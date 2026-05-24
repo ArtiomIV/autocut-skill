@@ -1,0 +1,18 @@
+# Gitleaks configuration for autocut-skill.
+#
+# We extend the default ruleset (which already detects sk-..., AIza..., Bearer ...).
+# The only allowlist is the redaction test file: it intentionally contains
+# strings that LOOK like API keys so we can verify the redaction filter
+# scrubs them. These are not real secrets.
+
+title = "autocut-skill gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Fake API keys used as unit-test fixtures for the redaction filter"
+paths = [
+    '''tests/unit/test_redaction\.py''',
+    '''autocut/security/redaction\.py''',
+]
