@@ -11,8 +11,11 @@ title = "autocut-skill gitleaks config"
 useDefault = true
 
 [allowlist]
-description = "Fake API keys used as unit-test fixtures for the redaction filter"
+description = "Fake API keys used as unit-test fixtures (redaction filter + VLM mocks)"
 paths = [
     '''tests/unit/test_redaction\.py''',
+    '''tests/unit/test_vlm_factory\.py''',
+    '''tests/unit/test_vlm_openrouter\.py''',
+    '''tests/unit/test_vlm_discovery\.py''',
     '''autocut/security/redaction\.py''',
 ]
