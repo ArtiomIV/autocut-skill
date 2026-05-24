@@ -1,0 +1,62 @@
+# Python build & runtime
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.python-version
+
+# Test & coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Secrets — every path shape that might hold a key.
+# Policy: API keys live ONLY in the OS keyring, never in files.
+.env
+.env.*
+*.env
+.envrc
+.secrets
+.secrets.*
+secrets/
+secrets.*
+*.pem
+*.key
+credentials.json
+service-account*.json
+.api_keys
+api_keys.*
+
+# AutoCut runtime outputs — never committed
+CLIPS/
+outputs/
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+
+# Logs
+*.log
+logs/
+
+# Backup / temp
+*.bak
+*.tmp

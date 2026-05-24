@@ -1,0 +1,148 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "autocut-skill"
+version = "0.1.0a1"
+description = "Open-source cross-agent skill for automatic video highlight extraction with a VLM."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Artiom Ivan", email = "ivan199821zxc@gmail.com" },
+]
+keywords = ["video", "highlights", "vlm", "ffmpeg", "claude", "openrouter", "cli", "skill"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Utilities",
+]
+
+# Core runtime dependencies (v0.1.0: host + openrouter only)
+dependencies = [
+    # Video pipeline
+    "scenedetect>=0.7",
+    "opencv-python>=4.10",
+    "Pillow>=10.4.0",
+    # Data validation
+    "pydantic>=2.7.0",
+    # HTTP / retry
+    "httpx>=0.27.0",
+    "tenacity>=8.5.0",
+    # File type sniffing
+    "python-magic>=0.4.27; sys_platform != 'win32'",
+    "python-magic-bin>=0.4.14; sys_platform == 'win32'",
+    # CLI
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+    # Secret storage
+    "keyring>=25.0.0",
+    # TOML I/O for config (tomllib is read-only in stdlib; we need write too)
+    "tomli-w>=1.0.0",
+    # VLM client: openai SDK is used for OpenRouter via base_url override.
+    # Direct Anthropic/OpenAI/Gemini SDKs are intentionally deferred to v0.2.0.
+    "openai>=1.50.0",
+]
+
+[project.optional-dependencies]
+# Cross-platform ffmpeg fallback (~60 MB). Used when system ffmpeg is missing.
+ffmpeg-bundled = ["imageio-ffmpeg>=0.5.1"]
+# Optional transcript pipeline (opt-in with --with-transcript)
+whisper = ["openai-whisper>=20240930"]
+all = ["autocut-skill[ffmpeg-bundled,whisper]"]
+# Development toolchain
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=5.0.0",
+    "ruff>=0.6.0",
+    "mypy>=1.11.0",
+    "respx>=0.21.0",
+    "pre-commit>=3.8.0",
+    "types-Pillow",
+]
+
+# v0.2.0+: deferred providers (re-enable when implementing the corresponding modules)
+# anthropic = ["anthropic>=0.39.0"]
+# gemini    = ["google-genai>=0.4.0"]
+# capcut    = ["pycapcut>=0.1.0"]  # pending license clarification upstream
+
+[project.urls]
+Homepage = "https://github.com/ArtiomIV/autocut-skill"
+Repository = "https://github.com/ArtiomIV/autocut-skill"
+Issues = "https://github.com/ArtiomIV/autocut-skill/issues"
+Changelog = "https://github.com/ArtiomIV/autocut-skill/blob/main/CHANGELOG.md"
+
+[project.scripts]
+autocut = "cli.__main__:app"
+
+# Hatchling needs to be told which packages to ship in the wheel.
+[tool.hatch.build.targets.wheel]
+packages = ["autocut", "cli"]
+
+# ---------------------------------------------------------------------------
+# Tool configuration
+# ---------------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Curated rule set: pycodestyle/pyflakes, isort, bugbear, simplify, pyupgrade,
+# security (bandit-like), naming. Strict enough to catch real bugs without noise.
+select = [
+    "E", "F", "W",       # pycodestyle + pyflakes
+    "I",                  # isort
+    "B",                  # flake8-bugbear
+    "SIM",                # flake8-simplify
+    "UP",                 # pyupgrade
+    "S",                  # flake8-bandit (security)
+    "N",                  # pep8-naming
+    "RUF",                # ruff-specific
+]
+ignore = [
+    "S101",  # assert is fine in tests
+    "E501",  # line length is handled by formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "N"]  # tests can be looser
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+warn_return_any = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+files = ["autocut", "cli"]
+
+[[tool.mypy.overrides]]
+module = [
+    "scenedetect.*",
+    "imageio_ffmpeg.*",
+    "magic.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+asyncio_mode = "auto"
+markers = [
+    "integration: integration tests that may touch ffmpeg / network",
+    "slow: tests that take >5s",
+]
