@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from datetime import timedelta
 from enum import StrEnum
+from pathlib import Path
 from typing import Annotated
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
@@ -151,3 +152,62 @@ class AnalysisHints(BaseModel):
         if self.max_duration_sec <= self.min_duration_sec:
             raise ValueError("max_duration_sec must be greater than min_duration_sec")
         return self
+
+
+# ---------------------------------------------------------------------------
+# Video pipeline models (populated by ``autocut.video.*``)
+# ---------------------------------------------------------------------------
+
+
+class VideoMetadata(BaseModel):
+    """Container-level facts produced by ``autocut.video.probe.probe_video``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: Path
+    duration_sec: float = Field(gt=0)
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    fps: float = Field(gt=0)
+    video_codec: str
+    audio_codec: str | None = None
+    container: str
+    size_bytes: int = Field(ge=0)
+
+    @property
+    def aspect_ratio(self) -> float:
+        return self.width / self.height
+
+
+class Scene(BaseModel):
+    """A single scene segment detected by ``autocut.video.scene_detect``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    index: int = Field(ge=0)
+    start: Timestamp
+    end: Timestamp
+
+    @model_validator(mode="after")
+    def _end_after_start(self) -> Scene:
+        if self.end <= self.start:
+            raise ValueError("end must be strictly greater than start")
+        return self
+
+    @property
+    def duration_sec(self) -> float:
+        return (self.end - self.start).total_seconds()
+
+
+class Keyframe(BaseModel):
+    """A single keyframe image extracted from the video.
+
+    ``scene_index`` is ``None`` for uniform-sampling specs that are not bound
+    to any detected scene, and ``>= 0`` for scene-based or hybrid samples.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    scene_index: int | None = Field(default=None, ge=0)
+    timestamp: Timestamp
+    path: Path

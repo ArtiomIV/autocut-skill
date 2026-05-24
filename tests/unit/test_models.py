@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -14,6 +15,9 @@ from autocut.models import (
     ClipPlan,
     ClipPlanMetadata,
     ContentHint,
+    Keyframe,
+    Scene,
+    VideoMetadata,
 )
 
 # ---------------------------------------------------------------------------
@@ -232,3 +236,76 @@ def test_analysis_hints_rejects_malformed_language(bad_lang: str) -> None:
 @pytest.mark.parametrize("good_lang", ["it", "en", "it-IT", "pt-BR"])
 def test_analysis_hints_accepts_valid_language(good_lang: str) -> None:
     AnalysisHints(language=good_lang)
+
+
+# ---------------------------------------------------------------------------
+# Video pipeline models
+# ---------------------------------------------------------------------------
+
+
+def _video_meta_kwargs() -> dict[str, object]:
+    return {
+        "path": Path("video.mp4"),
+        "duration_sec": 60.0,
+        "width": 1920,
+        "height": 1080,
+        "fps": 30.0,
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        "container": "mp4",
+        "size_bytes": 1024,
+    }
+
+
+def test_video_metadata_basic() -> None:
+    meta = VideoMetadata.model_validate(_video_meta_kwargs())
+    assert meta.aspect_ratio == pytest.approx(1920 / 1080)
+    assert meta.audio_codec == "aac"
+
+
+def test_video_metadata_rejects_zero_dimension() -> None:
+    kwargs = _video_meta_kwargs()
+    kwargs["width"] = 0
+    with pytest.raises(ValidationError):
+        VideoMetadata.model_validate(kwargs)
+
+
+def test_video_metadata_allows_missing_audio() -> None:
+    kwargs = _video_meta_kwargs()
+    kwargs["audio_codec"] = None
+    VideoMetadata.model_validate(kwargs)
+
+
+def test_video_metadata_rejects_extra_field() -> None:
+    kwargs = _video_meta_kwargs()
+    kwargs["color_space"] = "bt709"
+    with pytest.raises(ValidationError):
+        VideoMetadata.model_validate(kwargs)
+
+
+def test_scene_validates_end_after_start() -> None:
+    with pytest.raises(ValidationError):
+        Scene(index=0, start=timedelta(seconds=5), end=timedelta(seconds=5))
+
+
+def test_scene_duration_property() -> None:
+    s = Scene(index=2, start=timedelta(seconds=1), end=timedelta(seconds=4.5))
+    assert s.duration_sec == pytest.approx(3.5)
+    assert s.index == 2
+
+
+def test_keyframe_accepts_none_scene_index_for_uniform_sampling() -> None:
+    kf = Keyframe(scene_index=None, timestamp=timedelta(seconds=1), path=Path("k.jpg"))
+    assert kf.scene_index is None
+
+
+def test_keyframe_accepts_zero_or_positive_scene_index() -> None:
+    Keyframe(scene_index=0, timestamp=timedelta(), path=Path("k.jpg"))
+    Keyframe(scene_index=42, timestamp=timedelta(seconds=1), path=Path("k.jpg"))
+
+
+def test_keyframe_rejects_negative_scene_index() -> None:
+    # The frame_sampler uses -1 as a sentinel; ``keyframes.py`` is responsible
+    # for mapping that to ``None`` before constructing the model.
+    with pytest.raises(ValidationError):
+        Keyframe(scene_index=-1, timestamp=timedelta(), path=Path("k.jpg"))
