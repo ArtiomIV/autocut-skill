@@ -17,8 +17,10 @@ from rich.console import Console
 from rich.table import Table
 
 from autocut import __version__
-from autocut.config import AutoCutSettings, config_path
-from autocut.pipeline import AnalysisResult, run_analysis
+from autocut.config import AutoCutSettings, OutputMode, config_path
+from autocut.models import ClipPlan
+from autocut.pipeline import AnalysisResult, CostCapExceeded, run_analysis
+from autocut.scoring import RankedClip
 from autocut.security import (
     SERVICE_NAME,
     KeyringError,
@@ -30,6 +32,7 @@ from autocut.security import (
     set_key,
 )
 from autocut.vlm import (
+    CostEstimate,
     HostAgentPauseRequested,
     HostAgentProvider,
     UnavailableProviderError,
@@ -131,18 +134,51 @@ def run(
             help="Keyframe sampling strategy: scene | uniform | hybrid.",
         ),
     ] = "hybrid",
+    output: Annotated[
+        str | None,
+        typer.Option(
+            "--output",
+            help="Comma-separated output modes: separate | merged | all. "
+            "Defaults to the config (typically 'separate').",
+        ),
+    ] = None,
     output_dir: Annotated[
         Path | None,
         typer.Option("--output-dir", help="Override output base dir (default: ./CLIPS)."),
     ] = None,
+    accurate: Annotated[
+        bool,
+        typer.Option(
+            "--accurate/--fast",
+            help="Re-encode for frame-accurate cuts (slower) vs stream-copy.",
+        ),
+    ] = False,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            "-y",
+            help="Skip confirmation prompts (e.g. cost cap exceeded).",
+        ),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Run the analysis but do not write any output files.",
+        ),
+    ] = False,
 ) -> None:
-    """Run the analysis pipeline on a video and print the resulting clip plan."""
+    """Run the analysis pipeline on a video and produce the highlight clips."""
     if not video.exists() or not video.is_file():
         err_console.print(f"input video not found: {video}")
         raise typer.Exit(code=1)
 
     settings = AutoCutSettings.load()
     cfg = settings.config
+    if output is not None:
+        cfg.output.modes = _parse_output_modes(output)
+
     provider_name = vlm or cfg.vlm.provider
     model = vlm_model or cfg.vlm.model
     out_root = (output_dir or cfg.output.base_dir).resolve()
@@ -169,11 +205,17 @@ def run(
                 config=cfg,
                 output_root=out_root,
                 sampling_strategy=sampling,
+                write_outputs=not dry_run,
+                accurate_cuts=accurate,
+                confirm_cost=_make_cost_confirm(yes=yes),
             )
         )
     except HostAgentPauseRequested as pause:
         _print_pause_message(pause)
         raise typer.Exit(code=0) from None
+    except CostCapExceeded as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(code=1) from exc
     except VLMError as exc:
         err_console.print(f"VLM error: {exc}")
         raise typer.Exit(code=1) from exc
@@ -401,6 +443,38 @@ def _print_pause_message(pause: HostAgentPauseRequested) -> None:
     )
 
 
+def _parse_output_modes(raw: str) -> list[OutputMode]:
+    """Split a comma-separated string into validated ``OutputMode`` values."""
+    valid: set[str] = {"separate", "merged", "all"}
+    modes: list[OutputMode] = []
+    for token in raw.split(","):
+        cleaned = token.strip().lower()
+        if cleaned not in valid:
+            raise typer.BadParameter(
+                f"unknown output mode {cleaned!r}; choose from {sorted(valid)}"
+            )
+        # ``cast`` would also work; the literal-membership check above makes
+        # this assignment type-safe for mypy.
+        modes.append(cleaned)  # type: ignore[arg-type]
+    return modes
+
+
+def _make_cost_confirm(*, yes: bool):  # type: ignore[no-untyped-def]
+    """Return a confirm callback consumed by the pipeline."""
+
+    def _confirm(estimate: CostEstimate, cap_usd: float) -> bool:
+        if yes:
+            return True
+        console.print(
+            f"\n[bold yellow]Cost estimate ${estimate.estimated_total_usd:.4f}[/] "
+            f"exceeds cap ${cap_usd:.2f} for "
+            f"{estimate.provider}/{estimate.model} on {estimate.n_input_images} image(s)."
+        )
+        return typer.confirm("Proceed anyway?", default=False)
+
+    return _confirm
+
+
 def _render_analysis_summary(result: AnalysisResult) -> None:
     meta = result.metadata
     plan = result.plan
@@ -416,24 +490,58 @@ def _render_analysis_summary(result: AnalysisResult) -> None:
         console.print("[yellow]No clips were proposed.[/]")
         return
 
-    table = Table(title=f"{len(plan.clips)} clip candidate(s)")
+    table = Table(title=f"{len(plan.clips)} clip candidate(s) ranked")
     table.add_column("#", justify="right")
     table.add_column("Start → End", style="bold")
-    table.add_column("Score", justify="right")
+    table.add_column("VLM", justify="right")
+    table.add_column("Heur", justify="right")
+    table.add_column("Final", justify="right", style="bold")
     table.add_column("Category")
     table.add_column("Description")
-    for i, clip in enumerate(plan.clips, start=1):
+
+    rows_source = result.ranked if result.ranked else _fallback_rows(plan)
+    for i, ranked in enumerate(rows_source, start=1):
         table.add_row(
             str(i),
-            f"{clip.start} → {clip.end}",
-            str(clip.score),
-            clip.category.value,
-            clip.description,
+            f"{ranked.clip.start} → {ranked.clip.end}",
+            str(ranked.vlm_score),
+            str(ranked.heuristic_score),
+            str(ranked.final_score),
+            ranked.clip.category.value,
+            ranked.clip.description,
         )
     console.print(table)
+
+    if result.dispatch:
+        console.print("\n[bold]Outputs written[/]:")
+        for mode, written in result.dispatch.by_mode.items():
+            console.print(f"  [cyan]{mode}[/]: {len(written)} file(s)")
+            for w in written:
+                console.print(f"    - {w.path}")
+        if result.dispatch.manifest_path:
+            console.print(f"\n[bold]Manifest[/]: {result.dispatch.manifest_path}")
+    else:
+        console.print(
+            "\n[dim]Dry run — no files were written. "
+            "Re-run without --dry-run to produce clips.[/]"
+        )
+
     console.print(
         f"\n[dim]Full ClipPlan JSON:[/]\n{json.dumps(plan.model_dump(mode='json'), indent=2)}"
     )
+
+
+def _fallback_rows(plan: ClipPlan) -> list[RankedClip]:
+    """Build display rows from raw ``ClipPlan`` when ranking dropped everything."""
+    return [
+        RankedClip(
+            clip=clip,
+            vlm_score=clip.score,
+            heuristic_score=0,
+            final_score=clip.score,
+        )
+        for clip in plan.clips
+    ]
 
 
 if __name__ == "__main__":  # pragma: no cover

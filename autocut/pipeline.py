@@ -1,47 +1,61 @@
-"""Pipeline orchestrator — chains every stage from video file to clip plan.
+"""Pipeline orchestrator — chains every stage from video file to written clips.
 
-This is the single place that knows the full happy path:
+Full happy path:
 
     probe -> scene_detect -> frame_sampler -> extract_keyframes
-          -> provider.analyze -> ClipPlan
-
-Output writing (separate / merged) is wired in M4; for now ``run_analysis``
-returns the validated ``ClipPlan`` and the list of extracted keyframes so
-the CLI can preview the result before any cutting happens.
+          -> (cost cap check) -> provider.analyze
+          -> rank_clips -> dispatch_outputs
 
 The orchestrator is provider-agnostic: it only talks to the abstract
 ``VLMProvider`` interface. The ``host_agent`` pause flow surfaces here as
-``HostAgentPauseRequested`` propagating untouched — the CLI catches it.
+``HostAgentPauseRequested`` propagating untouched — the CLI catches it
+and tells the user how to resume.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from autocut.config import AutoCutConfig
 from autocut.models import AnalysisHints, ClipPlan, ContentHint, Keyframe, VideoMetadata
+from autocut.output import DispatchResult, dispatch_outputs
+from autocut.scoring import RankedClip, rank_clips
 from autocut.video import (
     build_sampler,
     detect_scenes,
     extract_keyframes,
     probe_video,
 )
-from autocut.vlm import VLMProvider
+from autocut.vlm import CostEstimate, VLMError, VLMProvider
 
 log = logging.getLogger(__name__)
 
 DEFAULT_KEYFRAME_SUBDIR = "keyframes"
 
+# A confirm hook: returns True to proceed, False to abort. The CLI passes
+# its interactive prompt; tests pass a constant.
+ConfirmHook = Callable[[CostEstimate, float], bool]
+
+
+class CostCapExceeded(VLMError):  # noqa: N818
+    # ``Error`` suffix is conventional but here we are signalling a deliberate
+    # safety gate, not an error condition. Keeping the descriptive name.
+    """Raised when the estimated cost exceeds ``config.security.cost_cap_usd``
+    and the confirm hook denies the run."""
+
 
 @dataclass(frozen=True, slots=True)
 class AnalysisResult:
-    """Bundle returned by ``run_analysis``: metadata + sampled frames + clip plan."""
+    """Bundle returned by ``run_analysis``: every artefact produced during the run."""
 
     metadata: VideoMetadata
     keyframes: list[Keyframe]
     plan: ClipPlan
+    ranked: list[RankedClip]
+    dispatch: DispatchResult | None
 
 
 async def run_analysis(
@@ -52,13 +66,11 @@ async def run_analysis(
     hints: AnalysisHints | None = None,
     output_root: Path | None = None,
     sampling_strategy: str = "hybrid",
+    write_outputs: bool = True,
+    accurate_cuts: bool = False,
+    confirm_cost: ConfirmHook | None = None,
 ) -> AnalysisResult:
-    """Run probe -> scenes -> sampler -> keyframes -> provider.analyze.
-
-    ``output_root`` defaults to ``config.output.base_dir``. Keyframes go
-    under ``<output_root>/<DEFAULT_KEYFRAME_SUBDIR>/``. Cutting itself
-    happens later (CLI / M4) once the user has reviewed the plan.
-    """
+    """Run the full pipeline. Returns a populated ``AnalysisResult``."""
     video = Path(video_path)
     root = (output_root or config.output.base_dir).resolve()
     keyframe_dir = root / DEFAULT_KEYFRAME_SUBDIR
@@ -91,6 +103,24 @@ async def run_analysis(
         long_edge_px=config.advanced.keyframe_resolution,
     )
 
+    # Cost cap check happens BEFORE the API call, when we know exactly how
+    # many images we're about to send.
+    estimate = provider.estimate_cost(len(keyframes))
+    cap = config.security.cost_cap_usd
+    log.info(
+        "pipeline: cost estimate %.4f USD (cap %.2f, free=%s)",
+        estimate.estimated_total_usd,
+        cap,
+        estimate.is_free,
+    )
+    if not estimate.is_free and estimate.estimated_total_usd > cap:
+        proceed = confirm_cost(estimate, cap) if confirm_cost else False
+        if not proceed:
+            raise CostCapExceeded(
+                f"estimated cost {estimate.estimated_total_usd:.4f} USD exceeds "
+                f"cap {cap:.2f} USD; rerun with a higher cost_cap_usd or accept the prompt"
+            )
+
     video_id = video.stem or "video"
     log.info(
         "pipeline: handing %d keyframes to provider=%s model=%s",
@@ -105,7 +135,43 @@ async def run_analysis(
         duration_sec=metadata.duration_sec,
     )
     log.info("pipeline: provider returned %d clip(s)", len(plan.clips))
-    return AnalysisResult(metadata=metadata, keyframes=keyframes, plan=plan)
+
+    ranked = rank_clips(plan, config.scoring)
+    log.info("pipeline: %d clip(s) survived ranking", len(ranked))
+
+    dispatch: DispatchResult | None = None
+    if write_outputs and ranked:
+        dispatch = dispatch_outputs(
+            video,
+            ranked,
+            metadata,
+            root,
+            modes=config.output.modes,
+            merge_order=config.output.merge_order,
+            accurate=accurate_cuts,
+            extra_manifest={
+                "vlm": {
+                    "provider": plan.metadata.vlm_provider,
+                    "model": plan.metadata.vlm_model,
+                    "prompt_version": plan.metadata.prompt_version,
+                    "analysis_time_sec": plan.metadata.analysis_time_sec,
+                    "cost_estimate_usd": estimate.estimated_total_usd,
+                },
+                "sampling": {
+                    "strategy": sampling_strategy,
+                    "n_keyframes": len(keyframes),
+                    "n_scenes": len(scenes),
+                },
+            },
+        )
+
+    return AnalysisResult(
+        metadata=metadata,
+        keyframes=keyframes,
+        plan=plan,
+        ranked=ranked,
+        dispatch=dispatch,
+    )
 
 
 def _resolve_hints(
