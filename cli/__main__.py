@@ -13,13 +13,21 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
 
 from autocut import __version__
 from autocut.config import AutoCutSettings, OutputMode, config_path
-from autocut.models import ClipPlan
-from autocut.pipeline import AnalysisResult, CostCapExceeded, run_analysis
+from autocut.models import ClipPlan, VideoMetadata
+from autocut.pipeline import (
+    AnalysisResult,
+    CostCapExceeded,
+    ResumeStateError,
+    complete_from_plan,
+    load_resume_state,
+    run_analysis,
+)
 from autocut.scoring import RankedClip
 from autocut.security import (
     SERVICE_NAME,
@@ -40,6 +48,15 @@ from autocut.vlm import (
     list_openrouter_models,
     make_provider,
 )
+
+# Force UTF-8 on stdio so unicode chars (✓, →, …) used in rich output don't
+# crash on Windows consoles defaulting to cp1252. Must run before any
+# console.print() call.
+for _stream in (sys.stdout, sys.stderr):
+    reconfigure = getattr(_stream, "reconfigure", None)
+    if reconfigure is not None:
+        with contextlib.suppress(OSError, ValueError):
+            reconfigure(encoding="utf-8", errors="replace")
 
 # Install the log redaction filter as early as possible so any subsequent
 # library call that ends up logging an API-key-shaped string is scrubbed.
@@ -233,10 +250,16 @@ def resume(
         ),
     ] = None,
 ) -> None:
-    """Resume a paused host-agent run by reading VLM_RESPONSE.json from disk."""
+    """Resume a paused host-agent run: validate the JSON, rank, write clips."""
     settings = AutoCutSettings.load()
     cfg = settings.config
     base = (work_dir or cfg.output.base_dir).resolve()
+
+    try:
+        state = load_resume_state(base)
+    except ResumeStateError as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(code=1) from exc
 
     provider = HostAgentProvider(work_dir=base, agent_hint=cfg.vlm.model)
     try:
@@ -245,8 +268,39 @@ def resume(
         err_console.print(str(exc))
         raise typer.Exit(code=1) from exc
 
-    console.print(f"[green]✓[/green] Loaded ClipPlan with {len(plan.clips)} clip(s).")
-    console.print_json(plan.model_dump_json(indent=2))
+    console.print(f"[green]OK[/] Loaded ClipPlan with {len(plan.clips)} clip(s).")
+
+    video = Path(str(state["video_path"]))
+    if not video.is_file():
+        err_console.print(
+            f"original video no longer at {video}; cannot cut clips. "
+            f"Move the file back or re-run `autocut run` from scratch."
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        metadata = VideoMetadata.model_validate(state["video_metadata"])
+    except ValidationError as exc:
+        err_console.print(f"resume state video_metadata is invalid: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    result = complete_from_plan(
+        plan,
+        video=video,
+        metadata=metadata,
+        config=cfg,
+        output_root=base,
+        n_scenes=_state_int(state, "n_scenes"),
+        n_keyframes=_state_int(state, "n_keyframes"),
+        sampling_strategy=str(state.get("sampling_strategy", "hybrid")),
+        accurate_cuts=bool(state.get("accurate_cuts", False)),
+        write_outputs=bool(state.get("write_outputs", True)),
+    )
+    # Resume succeeded end-to-end; the sidecar has served its purpose.
+    with contextlib.suppress(OSError):
+        (base / ".autocut_resume.json").unlink(missing_ok=True)
+
+    _render_analysis_summary(result)
 
 
 @app.command()
@@ -441,6 +495,14 @@ def _print_pause_message(pause: HostAgentPauseRequested) -> None:
         "Read the request, write the ClipPlan JSON to the response path,\n"
         "then run [bold]autocut resume[/bold] to continue.\n"
     )
+
+
+def _state_int(state: dict[str, object], key: str) -> int:
+    """Read an int counter from the resume-state dict, defaulting to 0."""
+    value = state.get(key, 0)
+    if isinstance(value, (int, float)):
+        return int(value)
+    return 0
 
 
 def _parse_output_modes(raw: str) -> list[OutputMode]:

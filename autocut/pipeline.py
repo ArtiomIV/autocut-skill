@@ -10,10 +10,18 @@ The orchestrator is provider-agnostic: it only talks to the abstract
 ``VLMProvider`` interface. The ``host_agent`` pause flow surfaces here as
 ``HostAgentPauseRequested`` propagating untouched — the CLI catches it
 and tells the user how to resume.
+
+Resume flow: before calling ``provider.analyze`` the orchestrator writes
+``RESUME_STATE_FILENAME`` next to the host-agent request file with every
+parameter ``complete_from_plan`` needs to finish the pipeline. The CLI's
+``resume`` subcommand reads it, calls ``complete_from_plan`` and the user
+gets the same output writers and manifest they would have got from a
+single-shot run.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -34,6 +42,7 @@ from autocut.vlm import CostEstimate, VLMError, VLMProvider
 log = logging.getLogger(__name__)
 
 DEFAULT_KEYFRAME_SUBDIR = "keyframes"
+RESUME_STATE_FILENAME = ".autocut_resume.json"
 
 # A confirm hook: returns True to proceed, False to abort. The CLI passes
 # its interactive prompt; tests pass a constant.
@@ -45,6 +54,10 @@ class CostCapExceeded(VLMError):  # noqa: N818
     # safety gate, not an error condition. Keeping the descriptive name.
     """Raised when the estimated cost exceeds ``config.security.cost_cap_usd``
     and the confirm hook denies the run."""
+
+
+class ResumeStateError(VLMError):
+    """Raised when the resume state sidecar is missing, malformed, or stale."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -121,6 +134,19 @@ async def run_analysis(
                 f"cap {cap:.2f} USD; rerun with a higher cost_cap_usd or accept the prompt"
             )
 
+    # Persist enough state that ``autocut resume`` can finish the pipeline
+    # if the provider pauses (host-agent flow). Cleared on success below.
+    _write_resume_state(
+        root,
+        video=video,
+        metadata=metadata,
+        n_scenes=len(scenes),
+        n_keyframes=len(keyframes),
+        sampling_strategy=sampling_strategy,
+        accurate_cuts=accurate_cuts,
+        write_outputs=write_outputs,
+    )
+
     video_id = video.stem or "video"
     log.info(
         "pipeline: handing %d keyframes to provider=%s model=%s",
@@ -136,6 +162,45 @@ async def run_analysis(
     )
     log.info("pipeline: provider returned %d clip(s)", len(plan.clips))
 
+    result = complete_from_plan(
+        plan,
+        video=video,
+        metadata=metadata,
+        config=config,
+        output_root=root,
+        n_scenes=len(scenes),
+        n_keyframes=len(keyframes),
+        sampling_strategy=sampling_strategy,
+        accurate_cuts=accurate_cuts,
+        write_outputs=write_outputs,
+        cost_estimate_usd=estimate.estimated_total_usd,
+        keyframes=keyframes,
+    )
+    _clear_resume_state(root)
+    return result
+
+
+def complete_from_plan(
+    plan: ClipPlan,
+    *,
+    video: Path,
+    metadata: VideoMetadata,
+    config: AutoCutConfig,
+    output_root: Path,
+    n_scenes: int,
+    n_keyframes: int,
+    sampling_strategy: str,
+    accurate_cuts: bool,
+    write_outputs: bool,
+    cost_estimate_usd: float = 0.0,
+    keyframes: list[Keyframe] | None = None,
+) -> AnalysisResult:
+    """Run ranking + dispatch given an already-validated ``ClipPlan``.
+
+    Used both by ``run_analysis`` after a successful ``provider.analyze``
+    call, and by the CLI ``resume`` subcommand after the host agent has
+    written ``VLM_RESPONSE.json``.
+    """
     ranked = rank_clips(plan, config.scoring)
     log.info("pipeline: %d clip(s) survived ranking", len(ranked))
 
@@ -145,7 +210,7 @@ async def run_analysis(
             video,
             ranked,
             metadata,
-            root,
+            output_root,
             modes=config.output.modes,
             merge_order=config.output.merge_order,
             accurate=accurate_cuts,
@@ -155,23 +220,85 @@ async def run_analysis(
                     "model": plan.metadata.vlm_model,
                     "prompt_version": plan.metadata.prompt_version,
                     "analysis_time_sec": plan.metadata.analysis_time_sec,
-                    "cost_estimate_usd": estimate.estimated_total_usd,
+                    "cost_estimate_usd": cost_estimate_usd,
                 },
                 "sampling": {
                     "strategy": sampling_strategy,
-                    "n_keyframes": len(keyframes),
-                    "n_scenes": len(scenes),
+                    "n_keyframes": n_keyframes,
+                    "n_scenes": n_scenes,
                 },
             },
         )
 
     return AnalysisResult(
         metadata=metadata,
-        keyframes=keyframes,
+        keyframes=keyframes or [],
         plan=plan,
         ranked=ranked,
         dispatch=dispatch,
     )
+
+
+# ---------------------------------------------------------------------------
+# Resume state sidecar
+# ---------------------------------------------------------------------------
+
+
+def _write_resume_state(
+    output_root: Path,
+    *,
+    video: Path,
+    metadata: VideoMetadata,
+    n_scenes: int,
+    n_keyframes: int,
+    sampling_strategy: str,
+    accurate_cuts: bool,
+    write_outputs: bool,
+) -> Path:
+    """Persist the parameters ``complete_from_plan`` needs to finish later."""
+    output_root.mkdir(parents=True, exist_ok=True)
+    state = {
+        "video_path": str(video.resolve()),
+        "video_metadata": json.loads(metadata.model_dump_json()),
+        "output_root": str(output_root.resolve()),
+        "sampling_strategy": sampling_strategy,
+        "accurate_cuts": accurate_cuts,
+        "write_outputs": write_outputs,
+        "n_scenes": n_scenes,
+        "n_keyframes": n_keyframes,
+    }
+    path = output_root / RESUME_STATE_FILENAME
+    path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    return path
+
+
+def _clear_resume_state(output_root: Path) -> None:
+    """Best-effort delete of the sidecar after a successful run."""
+    path = output_root / RESUME_STATE_FILENAME
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        log.debug("could not clear resume state %s: %s", path, exc)
+
+
+def load_resume_state(output_root: Path) -> dict[str, object]:
+    """Load and lightly validate the resume sidecar. Raises ``ResumeStateError`` on issues."""
+    path = output_root / RESUME_STATE_FILENAME
+    if not path.is_file():
+        raise ResumeStateError(
+            f"resume state file not found: {path} (no paused run to resume in this output dir)"
+        )
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ResumeStateError(f"failed to read resume state: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ResumeStateError("resume state top-level value is not an object")
+    required = {"video_path", "video_metadata", "sampling_strategy", "accurate_cuts"}
+    missing = required - data.keys()
+    if missing:
+        raise ResumeStateError(f"resume state missing required keys: {sorted(missing)}")
+    return data
 
 
 def _resolve_hints(
