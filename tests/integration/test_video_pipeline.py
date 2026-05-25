@@ -96,6 +96,19 @@ def test_uniform_sampling_produces_expected_count(medium_video: Path, tmp_path: 
     assert all(kf.scene_index is None for kf in kfs)
 
 
+def test_hybrid_on_short_video_produces_enough_keyframes(
+    short_video: Path, tmp_path: Path
+) -> None:
+    # 4s video with hybrid: the short-video reroute must give us enough
+    # keyframes for the VLM. Pre-A.2 this could degenerate to 1-2 samples.
+    meta = probe_video(short_video)
+    scenes = detect_scenes(short_video)
+    specs = build_sampler("hybrid", scenes, meta.duration_sec)
+    assert len(specs) >= 3
+    kfs = extract_keyframes(short_video, specs, tmp_path / "short", long_edge_px=256)
+    assert len(kfs) >= 3
+
+
 # ---------------------------------------------------------------------------
 # cutter
 # ---------------------------------------------------------------------------

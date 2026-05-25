@@ -131,6 +131,45 @@ def test_build_sampler_rejects_unknown_strategy() -> None:
 
 
 # ---------------------------------------------------------------------------
+# build_sampler safety nets (A.2): short-video reroute + min_keyframes floor
+# ---------------------------------------------------------------------------
+
+
+def test_build_sampler_reroutes_short_hybrid_to_dense_uniform() -> None:
+    # 41s video with hybrid + a single uncut scene would yield only 2 samples
+    # via scene logic. The short-video reroute uses 1.5s uniform instead.
+    scenes = [_scene(0, 0, 41)]
+    specs = build_sampler("hybrid", scenes, duration_sec=41.0)
+    # All samples should be scene_index=-1 (uniform, not scene-based).
+    assert all(s.scene_index == -1 for s in specs)
+    # 41s / 1.5s ≈ 27 samples.
+    assert 25 <= len(specs) <= 28
+
+
+def test_build_sampler_keeps_long_hybrid_as_scene_based() -> None:
+    # 200s video (above the short-video threshold) uses real hybrid logic.
+    scenes = [_scene(0, 0, 100), _scene(1, 100, 200)]
+    specs = build_sampler("hybrid", scenes, duration_sec=200.0)
+    # At least one spec must carry a real scene_index (hybrid base samples).
+    assert any(s.scene_index >= 0 for s in specs)
+
+
+def test_build_sampler_enforces_min_keyframes_floor() -> None:
+    # Uniform with interval=10s on a 5s video naturally yields 0 samples.
+    # The min_keyframes floor densifies to at least the requested count.
+    specs = build_sampler("uniform", [], duration_sec=5.0, interval_sec=10.0, min_keyframes=4)
+    assert len(specs) >= 4
+
+
+def test_build_sampler_min_keyframes_does_not_override_when_already_dense() -> None:
+    # Hybrid reroute on 41s already produces ~27 samples; min_keyframes=3
+    # must not shrink that.
+    scenes = [_scene(0, 0, 41)]
+    specs = build_sampler("hybrid", scenes, duration_sec=41.0, min_keyframes=3)
+    assert len(specs) > 10
+
+
+# ---------------------------------------------------------------------------
 # Deduplication / sorting
 # ---------------------------------------------------------------------------
 

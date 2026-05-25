@@ -72,9 +72,9 @@ def test_final_score_is_clamped() -> None:
 
 def test_rank_orders_by_final_score_desc_then_start_asc() -> None:
     # Three clips, hand-tuned so we can predict ordering:
-    # - high_late: vlm 10, duration 15s (heur 7) -> final 9, starts at 100s
-    # - high_early: vlm 10, duration 15s (heur 7) -> final 9, starts at 10s
-    # - mid: vlm 6, duration 15s (heur 7) -> final 6, starts at 50s
+    # - high_late: vlm 10, duration 15s (heur 5) -> final round(7.0+1.5)=8, starts at 100s
+    # - high_early: vlm 10, duration 15s (heur 5) -> final 8, starts at 10s
+    # - mid: vlm 6, duration 15s (heur 5) -> final round(4.2+1.5)=6, starts at 50s
     high_late = _clip("late", 100, 115, score=10)
     high_early = _clip("early", 10, 25, score=10)
     mid = _clip("mid", 50, 65, score=6)
@@ -83,7 +83,7 @@ def test_rank_orders_by_final_score_desc_then_start_asc() -> None:
 
 
 def test_rank_drops_clips_below_min_score() -> None:
-    # Very-short clip: duration 1s -> heur 3, vlm 0 -> final 1
+    # Very-short clip: duration 1s -> heur 2, vlm 0 -> final round(0+0.6)=1
     weak = _clip("weak", 0, 1, score=0)
     strong = _clip("strong", 30, 45, score=9)
     ranked = rank_clips(_plan([weak, strong]), ScoringConfig(min_score=5))
@@ -98,15 +98,15 @@ def test_rank_caps_to_max_clips() -> None:
 
 
 def test_rank_attaches_both_raw_scores() -> None:
-    # A sweet-spot clip with vlm=8 should show vlm_score=8, heuristic_score=7,
-    # final_score=round(0.7*8 + 0.3*7) = round(7.7) = 8.
+    # A 15s clip with vlm=8 falls in the neutral band: heur=5,
+    # final_score=round(0.7*8 + 0.3*5) = round(7.1) = 7.
     clip = _clip("c", 0, 15, score=8)
     ranked = rank_clips(_plan([clip]), ScoringConfig(min_score=0))
     assert len(ranked) == 1
     r = ranked[0]
     assert r.vlm_score == 8
-    assert r.heuristic_score == 7
-    assert r.final_score == 8
+    assert r.heuristic_score == 5
+    assert r.final_score == 7
 
 
 def test_rank_empty_plan_returns_empty_list() -> None:

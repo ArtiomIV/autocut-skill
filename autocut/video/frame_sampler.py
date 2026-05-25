@@ -35,6 +35,16 @@ _DEFAULT_HYBRID_MAX_GAP_SEC = 3.0
 # Two timestamps closer than this collapse into one.
 _DEDUP_TOLERANCE_SEC = 0.25
 
+# Short videos suffer from scene-based sampling: a 30 s boxing clip with one
+# uncut shot only yields 2 keyframes, far too sparse for the VLM to reason
+# about. Under this threshold, ``hybrid`` is rerouted to a denser uniform pass.
+_SHORT_VIDEO_THRESHOLD_SEC = 120.0
+_SHORT_VIDEO_INTERVAL_SEC = 1.5
+
+# Final safety net: regardless of strategy, we always feed the VLM at least
+# this many keyframes. Below the floor, we densify with uniform sampling.
+_DEFAULT_MIN_KEYFRAMES = 3
+
 
 @dataclass(frozen=True, slots=True)
 class FrameSpec:
@@ -133,16 +143,37 @@ def build_sampler(
     per_scene: int = _DEFAULT_PER_SCENE,
     interval_sec: float = _DEFAULT_UNIFORM_INTERVAL_SEC,
     max_gap_sec: float = _DEFAULT_HYBRID_MAX_GAP_SEC,
+    min_keyframes: int = _DEFAULT_MIN_KEYFRAMES,
 ) -> list[FrameSpec]:
-    """Single entry point used by the pipeline (M3). Dispatches on strategy."""
-    if strategy == "scene":
-        return _dedupe_and_sort(sample_scene_based(scenes, per_scene=per_scene))
-    if strategy == "uniform":
-        return _dedupe_and_sort(sample_uniform(duration_sec, interval_sec=interval_sec))
-    if strategy == "hybrid":
-        return sample_hybrid(scenes, duration_sec, per_scene=per_scene, max_gap_sec=max_gap_sec)
-    # mypy enforces exhaustiveness via the Literal; this guards runtime callers.
-    raise ValueError(f"unknown sampling strategy: {strategy!r}")
+    """Single entry point used by the pipeline (M3). Dispatches on strategy.
+
+    Two safety nets always apply on top of the chosen strategy:
+    1. ``hybrid`` on a short video (< ``_SHORT_VIDEO_THRESHOLD_SEC``) is
+       rerouted to dense uniform sampling — scene logic would underproduce.
+    2. If the final spec count is below ``min_keyframes``, we densify with
+       uniform sampling so the VLM always has enough frames to judge.
+    """
+    if strategy == "hybrid" and duration_sec < _SHORT_VIDEO_THRESHOLD_SEC:
+        specs = _dedupe_and_sort(
+            sample_uniform(duration_sec, interval_sec=_SHORT_VIDEO_INTERVAL_SEC)
+        )
+    elif strategy == "scene":
+        specs = _dedupe_and_sort(sample_scene_based(scenes, per_scene=per_scene))
+    elif strategy == "uniform":
+        specs = _dedupe_and_sort(sample_uniform(duration_sec, interval_sec=interval_sec))
+    elif strategy == "hybrid":
+        specs = sample_hybrid(scenes, duration_sec, per_scene=per_scene, max_gap_sec=max_gap_sec)
+    else:
+        # mypy enforces exhaustiveness via the Literal; this guards runtime callers.
+        raise ValueError(f"unknown sampling strategy: {strategy!r}")
+
+    if len(specs) < min_keyframes and duration_sec > 0:
+        target_interval = duration_sec / (min_keyframes + 1)
+        if target_interval > 0:
+            specs = _dedupe_and_sort(
+                sample_uniform(duration_sec, interval_sec=target_interval)
+            )
+    return specs
 
 
 # ---------------------------------------------------------------------------

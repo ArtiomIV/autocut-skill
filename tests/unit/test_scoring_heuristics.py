@@ -30,17 +30,17 @@ def _clip(duration_sec: float, score: int = 5) -> Clip:
 @pytest.mark.parametrize(
     ("duration", "expected"),
     [
-        (1.0, 3.0),  # < HARD_MIN (3.0)  -> base 5 - 2 = 3
-        (2.9, 3.0),  # still under hard min
-        (3.0, 4.0),  # [3, 8)            -> base 5 - 1 = 4
-        (7.9, 4.0),  # still in the "a bit short" band
-        (8.0, 7.0),  # sweet spot lower edge -> base 5 + 2 = 7
-        (15.0, 7.0),  # mid sweet spot
-        (25.0, 7.0),  # sweet spot upper edge (inclusive)
-        (25.1, 5.0),  # (25, 45]          -> base 5 (no bonus, no penalty)
-        (45.0, 5.0),  # upper edge of acceptable band
-        (45.1, 4.0),  # > HARD_MAX        -> base 5 - 1 = 4
-        (120.0, 4.0),  # very long
+        (1.0, 2.0),  # < HARD_MIN (3.0)  -> base 5 - 3 = 2
+        (2.9, 2.0),  # still under hard min
+        (3.0, 5.0),  # [3, 60]           -> base 5 (neutral, trust the VLM)
+        (7.9, 5.0),  # neutral band
+        (8.0, 5.0),  # neutral band
+        (15.0, 5.0),  # neutral band
+        (25.0, 5.0),  # neutral band
+        (45.0, 5.0),  # neutral band
+        (60.0, 5.0),  # upper edge inclusive
+        (60.1, 2.0),  # > HARD_MAX (60.0) -> base 5 - 3 = 2
+        (120.0, 2.0),  # very long
     ],
 )
 def test_duration_score_curve(duration: float, expected: float) -> None:
@@ -48,8 +48,8 @@ def test_duration_score_curve(duration: float, expected: float) -> None:
 
 
 def test_duration_score_is_clamped_to_unit_range() -> None:
-    # The current curve cannot exceed [3, 7], but the clamp is part of the
-    # contract: future heuristics must not be able to overflow.
+    # The current curve only produces 2.0 or 5.0, but the clamp is part of
+    # the contract: future heuristics must not be able to overflow.
     assert 0.0 <= duration_score(_clip(0.1)) <= 10.0
     assert 0.0 <= duration_score(_clip(9999.0)) <= 10.0
 
