@@ -162,9 +162,7 @@ def _run_concat(ffmpeg_binary: str, concat_list: Path, out_path: Path) -> None:
     except (subprocess.SubprocessError, OSError) as exc:
         raise MergedConcatError(f"failed to invoke ffmpeg concat: {exc}") from exc
     if completed.returncode != 0 or not out_path.is_file():
-        raise MergedConcatError(
-            f"ffmpeg concat failed: {completed.stderr.strip()}"
-        )
+        raise MergedConcatError(f"ffmpeg concat failed: {completed.stderr.strip()}")
 
 
 def _write_order_log(target_dir: Path, clips: list[RankedClip]) -> None:

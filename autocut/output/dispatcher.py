@@ -118,9 +118,7 @@ def _write_manifest(
             }
             for i, r in enumerate(ranked)
         ],
-        "outputs": {
-            mode: [str(w.path) for w in writes] for mode, writes in by_mode.items()
-        },
+        "outputs": {mode: [str(w.path) for w in writes] for mode, writes in by_mode.items()},
         **extra,
     }
     manifest_path = output_dir / MANIFEST_FILENAME

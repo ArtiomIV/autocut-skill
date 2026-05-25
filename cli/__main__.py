@@ -522,8 +522,7 @@ def _render_analysis_summary(result: AnalysisResult) -> None:
             console.print(f"\n[bold]Manifest[/]: {result.dispatch.manifest_path}")
     else:
         console.print(
-            "\n[dim]Dry run — no files were written. "
-            "Re-run without --dry-run to produce clips.[/]"
+            "\n[dim]Dry run — no files were written. Re-run without --dry-run to produce clips.[/]"
         )
 
     console.print(
