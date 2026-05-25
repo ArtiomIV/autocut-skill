@@ -12,12 +12,12 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal
 
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
+
 # Prompt template IDs the VLM prompt builder dispatches on. Kept here (not
 # in ``autocut.content.profiles``) so ``AnalysisHints`` can reference the
 # Literal without an import cycle.
 PromptTemplateId = Literal["sport", "talk", "hybrid"]
-
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 # ---------------------------------------------------------------------------
 # Timestamp parsing
@@ -30,7 +30,7 @@ def _parse_timestamp(value: object) -> timedelta:
     """Accept either a ``HH:MM:SS(.mmm)`` string or a numeric seconds value."""
     if isinstance(value, timedelta):
         return value
-    if isinstance(value, (int, float)):
+    if isinstance(value, int | float):
         if value < 0:
             raise ValueError("timestamp cannot be negative")
         return timedelta(seconds=float(value))

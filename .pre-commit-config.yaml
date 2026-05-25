@@ -27,6 +27,10 @@ repos:
     rev: v1.11.2
     hooks:
       - id: mypy
+        # Match the ``files`` list in pyproject.toml's [tool.mypy]: tests
+        # are not type-checked because they use pytest decorators that mypy
+        # flags as untyped without extra stubs.
+        files: ^(autocut|cli)/
         additional_dependencies:
           - pydantic>=2.7.0
           - pydantic-settings>=2.4.0

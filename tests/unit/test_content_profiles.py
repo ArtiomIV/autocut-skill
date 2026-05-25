@@ -13,7 +13,6 @@ from autocut.content.profiles import (
 )
 from autocut.models import ContentHint
 
-
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
@@ -66,8 +65,16 @@ def test_talk_profile_has_long_clip_window() -> None:
 
 
 def test_hybrid_profile_sits_between_sport_and_talk() -> None:
-    assert SPORT_PROFILE.min_duration_sec <= HYBRID_PROFILE.min_duration_sec <= TALK_PROFILE.min_duration_sec
-    assert SPORT_PROFILE.max_duration_sec <= HYBRID_PROFILE.max_duration_sec <= TALK_PROFILE.max_duration_sec
+    assert (
+        SPORT_PROFILE.min_duration_sec
+        <= HYBRID_PROFILE.min_duration_sec
+        <= TALK_PROFILE.min_duration_sec
+    )
+    assert (
+        SPORT_PROFILE.max_duration_sec
+        <= HYBRID_PROFILE.max_duration_sec
+        <= TALK_PROFILE.max_duration_sec
+    )
     assert HYBRID_PROFILE.prompt_template == "hybrid"
 
 

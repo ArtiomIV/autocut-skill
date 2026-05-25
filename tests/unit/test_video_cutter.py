@@ -139,10 +139,6 @@ def test_expand_request_clamps_end_to_duration(tmp_path: Path) -> None:
 def test_expand_request_rejects_negative_padding(tmp_path: Path) -> None:
     original = _req(10, 20, tmp_path / "out.mp4")
     with pytest.raises(ValueError, match="non-negative"):
-        expand_request(
-            original, pre_roll_sec=-1.0, post_roll_sec=0.0, video_duration_sec=60.0
-        )
+        expand_request(original, pre_roll_sec=-1.0, post_roll_sec=0.0, video_duration_sec=60.0)
     with pytest.raises(ValueError, match="non-negative"):
-        expand_request(
-            original, pre_roll_sec=0.0, post_roll_sec=-1.0, video_duration_sec=60.0
-        )
+        expand_request(original, pre_roll_sec=0.0, post_roll_sec=-1.0, video_duration_sec=60.0)
