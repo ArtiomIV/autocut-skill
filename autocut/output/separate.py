@@ -19,6 +19,7 @@ from autocut.output.base import OutputWriter, WrittenClip, slugify
 from autocut.scoring import RankedClip
 from autocut.security.paths import ensure_inside
 from autocut.video import CutRequest, cut_clip
+from autocut.video.cutter import expand_request
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +38,9 @@ class SeparateWriter(OutputWriter):
         output_dir: Path,
         *,
         accurate: bool = False,
+        pre_roll_sec: float = 0.0,
+        post_roll_sec: float = 0.0,
+        video_duration_sec: float = 0.0,
     ) -> list[WrittenClip]:
         target_dir = (output_dir / SUBDIR_NAME).resolve()
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -49,6 +53,12 @@ class SeparateWriter(OutputWriter):
                 start=ranked.clip.start,
                 end=ranked.clip.end,
                 output_path=out_path,
+            )
+            request = expand_request(
+                request,
+                pre_roll_sec=pre_roll_sec,
+                post_roll_sec=post_roll_sec,
+                video_duration_sec=video_duration_sec,
             )
             cut_clip(video_path, request, accurate=accurate)
             log.info("separate: wrote %s", out_path.name)

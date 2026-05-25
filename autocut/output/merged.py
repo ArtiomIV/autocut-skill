@@ -28,6 +28,7 @@ from autocut.output.base import OutputWriter, WrittenClip
 from autocut.scoring import RankedClip
 from autocut.security.paths import ensure_inside
 from autocut.video import CutRequest, cut_clip
+from autocut.video.cutter import expand_request
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +56,9 @@ class MergedWriter(OutputWriter):
         output_dir: Path,
         *,
         accurate: bool = False,
+        pre_roll_sec: float = 0.0,
+        post_roll_sec: float = 0.0,
+        video_duration_sec: float = 0.0,
     ) -> list[WrittenClip]:
         if not clips:
             return []
@@ -73,7 +77,15 @@ class MergedWriter(OutputWriter):
 
         with tempfile.TemporaryDirectory(prefix="autocut_merge_") as tmp:
             tmp_dir = Path(tmp)
-            chunk_paths = _cut_chunks(video_path, ordered_clips, tmp_dir, accurate=accurate)
+            chunk_paths = _cut_chunks(
+                video_path,
+                ordered_clips,
+                tmp_dir,
+                accurate=accurate,
+                pre_roll_sec=pre_roll_sec,
+                post_roll_sec=post_roll_sec,
+                video_duration_sec=video_duration_sec,
+            )
             concat_list = _write_concat_list(tmp_dir, chunk_paths)
             _run_concat(ffmpeg_binary, concat_list, final_path)
 
@@ -103,6 +115,9 @@ def _cut_chunks(
     tmp_dir: Path,
     *,
     accurate: bool,
+    pre_roll_sec: float = 0.0,
+    post_roll_sec: float = 0.0,
+    video_duration_sec: float = 0.0,
 ) -> list[Path]:
     # ``accurate`` is unused in the merge path: we ALWAYS re-encode the chunks
     # so they share identical stream parameters — concat-copy requires that.
@@ -110,15 +125,18 @@ def _cut_chunks(
     chunk_paths: list[Path] = []
     for i, ranked in enumerate(clips):
         chunk = tmp_dir / f"chunk_{i:03d}.mp4"
-        cut_clip(
-            video_path,
-            CutRequest(
-                start=ranked.clip.start,
-                end=ranked.clip.end,
-                output_path=chunk,
-            ),
-            accurate=True,
+        request = CutRequest(
+            start=ranked.clip.start,
+            end=ranked.clip.end,
+            output_path=chunk,
         )
+        request = expand_request(
+            request,
+            pre_roll_sec=pre_roll_sec,
+            post_roll_sec=post_roll_sec,
+            video_duration_sec=video_duration_sec,
+        )
+        cut_clip(video_path, request, accurate=True)
         chunk_paths.append(chunk)
     return chunk_paths
 

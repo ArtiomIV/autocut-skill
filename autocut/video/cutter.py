@@ -46,6 +46,34 @@ class CutRequest:
             raise ValueError("end must be strictly greater than start")
 
 
+def expand_request(
+    request: CutRequest,
+    *,
+    pre_roll_sec: float,
+    post_roll_sec: float,
+    video_duration_sec: float,
+) -> CutRequest:
+    """Return ``request`` widened by pre/post-roll, clamped to ``[0, duration]``.
+
+    Padding < 0 is rejected; padding of zero is a no-op (returns the same
+    request unchanged so callers can opt out cheaply). The clamped window
+    is guaranteed to stay strictly inside the source video, so downstream
+    ffmpeg never asks for a negative ``-ss`` or an ``-to`` past EOF.
+    """
+    if pre_roll_sec < 0 or post_roll_sec < 0:
+        raise ValueError("pre/post-roll padding must be non-negative")
+    if pre_roll_sec == 0 and post_roll_sec == 0:
+        return request
+
+    start_sec = max(0.0, request.start.total_seconds() - pre_roll_sec)
+    end_sec = min(video_duration_sec, request.end.total_seconds() + post_roll_sec)
+    return CutRequest(
+        start=timedelta(seconds=start_sec),
+        end=timedelta(seconds=end_sec),
+        output_path=request.output_path,
+    )
+
+
 def cut_clip(
     video_path: str | Path,
     request: CutRequest,

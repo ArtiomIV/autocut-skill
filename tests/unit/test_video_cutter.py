@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from autocut.video.cutter import CutRequest, _build_args, _format_ts
+from autocut.video.cutter import CutRequest, _build_args, _format_ts, expand_request
 
 
 def _req(start: float, end: float, path: Path) -> CutRequest:
@@ -93,3 +93,56 @@ def test_args_never_use_shell_metacharacters(tmp_path: Path) -> None:
     forbidden = {"|", ";", "&", ">", "<", "$(", "`"}
     for arg in args:
         assert not any(token in arg for token in forbidden), f"shell metacharacter in {arg!r}"
+
+
+# ---------------------------------------------------------------------------
+# expand_request — pre/post-roll plumbing (A.5.3)
+# ---------------------------------------------------------------------------
+
+
+def test_expand_request_is_noop_when_padding_is_zero(tmp_path: Path) -> None:
+    original = _req(5, 10, tmp_path / "out.mp4")
+    expanded = expand_request(
+        original, pre_roll_sec=0.0, post_roll_sec=0.0, video_duration_sec=60.0
+    )
+    assert expanded is original  # identity, not just equal
+
+
+def test_expand_request_widens_both_bounds(tmp_path: Path) -> None:
+    original = _req(10, 20, tmp_path / "out.mp4")
+    expanded = expand_request(
+        original, pre_roll_sec=1.5, post_roll_sec=0.5, video_duration_sec=60.0
+    )
+    assert expanded.start == timedelta(seconds=8.5)
+    assert expanded.end == timedelta(seconds=20.5)
+    assert expanded.output_path == original.output_path
+
+
+def test_expand_request_clamps_start_to_zero(tmp_path: Path) -> None:
+    original = _req(0.5, 5, tmp_path / "out.mp4")
+    expanded = expand_request(
+        original, pre_roll_sec=2.0, post_roll_sec=0.0, video_duration_sec=60.0
+    )
+    assert expanded.start == timedelta(0)
+    assert expanded.end == timedelta(seconds=5)
+
+
+def test_expand_request_clamps_end_to_duration(tmp_path: Path) -> None:
+    original = _req(50, 58, tmp_path / "out.mp4")
+    expanded = expand_request(
+        original, pre_roll_sec=0.0, post_roll_sec=5.0, video_duration_sec=60.0
+    )
+    assert expanded.start == timedelta(seconds=50)
+    assert expanded.end == timedelta(seconds=60)
+
+
+def test_expand_request_rejects_negative_padding(tmp_path: Path) -> None:
+    original = _req(10, 20, tmp_path / "out.mp4")
+    with pytest.raises(ValueError, match="non-negative"):
+        expand_request(
+            original, pre_roll_sec=-1.0, post_roll_sec=0.0, video_duration_sec=60.0
+        )
+    with pytest.raises(ValueError, match="non-negative"):
+        expand_request(
+            original, pre_roll_sec=0.0, post_roll_sec=-1.0, video_duration_sec=60.0
+        )

@@ -71,3 +71,42 @@ def test_format_timestamp_matches_extractor_format() -> None:
     assert format_timestamp(timedelta(seconds=0)) == "00:00:00.000"
     assert format_timestamp(timedelta(seconds=12.345)) == "00:00:12.345"
     assert format_timestamp(timedelta(hours=1, minutes=2, seconds=3)) == "01:02:03.000"
+
+
+# ---------------------------------------------------------------------------
+# A.5.2: specialized system prompt templates
+# ---------------------------------------------------------------------------
+
+
+def test_system_prompt_sport_template_includes_multi_frame_rule() -> None:
+    hints = AnalysisHints(prompt_template="sport")
+    text = build_system_prompt(hints)
+    # The boxing-feedback rule must be present so the VLM is conservative.
+    lowered = text.lower()
+    assert "multi" in lowered or "consecutive" in lowered
+    assert "sport" in lowered or "combat" in lowered or "action" in lowered
+
+
+def test_system_prompt_talk_template_targets_verbal_content() -> None:
+    hints = AnalysisHints(prompt_template="talk")
+    text = build_system_prompt(hints).lower()
+    assert "talk" in text or "podcast" in text or "interview" in text
+    # Talk template should not require multi-frame action confirmation.
+    assert "verbal" in text or "speaker" in text or "audience" in text
+
+
+def test_system_prompt_hybrid_template_is_neutral() -> None:
+    hints = AnalysisHints(prompt_template="hybrid")
+    text = build_system_prompt(hints).lower()
+    assert "mixed" in text or "unknown" in text or "general highlight" in text
+
+
+def test_system_prompt_falls_back_to_hybrid_for_unknown_template() -> None:
+    # Defensive: if a future caller bypasses Pydantic and sets an unknown
+    # template ID, build_system_prompt must not crash.
+    hints = AnalysisHints()
+    hints.prompt_template = "nonexistent"  # type: ignore[assignment]
+    text = build_system_prompt(hints).lower()
+    # Should produce SOME prompt with shared core rules.
+    assert "highlight" in text
+    assert "json" in text

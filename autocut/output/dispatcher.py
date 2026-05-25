@@ -42,9 +42,16 @@ def dispatch_outputs(
     modes: list[OutputMode],
     merge_order: MergeOrder = "score",
     accurate: bool = False,
+    pre_roll_sec: float = 0.0,
+    post_roll_sec: float = 0.0,
     extra_manifest: dict[str, object] | None = None,
 ) -> DispatchResult:
-    """Run every requested writer in order and persist the manifest."""
+    """Run every requested writer in order and persist the manifest.
+
+    ``pre_roll_sec`` / ``post_roll_sec`` are forwarded to each writer so the
+    cutter can widen clip bounds. Defaults of zero mean tight cuts; the
+    pipeline normally sources these from the active ``ContentProfile``.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     writers: list[OutputWriter] = []
@@ -64,7 +71,15 @@ def dispatch_outputs(
 
     by_mode: dict[str, list[WrittenClip]] = {}
     for writer in writers:
-        written = writer.write(video_path, ranked, output_dir, accurate=accurate)
+        written = writer.write(
+            video_path,
+            ranked,
+            output_dir,
+            accurate=accurate,
+            pre_roll_sec=pre_roll_sec,
+            post_roll_sec=post_roll_sec,
+            video_duration_sec=metadata.duration_sec,
+        )
         by_mode.setdefault(writer.name, []).extend(written)
 
     manifest_path = _write_manifest(

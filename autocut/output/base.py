@@ -32,8 +32,16 @@ class OutputWriter(ABC):
         output_dir: Path,
         *,
         accurate: bool = False,
+        pre_roll_sec: float = 0.0,
+        post_roll_sec: float = 0.0,
+        video_duration_sec: float = 0.0,
     ) -> list[WrittenClip]:
-        """Produce output files for ``clips`` under ``output_dir``."""
+        """Produce output files for ``clips`` under ``output_dir``.
+
+        ``pre_roll_sec`` / ``post_roll_sec`` widen each clip's bounds by the
+        given amounts (clamped to ``[0, video_duration_sec]``). The default
+        of zero is a no-op so existing callers keep behaving unchanged.
+        """
 
 
 # ---------------------------------------------------------------------------

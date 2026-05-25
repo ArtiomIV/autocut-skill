@@ -10,7 +10,12 @@ import re
 from datetime import timedelta
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
+
+# Prompt template IDs the VLM prompt builder dispatches on. Kept here (not
+# in ``autocut.content.profiles``) so ``AnalysisHints`` can reference the
+# Literal without an import cycle.
+PromptTemplateId = Literal["sport", "talk", "hybrid"]
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
@@ -146,6 +151,7 @@ class AnalysisHints(BaseModel):
     target_clip_count: int | None = Field(default=None, ge=1, le=100)
     min_duration_sec: float = Field(default=2.0, gt=0)
     max_duration_sec: float = Field(default=60.0, gt=0)
+    prompt_template: PromptTemplateId = "hybrid"
 
     @model_validator(mode="after")
     def _check_duration_window(self) -> AnalysisHints:

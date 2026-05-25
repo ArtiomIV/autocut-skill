@@ -18,8 +18,8 @@ from rich.console import Console
 from rich.table import Table
 
 from autocut import __version__
-from autocut.config import AutoCutSettings, OutputMode, config_path
-from autocut.models import ClipPlan, VideoMetadata
+from autocut.config import AutoCutConfig, AutoCutSettings, OutputMode, config_path
+from autocut.models import AnalysisHints, ClipPlan, ContentHint, VideoMetadata
 from autocut.pipeline import (
     AnalysisResult,
     CostCapExceeded,
@@ -151,6 +151,17 @@ def run(
             help="Keyframe sampling strategy: scene | uniform | hybrid.",
         ),
     ] = "hybrid",
+    content_hint: Annotated[
+        str | None,
+        typer.Option(
+            "--content-hint",
+            help=(
+                "Override content type (auto | boxing | sport | gameplay | talk | "
+                "podcast | other). Selects the matching profile: sport tunes for "
+                "dense action, talk for verbal content, auto/other for hybrid."
+            ),
+        ),
+    ] = None,
     output: Annotated[
         str | None,
         typer.Option(
@@ -196,6 +207,8 @@ def run(
     if output is not None:
         cfg.output.modes = _parse_output_modes(output)
 
+    hints_override = _build_hints_from_cli(content_hint, cfg)
+
     provider_name = vlm or cfg.vlm.provider
     model = vlm_model or cfg.vlm.model
     out_root = (output_dir or cfg.output.base_dir).resolve()
@@ -220,6 +233,7 @@ def run(
                 video,
                 provider,
                 config=cfg,
+                hints=hints_override,
                 output_root=out_root,
                 sampling_strategy=sampling,
                 write_outputs=not dry_run,
@@ -503,6 +517,32 @@ def _state_int(state: dict[str, object], key: str) -> int:
     if isinstance(value, (int, float)):
         return int(value)
     return 0
+
+
+def _build_hints_from_cli(
+    content_hint_raw: str | None,
+    cfg: AutoCutConfig,
+) -> AnalysisHints | None:
+    """Build ``AnalysisHints`` from the CLI ``--content-hint`` override.
+
+    Returns ``None`` if no override is given so the pipeline falls back to
+    its own resolution from ``cfg.content_defaults`` (unchanged behaviour).
+    """
+    if content_hint_raw is None:
+        return None
+    try:
+        hint = ContentHint(content_hint_raw.lower())
+    except ValueError as exc:
+        valid = ", ".join(h.value for h in ContentHint)
+        raise typer.BadParameter(
+            f"unknown --content-hint {content_hint_raw!r}; choose from: {valid}"
+        ) from exc
+    defaults = cfg.content_defaults
+    return AnalysisHints(
+        content_hint=hint,
+        goal=defaults.goal,
+        language=defaults.language,
+    )
 
 
 def _parse_output_modes(raw: str) -> list[OutputMode]:

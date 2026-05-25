@@ -16,7 +16,7 @@ import json
 from datetime import timedelta
 from typing import Final
 
-from autocut.models import AnalysisHints, ClipPlan
+from autocut.models import AnalysisHints, ClipPlan, PromptTemplateId
 from autocut.video.frame_sampler import FrameSpec
 
 PROMPT_VERSION: Final[str] = "v1"
@@ -38,7 +38,7 @@ def clip_plan_schema() -> str:
 # ---------------------------------------------------------------------------
 
 
-_SYSTEM_PROMPT: Final[str] = """\
+_CORE_RULES: Final[str] = """\
 You are a video editor assistant analysing keyframes extracted from a video.
 You will receive an ordered list of keyframes, each labelled with the
 timestamp at which it was sampled from the source video.
@@ -57,6 +57,57 @@ Hard rules:
 - Be conservative: prefer fewer high-score clips over many low-score ones.
 - If no segment is worth keeping, return an empty ``clips`` array.
 """
+
+
+_SPORT_GUIDANCE: Final[str] = """\
+
+Content guidance — sport / combat / action:
+- An action is only confirmed if you can see it across AT LEAST TWO
+  consecutive keyframes. A single frame that looks like a punch, kick,
+  or impact is often a feint, study phase, or a missed strike — do NOT
+  score it >= 7 alone.
+- Score >= 7 examples: multi-frame exchanges with motion blur on more
+  than one body, clinches with clear body contact, knockdowns,
+  follow-through punches landing, escalating combinations.
+- Score < 7 examples: defensive guard, ref breaks, fighters circling
+  or studying each other, single isolated jab without follow-up,
+  movement without engagement.
+- Prefer TIGHT cuts that frame the action without preamble. The clip
+  should start at the engagement, not at the setup.
+"""
+
+
+_TALK_GUIDANCE: Final[str] = """\
+
+Content guidance — talk / podcast / interview:
+- Frames carry no audio, so judge on visual cues: speaker leaning
+  forward, expressive hand gestures, eye contact intensity, reaction
+  shots of the listener (laughter, surprise, agreement).
+- Score >= 7 examples: speaker emphatically gesturing during a key
+  point, audience or interviewer reacting visibly (laughter,
+  surprise), close-up emotional moments, shared moments of agreement.
+- Score < 7 examples: static talking heads with no visible energy,
+  transitions between speakers, neutral discussion frames.
+- Clips can be longer here: a good moment often needs setup AND
+  payoff to read as a clip on its own.
+"""
+
+
+_HYBRID_GUIDANCE: Final[str] = """\
+
+Content guidance — mixed / unknown content:
+- Apply general highlight judgment: pick visually distinctive moments
+  that would read as standalone clips out of context.
+- When uncertain about the content type, lean conservative on scores
+  and prefer fewer well-justified clips over many speculative ones.
+"""
+
+
+_SYSTEM_TEMPLATES: Final[dict[PromptTemplateId, str]] = {
+    "sport": _CORE_RULES + _SPORT_GUIDANCE,
+    "talk": _CORE_RULES + _TALK_GUIDANCE,
+    "hybrid": _CORE_RULES + _HYBRID_GUIDANCE,
+}
 
 
 _USER_TEMPLATE: Final[str] = """\
@@ -86,8 +137,14 @@ def format_timestamp(ts: timedelta) -> str:
 
 
 def build_system_prompt(hints: AnalysisHints) -> str:
-    """Return the system message, hardcoding duration bounds from hints."""
-    return _SYSTEM_PROMPT.format(min_dur=hints.min_duration_sec, max_dur=hints.max_duration_sec)
+    """Return the system message: core rules + per-template guidance.
+
+    Template selection is driven by ``hints.prompt_template`` (set from the
+    active ``ContentProfile`` in the pipeline). Unknown template IDs fall
+    back to the ``hybrid`` variant defensively.
+    """
+    template = _SYSTEM_TEMPLATES.get(hints.prompt_template, _SYSTEM_TEMPLATES["hybrid"])
+    return template.format(min_dur=hints.min_duration_sec, max_dur=hints.max_duration_sec)
 
 
 def build_user_prompt(

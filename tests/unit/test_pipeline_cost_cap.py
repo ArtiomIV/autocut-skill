@@ -112,7 +112,7 @@ def _stub_video_stack(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("autocut.pipeline.detect_scenes", lambda _v, threshold=27.0: fake_scenes)
     monkeypatch.setattr(
         "autocut.pipeline.build_sampler",
-        lambda strategy, scenes, duration, per_scene: fake_specs,
+        lambda strategy, scenes, duration, **_kwargs: fake_specs,
     )
     monkeypatch.setattr(
         "autocut.pipeline.extract_keyframes",

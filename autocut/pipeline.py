@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from autocut.config import AutoCutConfig
+from autocut.content import ContentProfile, profile_for
 from autocut.models import AnalysisHints, ClipPlan, ContentHint, Keyframe, VideoMetadata
 from autocut.output import DispatchResult, dispatch_outputs
 from autocut.scoring import RankedClip, rank_clips
@@ -89,6 +90,11 @@ async def run_analysis(
     keyframe_dir = root / DEFAULT_KEYFRAME_SUBDIR
 
     effective_hints = _resolve_hints(hints, config)
+    profile = profile_for(effective_hints.content_hint)
+    effective_hints = _apply_profile_to_hints(effective_hints, profile)
+    effective_sampling_strategy = (
+        sampling_strategy if sampling_strategy != "hybrid" else profile.sampling_strategy
+    )
 
     log.info("pipeline: probe %s", video)
     metadata = probe_video(video)
@@ -96,12 +102,18 @@ async def run_analysis(
     log.info("pipeline: scene detect (threshold=%s)", config.advanced.scene_threshold)
     scenes = detect_scenes(video, threshold=config.advanced.scene_threshold)
 
-    log.info("pipeline: sampling (strategy=%s, %d scenes)", sampling_strategy, len(scenes))
+    log.info(
+        "pipeline: sampling (strategy=%s, profile=%s, %d scenes)",
+        effective_sampling_strategy,
+        profile.name,
+        len(scenes),
+    )
     specs = build_sampler(
-        sampling_strategy,  # type: ignore[arg-type]
+        effective_sampling_strategy,  # type: ignore[arg-type]
         scenes,
         metadata.duration_sec,
         per_scene=config.advanced.keyframes_per_scene,
+        min_keyframes=profile.min_keyframes,
     )
     if not specs:
         raise ValueError(
@@ -170,11 +182,12 @@ async def run_analysis(
         output_root=root,
         n_scenes=len(scenes),
         n_keyframes=len(keyframes),
-        sampling_strategy=sampling_strategy,
+        sampling_strategy=effective_sampling_strategy,
         accurate_cuts=accurate_cuts,
         write_outputs=write_outputs,
         cost_estimate_usd=estimate.estimated_total_usd,
         keyframes=keyframes,
+        profile=profile,
     )
     _clear_resume_state(root)
     return result
@@ -194,15 +207,20 @@ def complete_from_plan(
     write_outputs: bool,
     cost_estimate_usd: float = 0.0,
     keyframes: list[Keyframe] | None = None,
+    profile: ContentProfile | None = None,
 ) -> AnalysisResult:
     """Run ranking + dispatch given an already-validated ``ClipPlan``.
 
     Used both by ``run_analysis`` after a successful ``provider.analyze``
     call, and by the CLI ``resume`` subcommand after the host agent has
-    written ``VLM_RESPONSE.json``.
+    written ``VLM_RESPONSE.json``. ``profile`` is forwarded to the dispatcher
+    so per-content-type padding (currently 0 everywhere) reaches the cutter.
     """
     ranked = rank_clips(plan, config.scoring)
     log.info("pipeline: %d clip(s) survived ranking", len(ranked))
+
+    pre_roll = profile.pre_roll_sec if profile else 0.0
+    post_roll = profile.post_roll_sec if profile else 0.0
 
     dispatch: DispatchResult | None = None
     if write_outputs and ranked:
@@ -214,6 +232,8 @@ def complete_from_plan(
             modes=config.output.modes,
             merge_order=config.output.merge_order,
             accurate=accurate_cuts,
+            pre_roll_sec=pre_roll,
+            post_roll_sec=post_roll,
             extra_manifest={
                 "vlm": {
                     "provider": plan.metadata.vlm_provider,
@@ -317,4 +337,20 @@ def _resolve_hints(
         content_hint=content_hint,
         goal=defaults.goal,
         language=defaults.language,
+    )
+
+
+def _apply_profile_to_hints(hints: AnalysisHints, profile: ContentProfile) -> AnalysisHints:
+    """Overlay profile-derived fields (duration bounds, prompt template) on hints.
+
+    The caller's ``content_hint``, ``goal``, ``language``, and
+    ``target_clip_count`` are preserved — those reflect intent. Only the
+    fields the profile owns are overwritten.
+    """
+    return hints.model_copy(
+        update={
+            "min_duration_sec": profile.min_duration_sec,
+            "max_duration_sec": profile.max_duration_sec,
+            "prompt_template": profile.prompt_template,
+        }
     )
