@@ -134,8 +134,32 @@ module = [
     "scenedetect.*",
     "imageio_ffmpeg.*",
     "magic.*",
+    "numpy",
+    "numpy.*",
+    "cv2",
+    "cv2.*",
+    "httpx",
+    "httpx.*",
+    "openai",
+    "openai.*",
+    "typer",
+    "typer.*",
+    "rich",
+    "rich.*",
+    "pytest",
+    "pytest.*",
+    "keyring",
+    "keyring.*",
 ]
 ignore_missing_imports = true
+
+# Typer's @app.command decorators don't preserve type info, so every CLI
+# entry point reads as "untyped" under mypy --strict. Disable the misc
+# error code for the CLI package only — the rest of the codebase keeps
+# strict typing.
+[[tool.mypy.overrides]]
+module = "cli.*"
+disable_error_code = ["misc"]
 
 [tool.pytest.ini_options]
 minversion = "8.0"

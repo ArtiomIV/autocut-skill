@@ -48,9 +48,12 @@ def set_key(provider: SupportedProvider, key: str) -> None:
 def get_key(provider: SupportedProvider) -> str | None:
     """Return the stored key for ``provider``, or ``None`` if absent."""
     try:
-        return keyring.get_password(SERVICE_NAME, provider)
+        # keyring lacks type stubs, so the return value is Any; coerce
+        # explicitly so callers (and mypy --strict) see ``str | None``.
+        value = keyring.get_password(SERVICE_NAME, provider)
     except keyring.errors.KeyringError as exc:
         raise KeyringError(f"failed to read key for {provider!r}: {exc}") from exc
+    return str(value) if value is not None else None
 
 
 def delete_key(provider: SupportedProvider) -> bool:

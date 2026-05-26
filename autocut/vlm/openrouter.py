@@ -121,7 +121,10 @@ class OpenRouterProvider(VLMProvider):
                 }
             )
 
-        messages = cast(
+        # Local mypy sees openai's strict TypedDict union and rejects the
+        # dict-literal; pre-commit mypy has no openai stubs and treats the
+        # cast as redundant. Silence both with the combined ignore.
+        messages = cast(  # type: ignore[redundant-cast, unused-ignore]
             list[ChatCompletionMessageParam],
             [
                 {"role": "system", "content": system_prompt},

@@ -34,8 +34,11 @@ from autocut.output import DispatchResult, dispatch_outputs
 from autocut.scoring import RankedClip, rank_clips
 from autocut.video import (
     build_sampler,
+    compute_audio_profile,
+    compute_motion_profile,
     detect_scenes,
     extract_keyframes,
+    find_hot_windows,
     probe_video,
 )
 from autocut.vlm import CostEstimate, VLMError, VLMProvider
@@ -102,6 +105,23 @@ async def run_analysis(
     log.info("pipeline: scene detect (threshold=%s)", config.advanced.scene_threshold)
     scenes = detect_scenes(video, threshold=config.advanced.scene_threshold)
 
+    hot_windows = None
+    if effective_sampling_strategy == "motion":
+        log.info("pipeline: computing motion + audio profiles for motion sampler")
+        motion_profile = compute_motion_profile(video)
+        audio_profile = compute_audio_profile(video)
+        hot_windows = find_hot_windows(
+            motion_profile,
+            audio_profile,
+            video_duration_sec=metadata.duration_sec,
+        )
+        log.info(
+            "pipeline: motion sampler found %d hot window(s) from %d motion + %d audio samples",
+            len(hot_windows),
+            len(motion_profile),
+            len(audio_profile),
+        )
+
     log.info(
         "pipeline: sampling (strategy=%s, profile=%s, %d scenes)",
         effective_sampling_strategy,
@@ -114,6 +134,7 @@ async def run_analysis(
         metadata.duration_sec,
         per_scene=config.advanced.keyframes_per_scene,
         min_keyframes=profile.min_keyframes,
+        hot_windows=hot_windows,
     )
     if not specs:
         raise ValueError(

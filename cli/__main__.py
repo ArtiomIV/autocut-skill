@@ -148,7 +148,11 @@ def run(
         str,
         typer.Option(
             "--sampling",
-            help="Keyframe sampling strategy: scene | uniform | hybrid.",
+            help=(
+                "Keyframe sampling strategy: scene | uniform | hybrid | motion. "
+                "'motion' runs optical flow + audio onset analysis to sample "
+                "densely only where the action is (Phase D)."
+            ),
         ),
     ] = "hybrid",
     content_hint: Annotated[
@@ -514,7 +518,7 @@ def _print_pause_message(pause: HostAgentPauseRequested) -> None:
 def _state_int(state: dict[str, object], key: str) -> int:
     """Read an int counter from the resume-state dict, defaulting to 0."""
     value = state.get(key, 0)
-    if isinstance(value, (int, float)):
+    if isinstance(value, int | float):
         return int(value)
     return 0
 
@@ -572,7 +576,8 @@ def _make_cost_confirm(*, yes: bool):  # type: ignore[no-untyped-def]
             f"exceeds cap ${cap_usd:.2f} for "
             f"{estimate.provider}/{estimate.model} on {estimate.n_input_images} image(s)."
         )
-        return typer.confirm("Proceed anyway?", default=False)
+        # typer lacks type stubs so .confirm() returns Any; coerce to bool.
+        return bool(typer.confirm("Proceed anyway?", default=False))
 
     return _confirm
 
