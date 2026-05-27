@@ -96,17 +96,59 @@ async def list_openrouter_models(
 
 def _is_vision_capable(raw: dict[str, Any]) -> bool:
     """OpenRouter encodes modality flags under ``architecture.modality``."""
+    return _has_modality(raw, "image")
+
+
+def _has_modality(raw: dict[str, Any], needle: str) -> bool:
+    """Return True if the model's input modalities contain ``needle`` (case-insensitive).
+
+    Reads both the legacy ``architecture.modality`` string ("text+image->text"
+    style) and the newer ``architecture.input_modalities`` list, so the
+    helper works against any OpenRouter payload shape we have seen.
+    """
+    needle_lc = needle.lower()
     arch = raw.get("architecture") or {}
     if not isinstance(arch, dict):
         return False
     modality = arch.get("modality", "")
-    if isinstance(modality, str) and "image" in modality.lower():
+    if isinstance(modality, str) and needle_lc in modality.lower():
         return True
-    # Newer payloads sometimes use ``input_modalities`` as a list.
     inputs = arch.get("input_modalities")
     return isinstance(inputs, list) and any(
-        isinstance(m, str) and "image" in m.lower() for m in inputs
+        isinstance(m, str) and needle_lc in m.lower() for m in inputs
     )
+
+
+def model_supports_audio_input(model_id: str, models: list[dict[str, Any]]) -> bool:
+    """Return True if ``model_id`` declares ``audio`` as an input modality.
+
+    Phase E v0.1.0 does not yet ship the audio block path — this helper
+    exists so the detector and any future caller can branch on capability
+    when we plumb raw audio uploads in v0.2.0 (Whisper-light + Gemini
+    ``input_audio``). For now it reads the OpenRouter ``/models`` payload
+    directly and ignores any provider-side caching: detection is rare.
+    """
+    raw = _find_model(model_id, models)
+    return raw is not None and _has_modality(raw, "audio")
+
+
+def model_supports_video_input(model_id: str, models: list[dict[str, Any]]) -> bool:
+    """Return True if ``model_id`` declares ``video`` as an input modality.
+
+    See ``model_supports_audio_input`` for the rationale; video upload is
+    Gemini-family only today (Sonnet/GPT-4o do not yet expose it through
+    OpenRouter's OpenAI-compatible schema).
+    """
+    raw = _find_model(model_id, models)
+    return raw is not None and _has_modality(raw, "video")
+
+
+def _find_model(model_id: str, models: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Linear scan; the OpenRouter catalogue is a few hundred rows so this is fine."""
+    for entry in models:
+        if isinstance(entry, dict) and entry.get("id") == model_id:
+            return entry
+    return None
 
 
 def _to_model_info(raw: dict[str, Any]) -> ModelInfo | None:

@@ -20,6 +20,7 @@ from autocut.models import AnalysisHints, ClipPlan, PromptTemplateId
 from autocut.video.frame_sampler import FrameSpec
 
 PROMPT_VERSION: Final[str] = "v1"
+DETECTION_PROMPT_VERSION: Final[str] = "v1"
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +146,84 @@ def build_system_prompt(hints: AnalysisHints) -> str:
     """
     template = _SYSTEM_TEMPLATES.get(hints.prompt_template, _SYSTEM_TEMPLATES["hybrid"])
     return template.format(min_dur=hints.min_duration_sec, max_dur=hints.max_duration_sec)
+
+
+# ---------------------------------------------------------------------------
+# Detection prompt (Phase E) — classify content type from sparse keyframes
+# ---------------------------------------------------------------------------
+
+
+_DETECTION_SYSTEM: Final[str] = """\
+You classify videos so a downstream highlight-extraction pipeline can pick
+the right strategy. You receive a small set of keyframes sampled across the
+video timeline and a short textual description of the audio profile
+(computed from the waveform, not transcribed — there is no speech text).
+
+Pick EXACTLY ONE content type from this list:
+- boxing: combat sports — boxing, MMA, kickboxing, wrestling, martial arts
+- sport: other sports — football, basketball, tennis, racing, golf
+- gameplay: video game footage (in-engine view, HUD visible, etc.)
+- talk: monologue, interview, presentation, talking-head video
+- podcast: multi-person conversational format (2+ people on camera together)
+- other: anything else — vlog, cooking, music performance, tutorial, mixed
+
+Return STRICT JSON only. No prose before or after. No markdown fences.
+Schema:
+{
+  "content_hint": "boxing|sport|gameplay|talk|podcast|other",
+  "confidence": <number 0.0 to 1.0>,
+  "reasoning": "<one short sentence>"
+}
+
+Guidance:
+- ``confidence`` is your own self-assessment of how certain you are. Use
+  high values (>=0.8) only when the visual + audio signals clearly agree.
+- When in doubt between two categories, return ``other`` rather than
+  guessing — the downstream HYBRID profile handles ambiguous content
+  gracefully.
+- ``reasoning`` is for the human reading the log, not for self-talk. Keep
+  it to one sentence describing the main signal you used.
+"""
+
+
+_DETECTION_USER: Final[str] = """\
+Video duration: {duration_sec:.1f}s. Total keyframes sampled: {n_frames}.
+
+{audio_description}
+
+Keyframes (chronological, sampled across the full timeline):
+{keyframe_lines}
+
+Classify the content and return the JSON object.
+"""
+
+
+def build_detection_system_prompt() -> str:
+    """Return the system message used for the auto-detect pre-step."""
+    return _DETECTION_SYSTEM
+
+
+def build_detection_user_prompt(
+    *,
+    duration_sec: float,
+    keyframe_timestamps: list[timedelta],
+    audio_description: str,
+) -> str:
+    """Return the user message: audio summary + keyframe timeline.
+
+    The actual image bytes are attached by the provider as image content
+    parts; the user-prompt text only includes the timestamps so the model
+    can map each image to a point in the video.
+    """
+    keyframe_lines = "\n".join(
+        f"  - frame {i + 1}: t = {format_timestamp(ts)}" for i, ts in enumerate(keyframe_timestamps)
+    )
+    return _DETECTION_USER.format(
+        duration_sec=duration_sec,
+        n_frames=len(keyframe_timestamps),
+        audio_description=audio_description.rstrip(),
+        keyframe_lines=keyframe_lines,
+    )
 
 
 def build_user_prompt(

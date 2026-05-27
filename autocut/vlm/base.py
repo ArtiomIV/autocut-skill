@@ -23,7 +23,7 @@ from typing import ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from autocut.models import AnalysisHints, ClipPlan, Keyframe
+from autocut.models import AnalysisHints, ClipPlan, DetectionResult, Keyframe
 
 
 class VLMError(RuntimeError):
@@ -95,6 +95,38 @@ class VLMProvider(ABC):
 
         Implementations must raise ``VLMError`` for cloud failures and
         ``HostAgentPauseRequested`` for the deferred host-agent flow.
+        """
+
+    @abstractmethod
+    async def detect_content(
+        self,
+        keyframes: list[Keyframe],
+        audio_description: str,
+        *,
+        video_id: str,
+        duration_sec: float,
+        timeout_sec: int = 120,
+        transcript_text: str | None = None,
+        audio_clip_path: Path | None = None,
+        video_clip_paths: list[Path] | None = None,
+    ) -> DetectionResult:
+        """Classify the video content type using a small set of detection keyframes.
+
+        ``audio_description`` is a short text block built by the detector
+        from the waveform statistics (no transcription in v0.1.0); providers
+        feed it to the model as a system/user-prompt fragment.
+
+        ``transcript_text`` / ``audio_clip_path`` / ``video_clip_paths`` are
+        reserved for future capability-aware paths (Whisper-light in v0.2.0,
+        Gemini ``input_audio``/video upload). v0.1.0 implementations may
+        ignore them; the signature is forward-compatible so callers do not
+        need to change when the audio/video paths land.
+
+        Implementations must:
+        - raise ``VLMError`` for cloud failures or schema violations
+        - raise ``HostAgentPauseRequested`` if a host-agent pause is needed
+          for the detection step itself (v0.1.0 host-agent returns a stub
+          low-confidence result and never pauses).
         """
 
     @abstractmethod

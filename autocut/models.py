@@ -138,6 +138,46 @@ class ClipPlan(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# DetectionResult — VLM classification of the content type (Phase E)
+# ---------------------------------------------------------------------------
+
+
+class DetectionResult(BaseModel):
+    """Output of the auto-detect pre-step: the VLM classifies the video.
+
+    The pipeline invokes ``provider.detect_content`` when the caller passes
+    ``content_hint=auto`` (or no hint at all). The pipeline then picks the
+    matching ``ContentProfile``. ``confidence`` below a configurable
+    threshold falls back to ``HYBRID_PROFILE`` rather than acting on a
+    weak signal.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    content_hint: ContentHint = Field(
+        description="Detected category. ``auto`` is rejected — the detector must commit."
+    )
+    confidence: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="Self-reported certainty 0-1; below the pipeline threshold we fall back.",
+    )
+    reasoning: str = Field(
+        default="",
+        max_length=300,
+        description="One-sentence explanation, surfaced in logs for debuggability.",
+    )
+
+    @model_validator(mode="after")
+    def _content_hint_committed(self) -> DetectionResult:
+        # ``auto`` is the *input* asking us to classify; allowing it as
+        # *output* would defeat the purpose of detection.
+        if self.content_hint == ContentHint.auto:
+            raise ValueError("DetectionResult.content_hint must commit to a concrete category")
+        return self
+
+
+# ---------------------------------------------------------------------------
 # AnalysisHints — what we send TO the VLM
 # ---------------------------------------------------------------------------
 

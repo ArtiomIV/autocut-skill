@@ -28,8 +28,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from autocut.config import AutoCutConfig
-from autocut.content import ContentProfile, profile_for
-from autocut.models import AnalysisHints, ClipPlan, ContentHint, Keyframe, VideoMetadata
+from autocut.content import ContentProfile, detect_content_hint, profile_for
+from autocut.models import (
+    AnalysisHints,
+    ClipPlan,
+    ContentHint,
+    DetectionResult,
+    Keyframe,
+    VideoMetadata,
+)
 from autocut.output import DispatchResult, dispatch_outputs
 from autocut.scoring import RankedClip, rank_clips
 from autocut.video import (
@@ -47,6 +54,11 @@ log = logging.getLogger(__name__)
 
 DEFAULT_KEYFRAME_SUBDIR = "keyframes"
 RESUME_STATE_FILENAME = ".autocut_resume.json"
+
+# Detection confidence below this threshold falls back to HYBRID_PROFILE.
+# 0.5 is permissive: we trust the model's self-assessment except when it
+# explicitly signals uncertainty. Retunable after empirical runs.
+_AUTO_DETECT_CONFIDENCE_THRESHOLD: float = 0.5
 
 # A confirm hook: returns True to proceed, False to abort. The CLI passes
 # its interactive prompt; tests pass a constant.
@@ -93,14 +105,40 @@ async def run_analysis(
     keyframe_dir = root / DEFAULT_KEYFRAME_SUBDIR
 
     effective_hints = _resolve_hints(hints, config)
+
+    log.info("pipeline: probe %s", video)
+    metadata = probe_video(video)
+
+    # Phase E: if the caller asked for auto-detect (or didn't pass a hint
+    # at all), run the detection pre-step before picking the profile.
+    if effective_hints.content_hint == ContentHint.auto:
+        detection = await _run_auto_detect(video, provider, metadata=metadata, output_root=root)
+        if detection.confidence >= _AUTO_DETECT_CONFIDENCE_THRESHOLD:
+            log.info(
+                "pipeline: auto-detect picked %s (confidence %.2f) — %s",
+                detection.content_hint.value,
+                detection.confidence,
+                detection.reasoning,
+            )
+            effective_hints = effective_hints.model_copy(
+                update={"content_hint": detection.content_hint}
+            )
+        else:
+            log.warning(
+                "pipeline: detection confidence %.2f below %.2f; HYBRID fallback "
+                "(detected=%s, reason=%r)",
+                detection.confidence,
+                _AUTO_DETECT_CONFIDENCE_THRESHOLD,
+                detection.content_hint.value,
+                detection.reasoning,
+            )
+            # Leave content_hint as ``auto`` so ``profile_for`` returns HYBRID.
+
     profile = profile_for(effective_hints.content_hint)
     effective_hints = _apply_profile_to_hints(effective_hints, profile)
     effective_sampling_strategy = (
         sampling_strategy if sampling_strategy != "hybrid" else profile.sampling_strategy
     )
-
-    log.info("pipeline: probe %s", video)
-    metadata = probe_video(video)
 
     log.info("pipeline: scene detect (threshold=%s)", config.advanced.scene_threshold)
     scenes = detect_scenes(video, threshold=config.advanced.scene_threshold)
@@ -340,6 +378,37 @@ def load_resume_state(output_root: Path) -> dict[str, object]:
     if missing:
         raise ResumeStateError(f"resume state missing required keys: {sorted(missing)}")
     return data
+
+
+async def _run_auto_detect(
+    video: Path,
+    provider: VLMProvider,
+    *,
+    metadata: VideoMetadata,
+    output_root: Path,
+) -> DetectionResult:
+    """Run Phase E detection and surface a clean DetectionResult.
+
+    Wraps ``detect_content_hint`` in defensive handling: any failure of
+    the detection step (VLM error, audio-read error inside the detector,
+    etc.) is logged and converted into a low-confidence ``other`` result
+    so the pipeline can still proceed under HYBRID instead of dying
+    halfway through.
+    """
+    try:
+        return await detect_content_hint(
+            video,
+            provider,
+            metadata=metadata,
+            output_root=output_root,
+        )
+    except VLMError as exc:
+        log.warning("pipeline: auto-detect failed (%s); HYBRID fallback", exc)
+        return DetectionResult(
+            content_hint=ContentHint.other,
+            confidence=0.0,
+            reasoning=f"auto-detect failed: {exc}",
+        )
 
 
 def _resolve_hints(

@@ -28,11 +28,13 @@ from openai import APIError, AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from pydantic import ValidationError
 
-from autocut.models import AnalysisHints, ClipPlan, Keyframe
+from autocut.models import AnalysisHints, ClipPlan, DetectionResult, Keyframe
 from autocut.video.frame_sampler import FrameSpec
 from autocut.vlm.base import CostEstimate, VLMError, VLMProvider
 from autocut.vlm.prompts import (
     PROMPT_VERSION,
+    build_detection_system_prompt,
+    build_detection_user_prompt,
     build_system_prompt,
     build_user_prompt,
 )
@@ -166,6 +168,81 @@ class OpenRouterProvider(VLMProvider):
         )
         return plan
 
+    async def detect_content(
+        self,
+        keyframes: list[Keyframe],
+        audio_description: str,
+        *,
+        video_id: str,
+        duration_sec: float,
+        timeout_sec: int = 120,
+        transcript_text: str | None = None,
+        audio_clip_path: Path | None = None,
+        video_clip_paths: list[Path] | None = None,
+    ) -> DetectionResult:
+        """Classify the video content type via a small OpenRouter call.
+
+        v0.1.0 sends only image content blocks + the textual audio
+        description. ``transcript_text`` (Whisper) and ``audio_clip_path``
+        (Gemini ``input_audio``) hooks are accepted for forward-compat but
+        not yet wired into the payload — they will be in v0.2.0 once the
+        capability detection picks Gemini specifically.
+        """
+        # Silence the forward-compat parameters until v0.2.0 plumbs them in.
+        del transcript_text, audio_clip_path, video_clip_paths
+
+        if not keyframes:
+            raise VLMError("openrouter.detect_content called with no keyframes")
+
+        system_prompt = build_detection_system_prompt()
+        user_prompt = build_detection_user_prompt(
+            duration_sec=duration_sec,
+            keyframe_timestamps=[kf.timestamp for kf in keyframes],
+            audio_description=audio_description,
+        )
+
+        content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
+        for kf in keyframes:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": _encode_image_to_data_url(kf.path)},
+                }
+            )
+
+        messages = cast(  # type: ignore[redundant-cast, unused-ignore]
+            list[ChatCompletionMessageParam],
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": content},
+            ],
+        )
+        start = time.monotonic()
+        try:
+            completion = await asyncio.wait_for(
+                self._client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    # Detection JSON is tiny; cap output low to limit cost.
+                    max_tokens=256,
+                ),
+                timeout=timeout_sec,
+            )
+        except TimeoutError as exc:
+            raise VLMError(f"openrouter detection timed out after {timeout_sec}s") from exc
+        except APIError as exc:
+            raise VLMError(f"openrouter detection API call failed: {exc}") from exc
+
+        elapsed = time.monotonic() - start
+        # Suppress unused-variable warning when timing is not logged.
+        del elapsed
+        raw = (completion.choices[0].message.content or "").strip()
+        if not raw:
+            raise VLMError("openrouter detection returned an empty response body")
+
+        return _parse_detection_response(raw, model=self.model, video_id=video_id)
+
     def estimate_cost(self, n_keyframes: int) -> CostEstimate:
         input_tokens = _TOKENS_PER_PROMPT_OVERHEAD + n_keyframes * _TOKENS_PER_IMAGE
         # Conservative output guess: assume ~10 clips at 120 tokens each.
@@ -210,6 +287,56 @@ def _encode_image_to_data_url(path: Path) -> str:
     suffix = path.suffix.lower().lstrip(".") or "jpeg"
     mime = "jpeg" if suffix == "jpg" else suffix
     return f"data:image/{mime};base64,{encoded}"
+
+
+def _parse_detection_response(raw: str, *, model: str, video_id: str) -> DetectionResult:
+    """Validate the detection JSON. Lenient on field-naming variations.
+
+    Wraps both invalid JSON and pydantic validation failures into ``VLMError``
+    with a message that identifies the model — so the user can tell which
+    backend misbehaved when one fails.
+    """
+    # ``video_id`` is currently logged via the surrounding error context;
+    # ``del`` silences unused-arg complaints without removing the parameter
+    # (we want it in the signature for future structured-logging hooks).
+    del video_id
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise VLMError(
+            f"openrouter detection ({model}) response was not valid JSON: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise VLMError(f"openrouter detection ({model}) response top-level value is not an object")
+
+    # Some models prefer ``category`` or ``content_type`` — normalise to
+    # the schema field ``content_hint`` so DetectionResult validates.
+    if "content_hint" not in payload:
+        for alias in ("category", "content_type", "type", "label"):
+            if alias in payload:
+                payload["content_hint"] = payload.pop(alias)
+                break
+    # Confidence might come as a string ("0.9") or percentage ("90%").
+    if isinstance(payload.get("confidence"), str):
+        raw_conf = payload["confidence"].strip().rstrip("%")
+        try:
+            value = float(raw_conf)
+        except ValueError as exc:
+            raise VLMError(
+                f"openrouter detection ({model}) returned non-numeric confidence: {payload['confidence']!r}"
+            ) from exc
+        # If the model wrote "90", read as percent → 0.9.
+        payload["confidence"] = value / 100.0 if value > 1.0 else value
+
+    try:
+        # Lowercase the hint so "Boxing" / "BOXING" still match the enum.
+        if isinstance(payload.get("content_hint"), str):
+            payload["content_hint"] = payload["content_hint"].lower().strip()
+        return DetectionResult.model_validate(payload)
+    except ValidationError as exc:
+        raise VLMError(
+            f"openrouter detection ({model}) response failed DetectionResult validation: {exc}"
+        ) from exc
 
 
 def _parse_response(

@@ -9,6 +9,7 @@ import json
 import shutil
 import subprocess
 import sys
+from datetime import timedelta
 from pathlib import Path
 from typing import Annotated
 
@@ -322,6 +323,264 @@ def resume(
 
 
 @app.command()
+def detect(
+    video: Annotated[Path, typer.Argument(help="Path to the input video file.")],
+    vlm: Annotated[
+        str | None,
+        typer.Option("--vlm", help="VLM provider override (host | openrouter)."),
+    ] = None,
+    vlm_model: Annotated[
+        str | None,
+        typer.Option("--vlm-model", help="VLM model id override (provider-specific)."),
+    ] = None,
+    output_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--output-dir",
+            help=(
+                "Where to drop detection keyframes (default: ./CLIPS). "
+                "JPEGs are reused by ``autocut run`` if you launch the full "
+                "pipeline next."
+            ),
+        ),
+    ] = None,
+    n_keyframes: Annotated[
+        int,
+        typer.Option(
+            "--keyframes",
+            min=3,
+            max=20,
+            help="Number of keyframes to sample (stratified random). Default 9.",
+        ),
+    ] = 9,
+) -> None:
+    """Classify the content type of VIDEO without running the full pipeline.
+
+    Prints a JSON object ``{content_hint, confidence, reasoning}``.
+    Useful before launching ``autocut run`` to confirm the auto-detected
+    category, or for AI agents that want to surface the classification
+    to a user before triggering the expensive highlight extraction.
+    """
+    from autocut.content import detect_content_hint
+    from autocut.video import probe_video
+
+    if not video.exists() or not video.is_file():
+        err_console.print(f"input video not found: {video}")
+        raise typer.Exit(code=1)
+
+    settings = AutoCutSettings.load()
+    cfg = settings.config
+    provider_name = vlm or cfg.vlm.provider
+    model = vlm_model or cfg.vlm.model
+    out_root = (output_dir or cfg.output.base_dir).resolve()
+
+    try:
+        provider = make_provider(provider_name, model=model, work_dir=out_root)
+    except UnavailableProviderError as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(code=2) from exc
+    except VLMError as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    try:
+        metadata = probe_video(video)
+        result = asyncio.run(
+            detect_content_hint(
+                video,
+                provider,
+                metadata=metadata,
+                output_root=out_root,
+                n_keyframes=n_keyframes,
+            )
+        )
+    except VLMError as exc:
+        err_console.print(f"detect failed: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print_json(
+        json.dumps(
+            {
+                "content_hint": result.content_hint.value,
+                "confidence": result.confidence,
+                "reasoning": result.reasoning,
+            }
+        )
+    )
+
+
+@app.command()
+def cut(
+    video: Annotated[Path, typer.Argument(help="Path to the input video file.")],
+    start: Annotated[
+        str,
+        typer.Option(
+            "--start",
+            "-s",
+            help="Start timestamp (HH:MM:SS.mmm or seconds, e.g. '00:02:15.500' or '135.5').",
+        ),
+    ],
+    end: Annotated[
+        str,
+        typer.Option(
+            "--end",
+            "-e",
+            help="End timestamp (HH:MM:SS.mmm or seconds, must be > start).",
+        ),
+    ],
+    output: Annotated[
+        Path,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Output MP4 path. Parent directory is created if missing.",
+        ),
+    ],
+    accurate: Annotated[
+        bool,
+        typer.Option(
+            "--accurate/--fast",
+            help=(
+                "Frame-accurate cut (re-encode with libx264) vs stream-copy. "
+                "Stream-copy is default — fast and lossless but snaps to the "
+                "nearest keyframe (typically ±1-2s)."
+            ),
+        ),
+    ] = False,
+) -> None:
+    """Cut a single segment ``[start, end]`` from VIDEO into OUTPUT via ffmpeg.
+
+    Deterministic, no VLM. Useful when the timestamps are already known
+    (e.g. from a previous ``autocut run`` manifest, or chosen by the user
+    directly).
+    """
+    # Imported lazily so callers that only use ``autocut keys``/``doctor``
+    # don't pay for video module imports.
+    from autocut.video import CutRequest, CutterError, cut_clip
+
+    if not video.exists() or not video.is_file():
+        err_console.print(f"input video not found: {video}")
+        raise typer.Exit(code=1)
+
+    start_td = _parse_cli_timestamp(start, field="--start")
+    end_td = _parse_cli_timestamp(end, field="--end")
+    if end_td <= start_td:
+        raise typer.BadParameter("--end must be strictly greater than --start")
+
+    request = CutRequest(start=start_td, end=end_td, output_path=output.resolve())
+    try:
+        produced = cut_clip(video, request, accurate=accurate)
+    except CutterError as exc:
+        err_console.print(f"cut failed: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    duration_sec = (end_td - start_td).total_seconds()
+    console.print(
+        f"[green]OK[/] cut {duration_sec:.3f}s "
+        f"({'accurate' if accurate else 'stream-copy'}) → {produced}"
+    )
+
+
+@app.command()
+def merge(
+    inputs: Annotated[
+        list[Path] | None,
+        typer.Argument(
+            help=(
+                "MP4 files to concatenate in the given order. "
+                "Mutually exclusive with --from-manifest."
+            ),
+        ),
+    ] = None,
+    output: Annotated[
+        Path,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Output MP4 path. Parent directory is created if missing.",
+        ),
+    ] = Path("highlights.mp4"),
+    from_manifest: Annotated[
+        Path | None,
+        typer.Option(
+            "--from-manifest",
+            help=(
+                "Read clips from an autocut manifest.json instead of positional args. "
+                "Pair with --min-score to filter."
+            ),
+        ),
+    ] = None,
+    min_score: Annotated[
+        int,
+        typer.Option(
+            "--min-score",
+            help="When using --from-manifest: keep only clips with final_score >= this.",
+            min=0,
+            max=10,
+        ),
+    ] = 0,
+    order: Annotated[
+        str,
+        typer.Option(
+            "--order",
+            help=(
+                "Output order: 'chronological' (clip.start ascending) | "
+                "'score-desc' (highest score first) | 'manifest' (manifest's existing order)."
+            ),
+        ),
+    ] = "chronological",
+) -> None:
+    """Concatenate MP4 files into a single output via the ffmpeg concat demuxer.
+
+    Two modes:
+
+    - **Positional**: ``autocut merge a.mp4 b.mp4 c.mp4 -o reel.mp4`` —
+      dumb concat in the given order. Inputs must share codec/resolution/fps.
+    - **Manifest-aware**: ``autocut merge --from-manifest CLIPS/manifest.json
+      --min-score 7 -o reel.mp4`` — reads the manifest, picks clips with
+      ``final_score >= min_score``, concats their separate-output files.
+    """
+    from autocut.video import ConcatError, concat_videos
+
+    if from_manifest is not None and inputs:
+        err_console.print(
+            "--from-manifest is mutually exclusive with positional input files. "
+            "Pass either inputs OR --from-manifest, not both."
+        )
+        raise typer.Exit(code=2)
+    if from_manifest is None and not inputs:
+        err_console.print(
+            "no inputs given: pass MP4 file paths positionally, OR use --from-manifest <path>."
+        )
+        raise typer.Exit(code=2)
+
+    if from_manifest is not None:
+        try:
+            selected = _select_from_manifest(from_manifest, min_score=min_score, order=order)
+        except ManifestSelectionError as exc:
+            err_console.print(str(exc))
+            raise typer.Exit(code=1) from exc
+        if not selected:
+            err_console.print(
+                f"manifest has no clips with final_score >= {min_score}; nothing to merge."
+            )
+            raise typer.Exit(code=1)
+        input_paths = selected
+    else:
+        # Typer guarantees inputs is non-empty here (we checked above).
+        assert inputs is not None
+        input_paths = [p.resolve() for p in inputs]
+
+    try:
+        produced = concat_videos(input_paths, output.resolve())
+    except ConcatError as exc:
+        err_console.print(f"merge failed: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(f"[green]OK[/] merged {len(input_paths)} file(s) → {produced}")
+
+
+@app.command()
 def bootstrap() -> None:
     """Detect installed AI agents and install skill manifests. Available from M5."""
     err_console.print("`autocut bootstrap` is not implemented yet. Available from M5.")
@@ -472,6 +731,124 @@ def models_list(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+class ManifestSelectionError(RuntimeError):
+    """Raised when ``--from-manifest`` cannot resolve a valid list of clip paths."""
+
+
+def _parse_cli_timestamp(raw: str, *, field: str) -> timedelta:
+    """Parse a CLI timestamp accepting both ``HH:MM:SS.mmm`` and plain seconds.
+
+    The pydantic model validator only accepts the structured form when
+    given a string; CLI users naturally type ``--start 5`` for "5 seconds".
+    We try the numeric conversion first (matching the model's numeric
+    path) and fall back to the structured grammar for ``00:00:05.500``
+    style inputs.
+    """
+    from autocut.models import _parse_timestamp
+
+    stripped = raw.strip()
+    try:
+        # Bare number → interpret as seconds, matching the model's numeric path.
+        return _parse_timestamp(float(stripped))
+    except (TypeError, ValueError):
+        pass
+    try:
+        return _parse_timestamp(stripped)
+    except (TypeError, ValueError) as exc:
+        raise typer.BadParameter(f"{field}: {exc}") from exc
+
+
+def _select_from_manifest(
+    manifest_path: Path,
+    *,
+    min_score: int,
+    order: str,
+) -> list[Path]:
+    """Read an autocut manifest.json and return the matching separate-output paths.
+
+    Selection: keep clips with ``final_score >= min_score``.
+    Ordering: ``chronological`` (clip.start asc) | ``score-desc`` |
+    ``manifest`` (keep manifest's existing clip order).
+
+    Raises ``ManifestSelectionError`` if the manifest is missing, malformed,
+    or doesn't contain a ``separate`` output section.
+    """
+    valid_orders = {"chronological", "score-desc", "manifest"}
+    if order not in valid_orders:
+        raise ManifestSelectionError(
+            f"unknown --order {order!r}; choose from {sorted(valid_orders)}"
+        )
+
+    if not manifest_path.is_file():
+        raise ManifestSelectionError(f"manifest not found: {manifest_path}")
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ManifestSelectionError(f"failed to read manifest {manifest_path}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ManifestSelectionError("manifest top-level value is not an object")
+
+    clips = data.get("clips")
+    outputs = data.get("outputs", {}) if isinstance(data.get("outputs"), dict) else {}
+    separate_paths_raw = outputs.get("separate")
+
+    if not isinstance(clips, list) or not clips:
+        raise ManifestSelectionError("manifest has no 'clips' array or it is empty")
+    if not isinstance(separate_paths_raw, list) or not separate_paths_raw:
+        raise ManifestSelectionError(
+            "manifest has no 'outputs.separate' paths — re-run `autocut run --output separate` "
+            "(or --output all) first so per-clip MP4s exist on disk."
+        )
+    if len(separate_paths_raw) != len(clips):
+        # Defensive: dispatcher writes them index-aligned today; flag any drift
+        # explicitly rather than silently mis-matching scores to paths.
+        raise ManifestSelectionError(
+            f"manifest is inconsistent: {len(clips)} clips vs "
+            f"{len(separate_paths_raw)} separate outputs"
+        )
+
+    # Pair each clip dict with its corresponding output path before filtering,
+    # so we never lose the score↔path correspondence during sort.
+    pairs: list[tuple[dict[str, object], Path]] = []
+    for clip, raw_path in zip(clips, separate_paths_raw, strict=True):
+        if not isinstance(clip, dict):
+            continue
+        pairs.append((clip, Path(str(raw_path))))
+
+    filtered = [(c, p) for c, p in pairs if _final_score(c) >= min_score]
+
+    if order == "score-desc":
+        filtered.sort(key=lambda pair: _final_score(pair[0]), reverse=True)
+    elif order == "chronological":
+        filtered.sort(key=lambda pair: _clip_start_seconds(pair[0]))
+    # ``manifest`` keeps the existing order — no sort.
+
+    return [p for _, p in filtered]
+
+
+def _final_score(clip: dict[str, object]) -> int:
+    """Return ``clip.final_score`` as an int, defaulting to 0 when absent/malformed."""
+    raw = clip.get("final_score", 0)
+    if isinstance(raw, int | float):
+        return int(raw)
+    return 0
+
+
+def _clip_start_seconds(clip: dict[str, object]) -> float:
+    """Return the clip start in seconds, parsing the manifest's HH:MM:SS.mmm string."""
+    raw = clip.get("start", "00:00:00.000")
+    if isinstance(raw, int | float):
+        return float(raw)
+    if isinstance(raw, str):
+        try:
+            td = _parse_cli_timestamp(raw, field="manifest clip.start")
+        except typer.BadParameter:
+            return 0.0
+        return td.total_seconds()
+    return 0.0
 
 
 def _probe_binary(name: str) -> str:

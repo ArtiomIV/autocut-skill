@@ -20,6 +20,8 @@ from autocut.models import (
     Clip,
     ClipPlan,
     ClipPlanMetadata,
+    ContentHint,
+    DetectionResult,
     Keyframe,
     Scene,
     VideoMetadata,
@@ -67,6 +69,34 @@ class _StubProvider(VLMProvider):
                 )
             ],
             metadata=ClipPlanMetadata(vlm_provider=self.name, vlm_model=self.model),
+        )
+
+    async def detect_content(
+        self,
+        keyframes: list[Keyframe],
+        audio_description: str,
+        *,
+        video_id: str,
+        duration_sec: float,
+        timeout_sec: int = 120,
+        transcript_text: str | None = None,
+        audio_clip_path: Path | None = None,
+        video_clip_paths: list[Path] | None = None,
+    ) -> DetectionResult:
+        del (
+            keyframes,
+            audio_description,
+            video_id,
+            duration_sec,
+            timeout_sec,
+            transcript_text,
+            audio_clip_path,
+            video_clip_paths,
+        )
+        return DetectionResult(
+            content_hint=ContentHint.other,
+            confidence=0.0,
+            reasoning="stub provider — cost-cap test fixture",
         )
 
     def estimate_cost(self, n_keyframes: int) -> CostEstimate:
@@ -118,6 +148,18 @@ def _stub_video_stack(monkeypatch: pytest.MonkeyPatch) -> None:
         "autocut.pipeline.extract_keyframes",
         lambda video, specs, out_dir, long_edge_px: fake_keyframes,
     )
+
+    # Phase E: bypass auto-detect entirely so cost-cap tests stay focused on
+    # the cost gate. Return a low-confidence ``other`` so the pipeline falls
+    # back to HYBRID without running ffmpeg on a fake path.
+    async def _stub_auto_detect(*_args: object, **_kwargs: object) -> DetectionResult:
+        return DetectionResult(
+            content_hint=ContentHint.other,
+            confidence=0.0,
+            reasoning="cost-cap test fixture bypassing detection",
+        )
+
+    monkeypatch.setattr("autocut.pipeline._run_auto_detect", _stub_auto_detect)
 
 
 # ---------------------------------------------------------------------------

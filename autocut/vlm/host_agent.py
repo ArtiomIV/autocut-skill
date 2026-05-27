@@ -27,7 +27,7 @@ from typing import ClassVar
 
 from pydantic import ValidationError
 
-from autocut.models import AnalysisHints, ClipPlan, Keyframe
+from autocut.models import AnalysisHints, ClipPlan, ContentHint, DetectionResult, Keyframe
 from autocut.video.frame_sampler import FrameSpec
 from autocut.vlm.base import (
     CostEstimate,
@@ -99,6 +99,54 @@ class HostAgentProvider(VLMProvider):
             response_path,
         )
         raise HostAgentPauseRequested(request_path=request_path, response_path=response_path)
+
+    async def detect_content(
+        self,
+        keyframes: list[Keyframe],
+        audio_description: str,
+        *,
+        video_id: str,
+        duration_sec: float,
+        timeout_sec: int = 120,
+        transcript_text: str | None = None,
+        audio_clip_path: Path | None = None,
+        video_clip_paths: list[Path] | None = None,
+    ) -> DetectionResult:
+        """v0.1.0 stub: returns a low-confidence ``other`` so the pipeline falls back.
+
+        Host-agent detection would require a second pause/resume cycle
+        (DETECTION_REQUEST.md → DETECTION.json before VLM_REQUEST.md).
+        That UX cost was judged too high for v0.1.0: users who want a
+        specific profile can pass ``--content-hint`` explicitly, and the
+        ``HYBRID_PROFILE`` fallback preserves the current behaviour for
+        the ``auto`` case.
+
+        When v0.1.x adds the second pause flow, this stub becomes the
+        only implementation change needed — every other Phase E surface
+        (prompts, models, pipeline wiring) is already capability-aware.
+        """
+        # The signature accepts every forward-compat arg; for the stub we
+        # ignore them all explicitly so static analysers do not warn.
+        del (
+            keyframes,
+            audio_description,
+            video_id,
+            duration_sec,
+            timeout_sec,
+            transcript_text,
+            audio_clip_path,
+            video_clip_paths,
+        )
+        log.warning(
+            "host_agent.detect_content is a v0.1.0 stub — returning low-confidence "
+            "'other'; pass --content-hint explicitly to skip detection or use "
+            "--vlm openrouter for full auto-detect."
+        )
+        return DetectionResult(
+            content_hint=ContentHint.other,
+            confidence=0.0,
+            reasoning="host-agent auto-detect is deferred to v0.1.x; HYBRID profile applied as fallback",
+        )
 
     def estimate_cost(self, n_keyframes: int) -> CostEstimate:
         """Host-agent uses the existing AI subscription — zero marginal cost."""

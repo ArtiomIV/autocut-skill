@@ -5,20 +5,22 @@ Two-step process:
 1. Cut every clip into a temporary directory (re-encoded so all chunks share
    the same codec parameters — required by the concat demuxer in stream-copy
    mode for the final stitch).
-2. Build a ``concat.txt`` file list and run ``ffmpeg -f concat -safe 0 -i
-   concat.txt -c copy highlights.mp4``.
+2. Delegate the actual concat to ``autocut.video.concat.concat_videos``,
+   which runs ``ffmpeg -f concat -safe 0 -i concat.txt -c copy highlights.mp4``.
 
 Re-encoding the chunks is the safe path; it tolerates source videos with
 mixed codecs/resolutions/framerates that would otherwise refuse to concat.
 For v0.1.0 the re-encode cost is acceptable (we cut at most ~20 chunks per
 run by default).
+
+The concat primitive lives in ``autocut.video.concat`` so the standalone
+``autocut merge`` CLI can reuse it without dragging in the writer/ranker
+machinery this module needs.
 """
 
 from __future__ import annotations
 
 import logging
-import shutil
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import ClassVar, Literal
@@ -28,17 +30,20 @@ from autocut.output.base import OutputWriter, WrittenClip
 from autocut.scoring import RankedClip
 from autocut.security.paths import ensure_inside
 from autocut.video import CutRequest, cut_clip
+from autocut.video.concat import ConcatError, concat_videos
 from autocut.video.cutter import expand_request
 
 log = logging.getLogger(__name__)
 
 SUBDIR_NAME = "merged"
 DEFAULT_OUTPUT_NAME = "highlights.mp4"
-_CONCAT_TIMEOUT_SEC = 600
 
 
-class MergedConcatError(RuntimeError):
-    """Raised when the final concat ffmpeg invocation fails."""
+# Kept for backwards compatibility with callers that catch this specific
+# error. The shared concat primitive raises ``ConcatError``; we re-export
+# it under the legacy name so existing ``except MergedConcatError`` blocks
+# keep working without code changes.
+MergedConcatError = ConcatError
 
 
 class MergedWriter(OutputWriter):
@@ -69,25 +74,17 @@ class MergedWriter(OutputWriter):
         target_dir.mkdir(parents=True, exist_ok=True)
         final_path = ensure_inside(target_dir / DEFAULT_OUTPUT_NAME, target_dir)
 
-        ffmpeg_binary = shutil.which("ffmpeg")
-        if ffmpeg_binary is None:
-            raise MergedConcatError(
-                "ffmpeg not found in PATH; install ffmpeg before producing merged output"
-            )
-
         with tempfile.TemporaryDirectory(prefix="autocut_merge_") as tmp:
-            tmp_dir = Path(tmp)
             chunk_paths = _cut_chunks(
                 video_path,
                 ordered_clips,
-                tmp_dir,
+                Path(tmp),
                 accurate=accurate,
                 pre_roll_sec=pre_roll_sec,
                 post_roll_sec=post_roll_sec,
                 video_duration_sec=video_duration_sec,
             )
-            concat_list = _write_concat_list(tmp_dir, chunk_paths)
-            _run_concat(ffmpeg_binary, concat_list, final_path)
+            concat_videos(chunk_paths, final_path)
 
         _write_order_log(target_dir, ordered_clips)
         log.info("merged: wrote %s (%d chunks)", final_path.name, len(ordered_clips))
@@ -139,48 +136,6 @@ def _cut_chunks(
         cut_clip(video_path, request, accurate=True)
         chunk_paths.append(chunk)
     return chunk_paths
-
-
-def _write_concat_list(tmp_dir: Path, chunk_paths: list[Path]) -> Path:
-    list_file = tmp_dir / "concat.txt"
-    lines = [f"file '{_escape_for_concat(p)}'" for p in chunk_paths]
-    list_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return list_file
-
-
-def _escape_for_concat(path: Path) -> str:
-    """Escape single quotes for the ffmpeg concat demuxer file syntax."""
-    return str(path).replace("'", r"'\''")
-
-
-def _run_concat(ffmpeg_binary: str, concat_list: Path, out_path: Path) -> None:
-    args: list[str] = [
-        ffmpeg_binary,
-        "-y",
-        "-loglevel",
-        "error",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(concat_list),
-        "-c",
-        "copy",
-        str(out_path),
-    ]
-    try:
-        completed = subprocess.run(  # noqa: S603 - args is a fixed list, no shell
-            args,
-            capture_output=True,
-            text=True,
-            timeout=_CONCAT_TIMEOUT_SEC,
-            check=False,
-        )
-    except (subprocess.SubprocessError, OSError) as exc:
-        raise MergedConcatError(f"failed to invoke ffmpeg concat: {exc}") from exc
-    if completed.returncode != 0 or not out_path.is_file():
-        raise MergedConcatError(f"ffmpeg concat failed: {completed.stderr.strip()}")
 
 
 def _write_order_log(target_dir: Path, clips: list[RankedClip]) -> None:
