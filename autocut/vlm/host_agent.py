@@ -27,7 +27,7 @@ from typing import ClassVar
 
 from pydantic import ValidationError
 
-from autocut.models import AnalysisHints, ClipPlan, ContentHint, DetectionResult, Keyframe
+from autocut.models import AnalysisHints, ClipPlan, DetectionResult, Keyframe
 from autocut.video.frame_sampler import FrameSpec
 from autocut.vlm.base import (
     CostEstimate,
@@ -45,6 +45,12 @@ log = logging.getLogger(__name__)
 
 REQUEST_FILENAME = "VLM_REQUEST.md"
 RESPONSE_FILENAME = "VLM_RESPONSE.json"
+
+# Phase E (host-agent detection) request/response filenames. Distinct from
+# the analysis ones so both phases can leave artefacts in the same work
+# dir without colliding, and so the CLI can tell which phase to resume.
+DETECTION_REQUEST_FILENAME = "DETECTION_REQUEST.md"
+DETECTION_RESPONSE_FILENAME = "DETECTION_RESPONSE.json"
 
 
 class HostAgentProvider(VLMProvider):
@@ -112,41 +118,97 @@ class HostAgentProvider(VLMProvider):
         audio_clip_path: Path | None = None,
         video_clip_paths: list[Path] | None = None,
     ) -> DetectionResult:
-        """v0.1.0 stub: returns a low-confidence ``other`` so the pipeline falls back.
+        """Pause for the host agent to classify the content type.
 
-        Host-agent detection would require a second pause/resume cycle
-        (DETECTION_REQUEST.md → DETECTION.json before VLM_REQUEST.md).
-        That UX cost was judged too high for v0.1.0: users who want a
-        specific profile can pass ``--content-hint`` explicitly, and the
-        ``HYBRID_PROFILE`` fallback preserves the current behaviour for
-        the ``auto`` case.
+        Writes ``DETECTION_REQUEST.md`` next to the keyframes, raises
+        ``HostAgentPauseRequested``, and expects ``DETECTION_RESPONSE.json``
+        to be filled in by the surrounding agent before the user runs
+        ``autocut resume``. The resume command catches the detection
+        phase, applies the classification, then re-enters the pipeline
+        for the standard analysis pause.
 
-        When v0.1.x adds the second pause flow, this stub becomes the
-        only implementation change needed — every other Phase E surface
-        (prompts, models, pipeline wiring) is already capability-aware.
+        ``timeout_sec`` and the forward-compat audio/video/transcript
+        kwargs are accepted but unused: this implementation is a synchronous
+        pause and only passes the textual audio description to the agent.
         """
-        # The signature accepts every forward-compat arg; for the stub we
-        # ignore them all explicitly so static analysers do not warn.
-        del (
-            keyframes,
-            audio_description,
-            video_id,
-            duration_sec,
-            timeout_sec,
-            transcript_text,
-            audio_clip_path,
-            video_clip_paths,
+        del timeout_sec, transcript_text, audio_clip_path, video_clip_paths
+
+        if not keyframes:
+            raise VLMError("host_agent.detect_content called with no keyframes")
+
+        self._work_dir.mkdir(parents=True, exist_ok=True)
+        request_path = self._work_dir / DETECTION_REQUEST_FILENAME
+        response_path = self._work_dir / DETECTION_RESPONSE_FILENAME
+
+        markdown = _render_detection_request_markdown(
+            video_id=video_id,
+            duration_sec=duration_sec,
+            audio_description=audio_description,
+            keyframes=keyframes,
+            response_path=response_path,
         )
-        log.warning(
-            "host_agent.detect_content is a v0.1.0 stub — returning low-confidence "
-            "'other'; pass --content-hint explicitly to skip detection or use "
-            "--vlm openrouter for full auto-detect."
+        request_path.write_text(markdown, encoding="utf-8")
+        log.info(
+            "host_agent paused for detection: wrote %s, waiting for %s",
+            request_path,
+            response_path,
         )
-        return DetectionResult(
-            content_hint=ContentHint.other,
-            confidence=0.0,
-            reasoning="host-agent auto-detect is deferred to v0.1.x; HYBRID profile applied as fallback",
-        )
+        raise HostAgentPauseRequested(request_path=request_path, response_path=response_path)
+
+    def resume_detection_from_disk(
+        self,
+        *,
+        request_path: Path | None = None,
+        response_path: Path | None = None,
+    ) -> DetectionResult:
+        """Load and validate the detection JSON the host agent wrote.
+
+        Mirrors ``resume_from_disk`` but expects a ``DetectionResult``
+        schema (``content_hint`` / ``confidence`` / ``reasoning``) instead
+        of a ``ClipPlan``. The lenient aliasing applied to the openrouter
+        path is replicated here so the host agent's response stays robust
+        against minor schema drift (e.g. an agent writing ``category``
+        instead of ``content_hint``).
+        """
+        del request_path  # currently unused
+        rp = response_path or (self._work_dir / DETECTION_RESPONSE_FILENAME)
+        if not rp.is_file():
+            raise VLMError(
+                f"host_agent detection response file not found: {rp} "
+                f"(ask the agent to write the DetectionResult JSON there, then re-run)"
+            )
+        try:
+            payload = json.loads(rp.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise VLMError(f"failed to read host_agent detection response: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise VLMError("host_agent detection response top-level value is not an object")
+
+        # Apply the same lenient aliases the openrouter parser uses so the
+        # host agent has identical wiggle room with the schema.
+        if "content_hint" not in payload:
+            for alias in ("category", "content_type", "type", "label"):
+                if alias in payload:
+                    payload["content_hint"] = payload.pop(alias)
+                    break
+        if isinstance(payload.get("content_hint"), str):
+            payload["content_hint"] = payload["content_hint"].lower().strip()
+        if isinstance(payload.get("confidence"), str):
+            raw_conf = payload["confidence"].strip().rstrip("%")
+            try:
+                value = float(raw_conf)
+            except ValueError as exc:
+                raise VLMError(
+                    f"host_agent detection confidence non-numeric: {payload['confidence']!r}"
+                ) from exc
+            payload["confidence"] = value / 100.0 if value > 1.0 else value
+
+        try:
+            return DetectionResult.model_validate(payload)
+        except ValidationError as exc:
+            raise VLMError(
+                f"host_agent detection response failed DetectionResult validation: {exc}"
+            ) from exc
 
     def estimate_cost(self, n_keyframes: int) -> CostEstimate:
         """Host-agent uses the existing AI subscription — zero marginal cost."""
@@ -277,6 +339,79 @@ def _render_request_markdown(
         keyframe_listing="\n".join(listing_lines),
         system_prompt=system_prompt,
         user_prompt=user_prompt,
+    )
+
+
+_DETECTION_REQUEST_TEMPLATE = """\
+# AutoCut — host-agent CONTENT DETECTION request (Phase E)
+
+The AutoCut pipeline is paused at the **detection** step. Before running
+the expensive analysis pass, AutoCut needs you to classify the video so
+it can pick the right highlight-extraction profile (sport vs talk vs
+hybrid). This is the first of two pauses; the second is the standard
+clip-analysis request and will come after you resume.
+
+## What to do
+
+1. Read each detection keyframe image listed below with your file/image tool.
+2. Use the audio profile description (next section) as additional signal.
+3. Pick ONE content type from the enum and write the JSON object to:
+
+   `{response_path}`
+
+4. Tell the user to run `autocut resume`. AutoCut will apply the
+   classification, then pause again with the regular `VLM_REQUEST.md`
+   so you can produce the ClipPlan.
+
+Do NOT output anything else in the response file. JSON only.
+
+## Schema you must match
+
+```
+{{
+  "content_hint": "boxing|sport|gameplay|talk|podcast|other",
+  "confidence":  <number 0.0..1.0>,
+  "reasoning":   "<one short sentence describing the dominant signal>"
+}}
+```
+
+Guidance:
+- ``confidence`` is your self-assessment. Use >= 0.8 only when visual +
+  audio signals clearly agree.
+- When undecided between two categories, prefer ``other`` over a guess;
+  AutoCut will fall back to HYBRID gracefully.
+
+## Audio profile (computed from the waveform, no transcription)
+
+```
+{audio_description}
+```
+
+## Detection keyframes (stratified random, spanning the full timeline)
+
+{keyframe_listing}
+"""
+
+
+def _render_detection_request_markdown(
+    *,
+    video_id: str,
+    duration_sec: float,
+    audio_description: str,
+    keyframes: list[Keyframe],
+    response_path: Path,
+) -> str:
+    """Build the markdown brief the host agent reads to classify the video."""
+    # ``video_id`` is logged downstream but not used in the body today;
+    # accept it so the call site mirrors ``_render_request_markdown``.
+    del video_id, duration_sec
+    listing_lines: list[str] = []
+    for i, kf in enumerate(keyframes, start=1):
+        listing_lines.append(f"{i}. `{kf.path}` — t = {_format_ts(kf.timestamp)}")
+    return _DETECTION_REQUEST_TEMPLATE.format(
+        response_path=response_path,
+        audio_description=audio_description.rstrip(),
+        keyframe_listing="\n".join(listing_lines),
     )
 
 

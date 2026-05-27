@@ -22,11 +22,14 @@ from autocut import __version__
 from autocut.config import AutoCutConfig, AutoCutSettings, OutputMode, config_path
 from autocut.models import AnalysisHints, ClipPlan, ContentHint, VideoMetadata
 from autocut.pipeline import (
+    DETECTION_RESUME_STATE_FILENAME,
     AnalysisResult,
     CostCapExceeded,
     ResumeStateError,
     complete_from_plan,
+    load_detection_resume_state,
     load_resume_state,
+    resume_after_detection,
     run_analysis,
 )
 from autocut.scoring import RankedClip
@@ -265,15 +268,94 @@ def resume(
         Path | None,
         typer.Option(
             "--work-dir",
-            help="Directory containing VLM_REQUEST.md / VLM_RESPONSE.json (default: ./CLIPS).",
+            help="Directory containing DETECTION_RESPONSE.json / VLM_RESPONSE.json (default: ./CLIPS).",
         ),
     ] = None,
 ) -> None:
-    """Resume a paused host-agent run: validate the JSON, rank, write clips."""
+    """Resume a paused host-agent run.
+
+    Two phases (in order) are supported:
+
+    1. **Detection** (Phase E) — if ``DETECTION_REQUEST.md`` was written
+       and a ``.autocut_detect_resume.json`` sidecar exists, this loads
+       ``DETECTION_RESPONSE.json``, applies the classification, then
+       re-enters the pipeline (which will pause again at the analysis
+       step with a fresh ``VLM_REQUEST.md``).
+
+    2. **Analysis** — if the standard ``.autocut_resume.json`` sidecar
+       exists, this loads ``VLM_RESPONSE.json``, ranks clips, runs the
+       output writers, and writes the manifest.
+
+    The detection sidecar takes precedence: a single run can produce both
+    files in sequence, and we always continue from the earliest pending
+    phase.
+    """
     settings = AutoCutSettings.load()
     cfg = settings.config
     base = (work_dir or cfg.output.base_dir).resolve()
 
+    if (base / DETECTION_RESUME_STATE_FILENAME).is_file():
+        _resume_detection_phase(base, cfg)
+        return
+    _resume_analysis_phase(base, cfg)
+
+
+def _resume_detection_phase(base: Path, cfg: AutoCutConfig) -> None:
+    """Handle the Phase E detection resume.
+
+    Loads the detection state + the host agent's DetectionResult JSON,
+    invokes ``resume_after_detection`` which re-enters the pipeline,
+    catches the analysis-step pause and prints the second pause message.
+    """
+    try:
+        state = load_detection_resume_state(base)
+    except ResumeStateError as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    provider = HostAgentProvider(work_dir=base, agent_hint=cfg.vlm.model)
+    try:
+        detection = provider.resume_detection_from_disk()
+    except VLMError as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    console.print(
+        f"[green]OK[/] detection resolved: "
+        f"[bold]{detection.content_hint.value}[/] "
+        f"(confidence {detection.confidence:.2f})\n"
+        f"  reasoning: {detection.reasoning}\n"
+        f"[dim]Re-entering pipeline; expect a second pause at the analysis step.[/]\n"
+    )
+
+    try:
+        result = asyncio.run(
+            resume_after_detection(
+                detection,
+                state=state,
+                provider=provider,
+                config=cfg,
+                confirm_cost=_make_cost_confirm(yes=False),
+            )
+        )
+    except HostAgentPauseRequested as pause:
+        # Expected: second pause for the analysis step. Show its message.
+        _print_pause_message(pause)
+        raise typer.Exit(code=0) from None
+    except CostCapExceeded as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(code=1) from exc
+    except VLMError as exc:
+        err_console.print(f"VLM error during resume: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    # Unexpected: pipeline returned without pausing (e.g. provider isn't
+    # host-agent — keep the path defensive). Render the summary anyway.
+    _render_analysis_summary(result)
+
+
+def _resume_analysis_phase(base: Path, cfg: AutoCutConfig) -> None:
+    """Handle the standard host-agent analysis resume (pre-Phase-E flow)."""
     try:
         state = load_resume_state(base)
     except ResumeStateError as exc:
