@@ -19,7 +19,7 @@ from rich.console import Console
 from rich.table import Table
 
 from autocut import __version__
-from autocut.config import AutoCutConfig, AutoCutSettings, OutputMode, config_path
+from autocut.config import AutoCutConfig, AutoCutSettings, config_path
 from autocut.models import AnalysisHints, ClipPlan, ContentHint, VideoMetadata
 from autocut.pipeline import (
     DETECTION_RESUME_STATE_FILENAME,
@@ -170,14 +170,6 @@ def run(
             ),
         ),
     ] = None,
-    output: Annotated[
-        str | None,
-        typer.Option(
-            "--output",
-            help="Comma-separated output modes: separate | merged | all. "
-            "Defaults to the config (typically 'separate').",
-        ),
-    ] = None,
     output_dir: Annotated[
         Path | None,
         typer.Option("--output-dir", help="Override output base dir (default: ./CLIPS)."),
@@ -212,8 +204,11 @@ def run(
 
     settings = AutoCutSettings.load()
     cfg = settings.config
-    if output is not None:
-        cfg.output.modes = _parse_output_modes(output)
+    # ``run`` always produces per-clip separate outputs. Composing a single
+    # reel is the job of the deterministic ``autocut merge`` subcommand, so the
+    # pipeline never mutates the output mode at runtime — that keeps the
+    # resume sidecar trivially consistent (no output mode to persist).
+    cfg.output.modes = ["separate"]
 
     hints_override = _build_hints_from_cli(content_hint, cfg)
 
@@ -881,8 +876,8 @@ def _select_from_manifest(
         raise ManifestSelectionError("manifest has no 'clips' array or it is empty")
     if not isinstance(separate_paths_raw, list) or not separate_paths_raw:
         raise ManifestSelectionError(
-            "manifest has no 'outputs.separate' paths — re-run `autocut run --output separate` "
-            "(or --output all) first so per-clip MP4s exist on disk."
+            "manifest has no 'outputs.separate' paths — re-run `autocut run` "
+            "first so per-clip MP4s exist on disk."
         )
     if len(separate_paths_raw) != len(clips):
         # Defensive: dispatcher writes them index-aligned today; flag any drift
@@ -1006,22 +1001,6 @@ def _build_hints_from_cli(
         goal=defaults.goal,
         language=defaults.language,
     )
-
-
-def _parse_output_modes(raw: str) -> list[OutputMode]:
-    """Split a comma-separated string into validated ``OutputMode`` values."""
-    valid: set[str] = {"separate", "merged", "all"}
-    modes: list[OutputMode] = []
-    for token in raw.split(","):
-        cleaned = token.strip().lower()
-        if cleaned not in valid:
-            raise typer.BadParameter(
-                f"unknown output mode {cleaned!r}; choose from {sorted(valid)}"
-            )
-        # ``cast`` would also work; the literal-membership check above makes
-        # this assignment type-safe for mypy.
-        modes.append(cleaned)  # type: ignore[arg-type]
-    return modes
 
 
 def _make_cost_confirm(*, yes: bool):  # type: ignore[no-untyped-def]
