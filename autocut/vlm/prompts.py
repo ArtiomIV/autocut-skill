@@ -19,7 +19,10 @@ from typing import Final
 from autocut.models import AnalysisHints, ClipPlan, PromptTemplateId
 from autocut.video.frame_sampler import FrameSpec
 
-PROMPT_VERSION: Final[str] = "v1"
+# v2 (2026-05-28): reworked sport/talk clip-boundary guidance so the model
+# includes the wind-up and follow-through of the key moment instead of cutting
+# tight on the impact. The detection prompt is unchanged, hence its own version.
+PROMPT_VERSION: Final[str] = "v2"
 DETECTION_PROMPT_VERSION: Final[str] = "v1"
 
 
@@ -73,8 +76,14 @@ Content guidance — sport / combat / action:
 - Score < 7 examples: defensive guard, ref breaks, fighters circling
   or studying each other, single isolated jab without follow-up,
   movement without engagement.
-- Prefer TIGHT cuts that frame the action without preamble. The clip
-  should start at the engagement, not at the setup.
+- Cut tight, but keep the moment readable. Start a beat BEFORE the
+  decisive action so it is legible (the wind-up, the combination
+  leading to a knockdown, the approach to the strike), and ALWAYS
+  include the immediate follow-through and reaction (the opponent
+  going down, the referee stepping in, the celebration). NEVER end on
+  the frame of impact itself — the aftermath is what makes the clip
+  land. Trim idle setup and dead air, not the action's natural
+  beginning and end.
 """
 
 
@@ -89,8 +98,11 @@ Content guidance — talk / podcast / interview:
   surprise), close-up emotional moments, shared moments of agreement.
 - Score < 7 examples: static talking heads with no visible energy,
   transitions between speakers, neutral discussion frames.
-- Clips can be longer here: a good moment often needs setup AND
-  payoff to read as a clip on its own.
+- Clips can be longer here: a good moment needs both setup AND payoff
+  to read on its own. Start a beat before the key line or gesture so it
+  has context, and ALWAYS include the reaction that follows (the laugh,
+  the nod, the stunned pause, the interviewer's response). NEVER end on
+  the punchline frame itself — the reaction is what makes it land.
 """
 
 
@@ -122,9 +134,9 @@ Return JSON matching this schema (do not output the schema itself, output
 your analysis):
 {schema}
 
-Fill ``video_id`` with {video_id!r}, ``duration_sec`` with {duration_sec},
-and ``metadata.vlm_provider`` / ``metadata.vlm_model`` with the model
-that produced this analysis. ``metadata.prompt_version`` must equal {pv!r}.
+Fill ``video_id`` with {video_id!r} and ``duration_sec`` with {duration_sec}.
+Leave ``metadata`` as an empty object — provenance fields (provider, model,
+prompt version, timing) are filled in by the caller.
 """
 
 
@@ -249,5 +261,4 @@ def build_user_prompt(
         keyframe_lines=keyframe_lines,
         schema=clip_plan_schema(),
         video_id=video_id,
-        pv=PROMPT_VERSION,
     )

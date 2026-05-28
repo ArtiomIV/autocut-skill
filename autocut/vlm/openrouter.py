@@ -224,8 +224,13 @@ class OpenRouterProvider(VLMProvider):
                     model=self.model,
                     messages=messages,
                     response_format={"type": "json_object"},
-                    # Detection JSON is tiny; cap output low to limit cost.
-                    max_tokens=256,
+                    # The detection JSON itself is tiny, but "thinking" models
+                    # (e.g. Gemini 3.x Flash) spend part of the token budget on
+                    # internal reasoning before emitting output. A 256 cap left
+                    # too little for the JSON, truncating it mid-string. Give
+                    # enough headroom that the object always completes; unused
+                    # tokens are not billed.
+                    max_tokens=2048,
                 ),
                 timeout=timeout_sec,
             )
@@ -240,6 +245,7 @@ class OpenRouterProvider(VLMProvider):
         raw = (completion.choices[0].message.content or "").strip()
         if not raw:
             raise VLMError("openrouter detection returned an empty response body")
+        log.debug("openrouter detection raw response: %s", raw[:300])
 
         return _parse_detection_response(raw, model=self.model, video_id=video_id)
 
@@ -289,6 +295,34 @@ def _encode_image_to_data_url(path: Path) -> str:
     return f"data:image/{mime};base64,{encoded}"
 
 
+def _extract_json(raw: str) -> str:
+    """Best-effort isolation of a JSON object from a model response.
+
+    Despite ``response_format={"type": "json_object"}``, some models routed
+    through OpenRouter still wrap their JSON in a markdown code fence
+    (```` ```json ... ``` ````) or surround it with prose. We strip a leading/
+    trailing fence and, failing that, fall back to the substring between the
+    first ``{`` and the last ``}``. Returns the original (stripped) text when
+    no object-looking span is found, so the caller's ``json.loads`` still
+    raises a meaningful error.
+    """
+    text = raw.strip()
+    if text.startswith("```"):
+        newline = text.find("\n")
+        if newline != -1:
+            text = text[newline + 1 :]
+        fence = text.rfind("```")
+        if fence != -1:
+            text = text[:fence]
+        text = text.strip()
+    if not text.startswith("{"):
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end > start:
+            text = text[start : end + 1]
+    return text
+
+
 def _parse_detection_response(raw: str, *, model: str, video_id: str) -> DetectionResult:
     """Validate the detection JSON. Lenient on field-naming variations.
 
@@ -301,10 +335,11 @@ def _parse_detection_response(raw: str, *, model: str, video_id: str) -> Detecti
     # (we want it in the signature for future structured-logging hooks).
     del video_id
     try:
-        payload = json.loads(raw)
+        payload = json.loads(_extract_json(raw))
     except json.JSONDecodeError as exc:
         raise VLMError(
-            f"openrouter detection ({model}) response was not valid JSON: {exc}"
+            f"openrouter detection ({model}) response was not valid JSON: {exc}; "
+            f"raw response began with: {raw[:200]!r}"
         ) from exc
     if not isinstance(payload, dict):
         raise VLMError(f"openrouter detection ({model}) response top-level value is not an object")
@@ -348,14 +383,20 @@ def _parse_response(
 ) -> ClipPlan:
     """Parse a VLM response string and validate it as ``ClipPlan``.
 
-    The provider injects metadata (provider name, model, prompt version,
-    timing) if the model forgot, so the downstream pipeline always sees a
-    fully-populated record.
+    Provenance metadata (provider name, model, prompt version, timing) is
+    authoritative on our side: we passed ``model`` to the API and measured
+    ``elapsed_sec`` ourselves. We therefore overwrite whatever the model put
+    in those fields — left to its own devices a model misidentifies itself
+    (e.g. Gemini 3.5 Flash reporting ``gemini-1.5-pro``), which would corrupt
+    the manifest's provenance and cost attribution.
     """
     try:
-        payload = json.loads(raw)
+        payload = json.loads(_extract_json(raw))
     except json.JSONDecodeError as exc:
-        raise VLMError(f"openrouter response was not valid JSON: {exc}") from exc
+        raise VLMError(
+            f"openrouter response was not valid JSON: {exc}; "
+            f"raw response began with: {raw[:200]!r}"
+        ) from exc
 
     if not isinstance(payload, dict):
         raise VLMError("openrouter response top-level value is not an object")
@@ -363,10 +404,10 @@ def _parse_response(
     metadata = payload.setdefault("metadata", {})
     if not isinstance(metadata, dict):
         raise VLMError("openrouter response metadata field is not an object")
-    metadata.setdefault("vlm_provider", provider)
-    metadata.setdefault("vlm_model", model)
-    metadata.setdefault("prompt_version", PROMPT_VERSION)
-    metadata.setdefault("analysis_time_sec", round(elapsed_sec, 2))
+    metadata["vlm_provider"] = provider
+    metadata["vlm_model"] = model
+    metadata["prompt_version"] = PROMPT_VERSION
+    metadata["analysis_time_sec"] = round(elapsed_sec, 2)
 
     try:
         return ClipPlan.model_validate(payload)

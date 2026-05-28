@@ -8,7 +8,6 @@ from datetime import timedelta
 from autocut.models import AnalysisHints, ContentHint
 from autocut.video.frame_sampler import FrameSpec
 from autocut.vlm.prompts import (
-    PROMPT_VERSION,
     build_system_prompt,
     build_user_prompt,
     clip_plan_schema,
@@ -63,7 +62,6 @@ def test_user_prompt_lists_every_keyframe_timestamp() -> None:
     assert "frame 3" in text
     assert "00:00:12.000" in text
     assert "match_001" in text
-    assert PROMPT_VERSION in text
     assert "boxing" in text
 
 

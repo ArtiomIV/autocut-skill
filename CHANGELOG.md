@@ -14,6 +14,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resume bug where a runtime-selected `merged`/`all` mode was not persisted to
   the resume sidecar, so a resumed host-agent run silently fell back to
   `separate` only.
+- Prompt templates bumped to `v2`: sport and talk clip-boundary guidance now
+  tell the model to include the wind-up and follow-through of the key moment
+  (never end on the frame of impact / the punchline) instead of cutting tight
+  on the action. Smaller models (e.g. Gemini Flash) followed the old "tight, no
+  preamble" wording literally and cut right on the punch.
+
+### Fixed
+
+- OpenRouter provenance metadata (`vlm_provider`, `vlm_model`, `prompt_version`,
+  `analysis_time_sec`) is now authoritative on our side instead of trusting the
+  model's self-report. Gemini 3.x Flash misidentified itself as `gemini-1.5-pro`,
+  corrupting the manifest's model attribution and cost tracking.
+- OpenRouter content detection no longer truncates: the call's `max_tokens` was
+  raised (256 → 2048) because "thinking" models spend part of the budget on
+  internal reasoning, which left too little for the JSON and cut it mid-string —
+  silently dropping the run into the HYBRID fallback. Response parsing now also
+  strips markdown code fences / surrounding prose, and JSON errors include a
+  snippet of the raw response for debugging.
 
 ### Scope of v0.1.0
 

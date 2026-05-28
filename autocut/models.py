@@ -122,7 +122,7 @@ class ClipPlanMetadata(BaseModel):
 
     vlm_provider: str
     vlm_model: str
-    prompt_version: str = "v1"
+    prompt_version: str = "v2"
     analysis_time_sec: float | None = None
 
 

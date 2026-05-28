@@ -194,7 +194,7 @@ def test_clipplan_validates_full_payload() -> None:
         }
     )
     assert len(plan.clips) == 1
-    assert plan.metadata.prompt_version == "v1"
+    assert plan.metadata.prompt_version == "v2"
 
 
 def test_clipplan_metadata_allows_extra_fields() -> None:

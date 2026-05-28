@@ -10,9 +10,9 @@ import httpx
 import pytest
 import respx
 
-from autocut.models import AnalysisHints, Keyframe
+from autocut.models import AnalysisHints, ContentHint, Keyframe
 from autocut.vlm import VLMError
-from autocut.vlm.openrouter import OpenRouterProvider
+from autocut.vlm.openrouter import OpenRouterProvider, _extract_json
 
 
 def _kf(idx: int, secs: float, path: Path) -> Keyframe:
@@ -109,7 +109,7 @@ async def test_analyze_happy_path(fake_keyframes: list[Keyframe]) -> None:
     assert len(plan.clips) == 1
     assert plan.clips[0].score == 9
     # Provider injects metadata even if the model omitted it.
-    assert plan.metadata.prompt_version == "v1"
+    assert plan.metadata.prompt_version == "v2"
 
 
 @pytest.mark.asyncio
@@ -185,6 +185,61 @@ async def test_analyze_wraps_empty_response(fake_keyframes: list[Keyframe]) -> N
             await provider.analyze(
                 fake_keyframes,
                 AnalysisHints(),
+                video_id="v",
+                duration_sec=10.0,
+            )
+
+
+def test_extract_json_passes_clean_object_through() -> None:
+    clean = '{"content_hint": "boxing", "confidence": 1.0}'
+    assert _extract_json(clean) == clean
+
+
+def test_extract_json_strips_markdown_fence() -> None:
+    fenced = '```json\n{"content_hint": "boxing", "confidence": 1.0}\n```'
+    assert json.loads(_extract_json(fenced)) == {"content_hint": "boxing", "confidence": 1.0}
+
+
+def test_extract_json_isolates_object_from_prose() -> None:
+    prose = 'Here is the analysis: {"content_hint": "talk", "confidence": 0.7}. Done.'
+    assert json.loads(_extract_json(prose)) == {"content_hint": "talk", "confidence": 0.7}
+
+
+@pytest.mark.asyncio
+async def test_detect_content_parses_fenced_response(fake_keyframes: list[Keyframe]) -> None:
+    # A model that wraps its JSON in a markdown fence must still be parsed.
+    fenced = (
+        '```json\n{"content_hint": "boxing", "confidence": 0.95, "reasoning": "ring + gloves"}\n```'
+    )
+    with respx.mock(base_url="https://openrouter.ai/api/v1", assert_all_called=True) as router:
+        router.post("/chat/completions").mock(
+            return_value=httpx.Response(200, json=_chat_completion_payload(fenced))
+        )
+        provider = OpenRouterProvider(api_key="sk-or-test", model="google/gemini-3.5-flash")
+        result = await provider.detect_content(
+            fake_keyframes,
+            "onset rate high; voice activity sparse",
+            video_id="v",
+            duration_sec=24.0,
+        )
+    assert result.content_hint == ContentHint.boxing
+    assert result.confidence == 0.95
+
+
+@pytest.mark.asyncio
+async def test_detect_content_error_includes_raw_snippet(fake_keyframes: list[Keyframe]) -> None:
+    # A truncated response (the real Gemini 3.x failure mode) cannot be
+    # recovered, but the error must surface the raw text for debugging.
+    truncated = '{"content_hint": "boxing", "confidence": 0.98, "'
+    with respx.mock(base_url="https://openrouter.ai/api/v1") as router:
+        router.post("/chat/completions").mock(
+            return_value=httpx.Response(200, json=_chat_completion_payload(truncated))
+        )
+        provider = OpenRouterProvider(api_key="sk-or-test", model="x")
+        with pytest.raises(VLMError, match="raw response began with"):
+            await provider.detect_content(
+                fake_keyframes,
+                "audio",
                 video_id="v",
                 duration_sec=10.0,
             )
