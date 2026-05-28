@@ -192,6 +192,11 @@ class AnalysisHints(BaseModel):
     min_duration_sec: float = Field(default=2.0, gt=0)
     max_duration_sec: float = Field(default=60.0, gt=0)
     prompt_template: PromptTemplateId = "hybrid"
+    # (start_sec, end_sec) windows where motion + audio analysis detected high
+    # activity. Surfaced in the user prompt so a stills-based VLM knows where
+    # to focus. Populated by the pipeline only for the host path under the
+    # ``motion`` sampler; empty otherwise, in which case no block is rendered.
+    motion_windows_sec: list[tuple[float, float]] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _check_duration_window(self) -> AnalysisHints:

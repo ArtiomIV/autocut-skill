@@ -129,7 +129,7 @@ goal = {goal}, source duration = {duration_sec:.2f}s.
 
 Keyframes (in chronological order):
 {keyframe_lines}
-
+{motion_block}
 Return JSON matching this schema (do not output the schema itself, output
 your analysis):
 {schema}
@@ -254,6 +254,7 @@ def build_user_prompt(
         f"  - frame {i + 1}: t = {format_timestamp(spec.timestamp)}" for i, spec in enumerate(specs)
     )
     return _USER_TEMPLATE.format(
+        motion_block=_build_motion_block(hints.motion_windows_sec),
         content_hint=hints.content_hint.value,
         language=hints.language,
         goal=hints.goal,
@@ -261,4 +262,25 @@ def build_user_prompt(
         keyframe_lines=keyframe_lines,
         schema=clip_plan_schema(),
         video_id=video_id,
+    )
+
+
+def _build_motion_block(windows: list[tuple[float, float]]) -> str:
+    """Render the optional high-intensity-windows guidance block.
+
+    Returns an empty string when no motion windows are known (every sampler
+    other than ``motion``), so the surrounding template collapses cleanly.
+    """
+    if not windows:
+        return ""
+    rendered = "; ".join(
+        f"{format_timestamp(timedelta(seconds=start))}-{format_timestamp(timedelta(seconds=end))}"
+        for start, end in windows
+    )
+    return (
+        "\nMotion analysis (optical flow + audio onsets) flags these high-intensity "
+        "windows — the decisive action is most likely inside them, and keyframes are "
+        "sampled densely there. Examine these windows closely and compare consecutive "
+        "keyframes WITHIN a window to confirm an action before scoring it:\n"
+        f"  {rendered}\n"
     )

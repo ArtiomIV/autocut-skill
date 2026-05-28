@@ -160,6 +160,16 @@ async def run_analysis(
             len(motion_profile),
             len(audio_profile),
         )
+        # Surface the hot windows in the prompt only for the host (stills)
+        # path: a host agent reads keyframes one at a time and benefits from
+        # being told where to look. Cloud providers that ingest the video
+        # directly perceive motion themselves, so the hint is redundant there.
+        if hot_windows and provider.name == "host":
+            effective_hints = effective_hints.model_copy(
+                update={
+                    "motion_windows_sec": [(w.start_sec, w.end_sec) for w in hot_windows],
+                }
+            )
 
     log.info(
         "pipeline: sampling (strategy=%s, profile=%s, %d scenes)",
