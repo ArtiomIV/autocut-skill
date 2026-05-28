@@ -17,12 +17,12 @@ image tokenisation).
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 from datetime import timedelta
 from pathlib import Path
 
 from autocut.models import Keyframe
+from autocut.video.ffmpeg_path import FFmpegResolveError, ffmpeg_binary
 from autocut.video.frame_sampler import FrameSpec
 
 
@@ -54,11 +54,10 @@ def extract_keyframes(
     if not video.is_file():
         raise KeyframeExtractionError(f"input file does not exist: {video}")
 
-    binary = ffmpeg_path or shutil.which("ffmpeg")
-    if binary is None:
-        raise KeyframeExtractionError(
-            "ffmpeg not found in PATH; install ffmpeg or pass ffmpeg_path explicitly"
-        )
+    try:
+        binary = ffmpeg_binary(ffmpeg_path)
+    except FFmpegResolveError as exc:
+        raise KeyframeExtractionError(f"ffmpeg not found: {exc}") from exc
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

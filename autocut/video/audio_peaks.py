@@ -24,12 +24,13 @@ moments" hot_windows.py looks for.
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+
+from autocut.video.ffmpeg_path import FFmpegResolveError, ffmpeg_binary
 
 
 class AudioAnalysisError(RuntimeError):
@@ -89,11 +90,10 @@ def compute_audio_profile(
     if not video.is_file():
         raise AudioAnalysisError(f"input video not found: {video}")
 
-    binary = ffmpeg_path or shutil.which("ffmpeg")
-    if binary is None:
-        raise AudioAnalysisError(
-            "ffmpeg not found in PATH; install ffmpeg or pass ffmpeg_path explicitly"
-        )
+    try:
+        binary = ffmpeg_binary(ffmpeg_path)
+    except FFmpegResolveError as exc:
+        raise AudioAnalysisError(f"ffmpeg not found: {exc}") from exc
 
     pcm = _decode_to_pcm(binary, video, sample_rate_hz)
     if pcm.size == 0:

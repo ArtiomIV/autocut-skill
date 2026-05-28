@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from autocut.video.ffmpeg_path import FFmpegResolveError
 from autocut.video.probe import FFprobeError, probe_video
 
 
@@ -57,7 +58,7 @@ def _patch_ffprobe(
         )
 
     monkeypatch.setattr("autocut.video.probe.subprocess.run", fake_run)
-    monkeypatch.setattr("autocut.video.probe.shutil.which", lambda _: "/fake/ffprobe")
+    monkeypatch.setattr("autocut.video.probe.ffprobe_binary", lambda explicit=None: "/fake/ffprobe")
 
 
 def test_parses_full_payload(monkeypatch: pytest.MonkeyPatch, fake_video: Path) -> None:
@@ -123,8 +124,12 @@ def test_raises_when_file_missing(tmp_path: Path) -> None:
         probe_video(tmp_path / "no_such_file.mp4")
 
 
-def test_raises_when_ffprobe_not_in_path(monkeypatch: pytest.MonkeyPatch, fake_video: Path) -> None:
-    monkeypatch.setattr("autocut.video.probe.shutil.which", lambda _: None)
+def test_raises_when_ffprobe_unavailable(monkeypatch: pytest.MonkeyPatch, fake_video: Path) -> None:
+    # Neither system PATH nor the bundled fallback could supply ffprobe.
+    def boom(explicit: str | None = None) -> str:
+        raise FFmpegResolveError("no ffprobe on PATH and bundled fetch failed")
+
+    monkeypatch.setattr("autocut.video.probe.ffprobe_binary", boom)
     with pytest.raises(FFprobeError, match="ffprobe not found"):
         probe_video(fake_video)
 
@@ -167,6 +172,6 @@ def test_raises_when_subprocess_times_out(
         raise subprocess.TimeoutExpired(cmd=args, timeout=30)
 
     monkeypatch.setattr("autocut.video.probe.subprocess.run", fake_run)
-    monkeypatch.setattr("autocut.video.probe.shutil.which", lambda _: "/fake/ffprobe")
+    monkeypatch.setattr("autocut.video.probe.ffprobe_binary", lambda explicit=None: "/fake/ffprobe")
     with pytest.raises(FFprobeError, match="timed out"):
         probe_video(fake_video)

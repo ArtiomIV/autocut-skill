@@ -6,7 +6,6 @@ import asyncio
 import contextlib
 import getpass
 import json
-import shutil
 import subprocess
 import sys
 from datetime import timedelta
@@ -929,10 +928,25 @@ def _clip_start_seconds(clip: dict[str, object]) -> float:
 
 
 def _probe_binary(name: str) -> str:
-    """Return a short version string for ``name`` or a clear 'missing' message."""
-    path = shutil.which(name)
-    if path is None:
-        return "[red]not found in PATH[/]"
+    """Return a version string for ``name`` plus its source (system vs bundled).
+
+    Resolves through the shared ffmpeg resolver so ``doctor`` reports exactly
+    what the pipeline will use, including the static-ffmpeg fallback (which it
+    fetches on first call if no system binary exists).
+    """
+    # Lazy import: pulls in autocut.video (cv2 etc.); `keys`/`config` must not
+    # pay that cost just to start up.
+    from autocut.video.ffmpeg_path import (
+        FFmpegResolveError,
+        describe_ffmpeg,
+        describe_ffprobe,
+    )
+
+    describe = describe_ffmpeg if name == "ffmpeg" else describe_ffprobe
+    try:
+        path, source = describe()
+    except FFmpegResolveError as exc:
+        return f"[red]not found (no system {name}; bundled fetch failed: {exc})[/]"
     try:
         result = subprocess.run(  # noqa: S603 - args is a fixed list, no shell
             [path, "-version"],
@@ -942,9 +956,10 @@ def _probe_binary(name: str) -> str:
             check=False,
         )
     except (subprocess.SubprocessError, OSError) as exc:
-        return f"[yellow]found at {path} but probe failed: {exc}[/]"
-    first_line = result.stdout.splitlines()[0] if result.stdout else "(no output)"
-    return first_line
+        return f"[yellow]{source} at {path} but probe failed: {exc}[/]"
+    version = result.stdout.splitlines()[0] if result.stdout else "(no output)"
+    tag = "system" if source == "system" else "bundled static-ffmpeg"
+    return f"{version}  [dim]({tag}: {path})[/]"
 
 
 def _format_context(value: int | None) -> str:

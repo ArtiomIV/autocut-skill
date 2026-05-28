@@ -31,6 +31,9 @@ dependencies = [
     "scenedetect>=0.7",
     "opencv-python>=4.10",
     "Pillow>=10.4.0",
+    # Bundled ffmpeg + ffprobe fallback when neither is on the system PATH.
+    # Binaries are fetched on first use (network required once), then cached.
+    "static-ffmpeg>=2.5",
     # Data validation
     "pydantic>=2.7.0",
     # HTTP / retry
@@ -52,11 +55,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Cross-platform ffmpeg fallback (~60 MB). Used when system ffmpeg is missing.
-ffmpeg-bundled = ["imageio-ffmpeg>=0.5.1"]
 # Optional transcript pipeline (opt-in with --with-transcript)
 whisper = ["openai-whisper>=20240930"]
-all = ["autocut-skill[ffmpeg-bundled,whisper]"]
+all = ["autocut-skill[whisper]"]
 # Development toolchain
 dev = [
     "pytest>=8.3.0",
@@ -132,7 +133,7 @@ files = ["autocut", "cli"]
 [[tool.mypy.overrides]]
 module = [
     "scenedetect.*",
-    "imageio_ffmpeg.*",
+    "static_ffmpeg.*",
     "magic.*",
     "numpy",
     "numpy.*",

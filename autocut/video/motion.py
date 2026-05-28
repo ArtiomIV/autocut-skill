@@ -24,13 +24,14 @@ Implementation choices:
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
 import numpy as np
+
+from autocut.video.ffmpeg_path import FFmpegResolveError, ffmpeg_binary, ffprobe_binary
 
 
 class MotionAnalysisError(RuntimeError):
@@ -77,13 +78,12 @@ def compute_motion_profile(
     if not video.is_file():
         raise MotionAnalysisError(f"input video not found: {video}")
 
-    binary = ffmpeg_path or shutil.which("ffmpeg")
-    if binary is None:
-        raise MotionAnalysisError(
-            "ffmpeg not found in PATH; install ffmpeg or pass ffmpeg_path explicitly"
-        )
+    try:
+        binary = ffmpeg_binary(ffmpeg_path)
+    except FFmpegResolveError as exc:
+        raise MotionAnalysisError(f"ffmpeg not found: {exc}") from exc
 
-    width, height = _pick_downscale_size(video, binary, downscale_long_edge)
+    width, height = _pick_downscale_size(video, downscale_long_edge)
     args = _ffmpeg_pipe_args(binary, video, target_fps=target_fps, width=width, height=height)
 
     samples: list[MotionSample] = []
@@ -166,7 +166,6 @@ def compute_motion_profile(
 
 def _pick_downscale_size(
     video: Path,
-    ffmpeg_binary: str,
     long_edge: int,
 ) -> tuple[int, int]:
     """Return the (width, height) we'll downscale to, preserving aspect ratio.
@@ -175,14 +174,10 @@ def _pick_downscale_size(
     down to the nearest even number — some ffmpeg filters reject odd
     dimensions on yuv4*p pixel formats.
     """
-    # ffprobe sits next to ffmpeg under the same WinGet/brew install.
-    ffprobe = ffmpeg_binary.replace("ffmpeg", "ffprobe", 1)
-    if not Path(ffprobe).is_file():
-        # Fallback: try PATH lookup.
-        located = shutil.which("ffprobe")
-        if located is None:
-            raise MotionAnalysisError("ffprobe not found alongside ffmpeg nor in PATH")
-        ffprobe = located
+    try:
+        ffprobe = ffprobe_binary()
+    except FFmpegResolveError as exc:
+        raise MotionAnalysisError(f"ffprobe not found: {exc}") from exc
 
     args = [
         ffprobe,

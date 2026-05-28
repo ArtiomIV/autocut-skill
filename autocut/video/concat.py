@@ -22,10 +22,11 @@ about mismatched inputs.
 from __future__ import annotations
 
 import logging
-import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+
+from autocut.video.ffmpeg_path import FFmpegResolveError, ffmpeg_binary
 
 log = logging.getLogger(__name__)
 
@@ -61,9 +62,10 @@ def concat_videos(
         if not inp.is_file():
             raise ConcatError(f"input file not found: {inp}")
 
-    binary = ffmpeg_path or shutil.which("ffmpeg")
-    if binary is None:
-        raise ConcatError("ffmpeg not found in PATH; install ffmpeg or pass ffmpeg_path explicitly")
+    try:
+        binary = ffmpeg_binary(ffmpeg_path)
+    except FFmpegResolveError as exc:
+        raise ConcatError(f"ffmpeg not found: {exc}") from exc
 
     output.parent.mkdir(parents=True, exist_ok=True)
 

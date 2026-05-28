@@ -13,7 +13,6 @@ Why not a third-party wrapper (e.g. ``ffmpeg-python``):
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 from fractions import Fraction
 from pathlib import Path
@@ -22,6 +21,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from autocut.models import VideoMetadata
+from autocut.video.ffmpeg_path import FFmpegResolveError, ffprobe_binary
 
 
 class FFprobeError(RuntimeError):
@@ -47,8 +47,8 @@ def probe_video(path: str | Path, *, ffprobe_path: str | None = None) -> VideoMe
     path:
         Path to the input video file. Must exist.
     ffprobe_path:
-        Optional explicit path to the ffprobe binary. When omitted we use
-        ``shutil.which("ffprobe")``.
+        Optional explicit path to the ffprobe binary. When omitted we resolve
+        it via the system PATH, falling back to the bundled static-ffmpeg copy.
 
     Raises
     ------
@@ -60,11 +60,10 @@ def probe_video(path: str | Path, *, ffprobe_path: str | None = None) -> VideoMe
     if not video_path.is_file():
         raise FFprobeError(f"input file does not exist: {video_path}")
 
-    binary = ffprobe_path or shutil.which("ffprobe")
-    if binary is None:
-        raise FFprobeError(
-            "ffprobe not found in PATH; install ffmpeg or pass ffprobe_path explicitly"
-        )
+    try:
+        binary = ffprobe_binary(ffprobe_path)
+    except FFmpegResolveError as exc:
+        raise FFprobeError(f"ffprobe not found: {exc}") from exc
 
     args = [binary, *_DEFAULT_FFPROBE_ARGS, str(video_path)]
     try:

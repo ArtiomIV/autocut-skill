@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- ffmpeg/ffprobe are now resolved through `autocut.video.ffmpeg_path`
+  (system PATH first, then a bundled `static-ffmpeg` fallback fetched on first
+  use). `static-ffmpeg` is a required dependency — it ships both `ffmpeg` and
+  `ffprobe`, unlike the previous optional `imageio-ffmpeg` (ffmpeg only), which
+  was removed. `autocut doctor` now reports which source each binary resolves
+  to (system vs bundled) and its full path.
 - `autocut run` now always produces per-clip `separate` outputs; the `--output`
   flag was removed. Composing a single reel is the job of the deterministic
   `autocut merge --from-manifest --min-score N` subcommand. This also removes a

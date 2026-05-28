@@ -15,11 +15,12 @@ is the caller's responsibility (see ``autocut.security.paths.ensure_inside``).
 
 from __future__ import annotations
 
-import shutil
 import subprocess
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
+
+from autocut.video.ffmpeg_path import FFmpegResolveError, ffmpeg_binary
 
 
 class CutterError(RuntimeError):
@@ -91,9 +92,10 @@ def cut_clip(
     if not video.is_file():
         raise CutterError(f"input file does not exist: {video}")
 
-    binary = ffmpeg_path or shutil.which("ffmpeg")
-    if binary is None:
-        raise CutterError("ffmpeg not found in PATH; install ffmpeg or pass ffmpeg_path explicitly")
+    try:
+        binary = ffmpeg_binary(ffmpeg_path)
+    except FFmpegResolveError as exc:
+        raise CutterError(f"ffmpeg not found: {exc}") from exc
 
     request.output_path.parent.mkdir(parents=True, exist_ok=True)
     args = _build_args(binary, video, request, accurate=accurate)
