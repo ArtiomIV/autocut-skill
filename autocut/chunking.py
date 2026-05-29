@@ -37,6 +37,7 @@ The functions here are pure: no I/O, no subprocess, no model calls.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -212,16 +213,21 @@ def merge_plans(
             vlm_provider=plans[0].metadata.vlm_provider,
             vlm_model=plans[0].metadata.vlm_model,
             prompt_version=plans[0].metadata.prompt_version,
-            analysis_time_sec=_sum_optional_times(plans),
+            analysis_time_sec=_sum_optional(plans, lambda m: m.analysis_time_sec),
+            cost_usd=_sum_optional(plans, lambda m: m.cost_usd),
         ),
     )
 
 
-def _sum_optional_times(plans: list[ClipPlan]) -> float | None:
-    """Sum per-chunk analysis times; return None if any chunk reported None."""
+def _sum_optional(
+    plans: list[ClipPlan],
+    field: Callable[[ClipPlanMetadata], float | None],
+) -> float | None:
+    """Sum a per-chunk optional metric; return None if any chunk reported None."""
     total = 0.0
     for plan in plans:
-        if plan.metadata.analysis_time_sec is None:
+        value = field(plan.metadata)
+        if value is None:
             return None
-        total += plan.metadata.analysis_time_sec
+        total += value
     return total

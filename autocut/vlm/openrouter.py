@@ -249,13 +249,20 @@ class OpenRouterProvider(VLMProvider):
         if not raw:
             raise VLMError("openrouter returned an empty response body")
 
-        plan = _parse_response(raw, provider=self.name, model=self.model, elapsed_sec=elapsed)
+        cost = _usage_cost(completion)
+        plan = _parse_response(
+            raw,
+            provider=self.name,
+            model=self.model,
+            elapsed_sec=elapsed,
+            cost_usd=cost,
+        )
         log.info(
             "openrouter video analyse complete: model=%s clips=%d elapsed=%.2fs cost=%s",
             self.model,
             len(plan.clips),
             elapsed,
-            _usage_cost(completion),
+            cost,
         )
         return plan
 
@@ -495,6 +502,7 @@ def _parse_response(
     provider: str,
     model: str,
     elapsed_sec: float,
+    cost_usd: float | None = None,
 ) -> ClipPlan:
     """Parse a VLM response string and validate it as ``ClipPlan``.
 
@@ -522,6 +530,8 @@ def _parse_response(
     metadata["vlm_model"] = model
     metadata["prompt_version"] = PROMPT_VERSION
     metadata["analysis_time_sec"] = round(elapsed_sec, 2)
+    if cost_usd is not None:
+        metadata["cost_usd"] = cost_usd
 
     try:
         return ClipPlan.model_validate(payload)

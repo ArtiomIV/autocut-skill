@@ -330,7 +330,11 @@ async def _run_video_analysis(
         cost_cap_usd=config.security.cost_cap_usd,
         confirm_cost=_confirm,
     )
-    log.info("pipeline: video analysis returned %d clip(s)", len(plan.clips))
+    log.info(
+        "pipeline: video analysis returned %d clip(s), real cost %s USD",
+        len(plan.clips),
+        plan.metadata.cost_usd,
+    )
     result = complete_from_plan(
         plan,
         video=video,
@@ -342,7 +346,8 @@ async def _run_video_analysis(
         sampling_strategy="video",
         accurate_cuts=accurate_cuts,
         write_outputs=write_outputs,
-        cost_estimate_usd=0.0,
+        # real billed cost from usage.include (summed across batches), not an estimate
+        cost_estimate_usd=plan.metadata.cost_usd or 0.0,
         keyframes=None,
         profile=profile,
     )
