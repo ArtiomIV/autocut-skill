@@ -113,6 +113,63 @@ async def test_analyze_happy_path(fake_keyframes: list[Keyframe]) -> None:
 
 
 @pytest.mark.asyncio
+async def test_analyze_video_clip_happy_path(tmp_path: Path) -> None:
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"\x00\x00\x00\x18ftypmp42fake-mp4-bytes")
+    with respx.mock(base_url="https://openrouter.ai/api/v1", assert_all_called=True) as router:
+        router.post("/chat/completions").mock(
+            return_value=httpx.Response(200, json=_chat_completion_payload(_valid_clipplan_json()))
+        )
+        provider = OpenRouterProvider(api_key="sk-or-test", model="google/gemini-3.5-flash")
+        plan = await provider.analyze_video_clip(
+            clip,
+            AnalysisHints(),
+            video_id="video_001",
+            clip_duration_sec=44.0,
+        )
+    assert len(plan.clips) == 1
+    # Provenance is overwritten authoritatively with our configured model.
+    assert plan.metadata.vlm_model == "google/gemini-3.5-flash"
+    assert plan.metadata.vlm_provider == "openrouter"
+
+
+@pytest.mark.asyncio
+async def test_analyze_video_clip_missing_file_raises(tmp_path: Path) -> None:
+    provider = OpenRouterProvider(api_key="sk-or-test", model="x")
+    with pytest.raises(VLMError, match="video clip not found"):
+        await provider.analyze_video_clip(
+            tmp_path / "nope.mp4",
+            AnalysisHints(),
+            video_id="v",
+            clip_duration_sec=10.0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_supports_video_true_when_model_declares_it() -> None:
+    payload = {
+        "data": [
+            {
+                "id": "google/gemini-3.5-flash",
+                "architecture": {"input_modalities": ["text", "image", "video"]},
+            }
+        ]
+    }
+    with respx.mock(base_url="https://openrouter.ai/api/v1", assert_all_called=True) as router:
+        router.get("/models").mock(return_value=httpx.Response(200, json=payload))
+        provider = OpenRouterProvider(api_key="sk-or-test", model="google/gemini-3.5-flash")
+        assert await provider.supports_video() is True
+
+
+@pytest.mark.asyncio
+async def test_supports_video_false_on_fetch_error() -> None:
+    with respx.mock(base_url="https://openrouter.ai/api/v1") as router:
+        router.get("/models").mock(return_value=httpx.Response(500, text="boom"))
+        provider = OpenRouterProvider(api_key="sk-or-test", model="google/gemini-3.5-flash")
+        assert await provider.supports_video() is False
+
+
+@pytest.mark.asyncio
 async def test_analyze_rejects_empty_keyframes() -> None:
     provider = OpenRouterProvider(api_key="sk-or-test", model="x")
     with pytest.raises(VLMError, match="no keyframes"):

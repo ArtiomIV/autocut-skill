@@ -5,6 +5,7 @@ from autocut.video.audio_peaks import (
     AudioSample,
     compute_audio_profile,
 )
+from autocut.video.compress import CompressionError, compress_for_vlm
 from autocut.video.concat import ConcatError, concat_videos
 from autocut.video.cutter import CutRequest, CutterError, cut_clip, cut_clips
 from autocut.video.frame_sampler import (
@@ -25,6 +26,7 @@ from autocut.video.scene_detect import SceneDetectError, detect_scenes
 __all__ = [
     "AudioAnalysisError",
     "AudioSample",
+    "CompressionError",
     "ConcatError",
     "CutRequest",
     "CutterError",
@@ -38,6 +40,7 @@ __all__ = [
     "SamplingStrategy",
     "SceneDetectError",
     "build_sampler",
+    "compress_for_vlm",
     "compute_audio_profile",
     "compute_motion_profile",
     "concat_videos",

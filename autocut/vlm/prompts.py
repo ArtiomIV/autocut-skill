@@ -140,6 +140,27 @@ prompt version, timing) are filled in by the caller.
 """
 
 
+# Used by the video-input path: no keyframe list (the model watches the clip)
+# and no motion block (a video conveys motion directly). Timestamps come back
+# relative to the clip; the batch engine re-bases them to absolute source time.
+_VIDEO_USER_TEMPLATE: Final[str] = """\
+Video metadata: content type = {content_hint}, language = {language},
+goal = {goal}, clip duration = {duration_sec:.2f}s.
+
+You are watching the full video clip provided. Identify the segments worth
+keeping as standalone highlight clips. Report each ``start``/``end`` RELATIVE
+to THIS clip, where 00:00:00.000 is the first frame you see.
+
+Return JSON matching this schema (do not output the schema itself, output
+your analysis):
+{schema}
+
+Fill ``video_id`` with {video_id!r} and ``duration_sec`` with {duration_sec}.
+Leave ``metadata`` as an empty object — provenance fields (provider, model,
+prompt version, timing) are filled in by the caller.
+"""
+
+
 def format_timestamp(ts: timedelta) -> str:
     """Format ``HH:MM:SS.mmm`` so timestamps in the prompt line up with the schema."""
     total_ms = max(0, int(ts.total_seconds() * 1000))
@@ -260,6 +281,28 @@ def build_user_prompt(
         goal=hints.goal,
         duration_sec=duration_sec,
         keyframe_lines=keyframe_lines,
+        schema=clip_plan_schema(),
+        video_id=video_id,
+    )
+
+
+def build_video_user_prompt(
+    *,
+    video_id: str,
+    duration_sec: float,
+    hints: AnalysisHints,
+) -> str:
+    """User message for the video-input path (no keyframe list, no motion block).
+
+    The model watches the actual clip, so it perceives motion itself and the
+    returned timestamps are relative to the clip — the batch engine offsets
+    them to absolute source time.
+    """
+    return _VIDEO_USER_TEMPLATE.format(
+        content_hint=hints.content_hint.value,
+        language=hints.language,
+        goal=hints.goal,
+        duration_sec=duration_sec,
         schema=clip_plan_schema(),
         video_id=video_id,
     )

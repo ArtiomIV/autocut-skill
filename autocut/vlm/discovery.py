@@ -47,6 +47,49 @@ async def list_openrouter_models(
     The endpoint is public; an ``api_key`` is optional and only used to
     surface account-specific availability (e.g. region restrictions).
     """
+    raw_models = await _fetch_models_data(api_key=api_key, client=client)
+
+    vision_models: list[ModelInfo] = []
+    for raw in raw_models:
+        if not _is_vision_capable(raw):
+            continue
+        info = _to_model_info(raw)
+        if info is not None:
+            vision_models.append(info)
+
+    # Cheapest input first — most users care about that ranking.
+    vision_models.sort(key=lambda m: (m.usd_per_1m_input is None, m.usd_per_1m_input or 0.0, m.id))
+    return vision_models
+
+
+async def model_supports_video(
+    model_id: str,
+    *,
+    api_key: str | None = None,
+    client: httpx.AsyncClient | None = None,
+) -> bool:
+    """Live check: does ``model_id`` declare ``video`` as an input modality?
+
+    Fetches the OpenRouter catalogue and inspects the model's modality flags.
+    Raises ``VLMError`` if the catalogue cannot be fetched — callers that want
+    a graceful fallback (e.g. the pipeline's capability gate) should catch it
+    and treat failure as "no video support".
+    """
+    models = await _fetch_models_data(api_key=api_key, client=client)
+    return model_supports_video_input(model_id, models)
+
+
+# ---------------------------------------------------------------------------
+# Internals
+# ---------------------------------------------------------------------------
+
+
+async def _fetch_models_data(
+    *,
+    api_key: str | None = None,
+    client: httpx.AsyncClient | None = None,
+) -> list[dict[str, Any]]:
+    """GET ``/models`` and return the raw ``data`` array (dict rows only)."""
     headers = {"Accept": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -73,25 +116,7 @@ async def list_openrouter_models(
     raw_models = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(raw_models, list):
         raise VLMError("OpenRouter /models payload missing 'data' array")
-
-    vision_models: list[ModelInfo] = []
-    for raw in raw_models:
-        if not isinstance(raw, dict):
-            continue
-        if not _is_vision_capable(raw):
-            continue
-        info = _to_model_info(raw)
-        if info is not None:
-            vision_models.append(info)
-
-    # Cheapest input first — most users care about that ranking.
-    vision_models.sort(key=lambda m: (m.usd_per_1m_input is None, m.usd_per_1m_input or 0.0, m.id))
-    return vision_models
-
-
-# ---------------------------------------------------------------------------
-# Internals
-# ---------------------------------------------------------------------------
+    return [m for m in raw_models if isinstance(m, dict)]
 
 
 def _is_vision_capable(raw: dict[str, Any]) -> bool:

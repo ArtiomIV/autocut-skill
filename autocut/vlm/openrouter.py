@@ -31,12 +31,14 @@ from pydantic import ValidationError
 from autocut.models import AnalysisHints, ClipPlan, DetectionResult, Keyframe
 from autocut.video.frame_sampler import FrameSpec
 from autocut.vlm.base import CostEstimate, VLMError, VLMProvider
+from autocut.vlm.discovery import model_supports_video
 from autocut.vlm.prompts import (
     PROMPT_VERSION,
     build_detection_system_prompt,
     build_detection_user_prompt,
     build_system_prompt,
     build_user_prompt,
+    build_video_user_prompt,
 )
 
 log = logging.getLogger(__name__)
@@ -168,6 +170,95 @@ class OpenRouterProvider(VLMProvider):
         )
         return plan
 
+    async def supports_video(self) -> bool:
+        """True if the configured model declares video input on OpenRouter.
+
+        Best-effort: a catalogue-fetch failure resolves to ``False`` so the
+        pipeline falls back to the keyframe path rather than erroring.
+        """
+        try:
+            return await model_supports_video(self.model)
+        except VLMError:
+            return False
+
+    async def analyze_video_clip(
+        self,
+        clip_path: Path,
+        hints: AnalysisHints,
+        *,
+        video_id: str,
+        clip_duration_sec: float,
+        timeout_sec: int = 300,
+    ) -> ClipPlan:
+        """Analyse a (compressed) video clip via the model's video modality.
+
+        Sends the clip as a base64 ``video_url`` block, pinning OpenRouter to
+        the **Vertex** backend — the only Gemini route that accepts base64
+        video (AI-Studio wants YouTube URLs). ``usage.include`` is requested so
+        the real billed cost is logged. The returned ``ClipPlan`` carries
+        timestamps RELATIVE to the clip; the batch engine re-bases them to
+        absolute source time. Raises ``VLMError`` on failure.
+        """
+        if not clip_path.is_file():
+            raise VLMError(f"video clip not found: {clip_path}")
+
+        system_prompt = build_system_prompt(hints)
+        user_prompt = build_video_user_prompt(
+            video_id=video_id,
+            duration_sec=clip_duration_sec,
+            hints=hints,
+        )
+        content: list[dict[str, Any]] = [
+            {"type": "text", "text": user_prompt},
+            {
+                "type": "video_url",
+                "video_url": {"url": _encode_video_to_data_url(clip_path)},
+            },
+        ]
+        messages = cast(  # type: ignore[redundant-cast, unused-ignore]
+            list[ChatCompletionMessageParam],
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": content},
+            ],
+        )
+        start = time.monotonic()
+        try:
+            completion = await asyncio.wait_for(
+                self._client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    max_tokens=4096,
+                    extra_body={
+                        # base64 video only works on the Vertex backend.
+                        "provider": {"order": ["google-vertex"], "allow_fallbacks": False},
+                        # ask OpenRouter to return the real billed cost.
+                        "usage": {"include": True},
+                    },
+                ),
+                timeout=timeout_sec,
+            )
+        except TimeoutError as exc:
+            raise VLMError(f"openrouter video request timed out after {timeout_sec}s") from exc
+        except APIError as exc:
+            raise VLMError(f"openrouter video API call failed: {exc}") from exc
+
+        elapsed = time.monotonic() - start
+        raw = (completion.choices[0].message.content or "").strip()
+        if not raw:
+            raise VLMError("openrouter returned an empty response body")
+
+        plan = _parse_response(raw, provider=self.name, model=self.model, elapsed_sec=elapsed)
+        log.info(
+            "openrouter video analyse complete: model=%s clips=%d elapsed=%.2fs cost=%s",
+            self.model,
+            len(plan.clips),
+            elapsed,
+            _usage_cost(completion),
+        )
+        return plan
+
     async def detect_content(
         self,
         keyframes: list[Keyframe],
@@ -295,6 +386,30 @@ def _encode_image_to_data_url(path: Path) -> str:
     return f"data:image/{mime};base64,{encoded}"
 
 
+def _encode_video_to_data_url(path: Path) -> str:
+    """Read a video file and return a ``data:video/mp4;base64,...`` URL."""
+    with path.open("rb") as f:
+        encoded = base64.b64encode(f.read()).decode("ascii")
+    suffix = path.suffix.lower().lstrip(".") or "mp4"
+    return f"data:video/{suffix};base64,{encoded}"
+
+
+def _usage_cost(completion: Any) -> float | None:
+    """Pull the real billed cost from an OpenRouter completion, if present.
+
+    OpenRouter attaches ``cost`` to the usage object when ``usage.include`` is
+    set; the openai SDK surfaces it via ``model_dump`` as an extra field.
+    """
+    usage = getattr(completion, "usage", None)
+    if usage is None:
+        return None
+    try:
+        cost = usage.model_dump().get("cost")
+    except (AttributeError, TypeError):
+        return None
+    return float(cost) if isinstance(cost, int | float) else None
+
+
 def _extract_json(raw: str) -> str:
     """Best-effort isolation of a JSON object from a model response.
 
@@ -394,8 +509,7 @@ def _parse_response(
         payload = json.loads(_extract_json(raw))
     except json.JSONDecodeError as exc:
         raise VLMError(
-            f"openrouter response was not valid JSON: {exc}; "
-            f"raw response began with: {raw[:200]!r}"
+            f"openrouter response was not valid JSON: {exc}; raw response began with: {raw[:200]!r}"
         ) from exc
 
     if not isinstance(payload, dict):

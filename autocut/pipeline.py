@@ -48,6 +48,7 @@ from autocut.video import (
     find_hot_windows,
     probe_video,
 )
+from autocut.video_analysis import analyze_video
 from autocut.vlm import CostEstimate, VLMError, VLMProvider
 from autocut.vlm.base import HostAgentPauseRequested
 
@@ -141,6 +142,24 @@ async def run_analysis(
         sampling_strategy if sampling_strategy != "hybrid" else profile.sampling_strategy
     )
 
+    # Capability gate: a provider that ingests video directly (openrouter with
+    # a video-capable model) takes the L2 video path — compress + autonomous
+    # batch loop, no keyframe sampling. Everything else (host, non-video
+    # models) falls through to the keyframe path below.
+    if await provider.supports_video():
+        return await _run_video_analysis(
+            video,
+            provider,
+            metadata=metadata,
+            effective_hints=effective_hints,
+            profile=profile,
+            config=config,
+            root=root,
+            accurate_cuts=accurate_cuts,
+            write_outputs=write_outputs,
+            confirm_cost=confirm_cost,
+        )
+
     log.info("pipeline: scene detect (threshold=%s)", config.advanced.scene_threshold)
     scenes = detect_scenes(video, threshold=config.advanced.scene_threshold)
 
@@ -160,11 +179,11 @@ async def run_analysis(
             len(motion_profile),
             len(audio_profile),
         )
-        # Surface the hot windows in the prompt only for the host (stills)
-        # path: a host agent reads keyframes one at a time and benefits from
-        # being told where to look. Cloud providers that ingest the video
-        # directly perceive motion themselves, so the hint is redundant there.
-        if hot_windows and provider.name == "host":
+        # Reaching here means the keyframe (stills) path: the video branch
+        # returned earlier. A stills VLM cannot perceive motion, so surface the
+        # hot windows in the prompt to tell it where to look — for the host
+        # agent and for any openrouter keyframe fallback alike.
+        if hot_windows:
             effective_hints = effective_hints.model_copy(
                 update={
                     "motion_windows_sec": [(w.start_sec, w.end_sec) for w in hot_windows],
@@ -257,6 +276,74 @@ async def run_analysis(
         write_outputs=write_outputs,
         cost_estimate_usd=estimate.estimated_total_usd,
         keyframes=keyframes,
+        profile=profile,
+    )
+    _clear_resume_state(root)
+    return result
+
+
+async def _run_video_analysis(
+    video: Path,
+    provider: VLMProvider,
+    *,
+    metadata: VideoMetadata,
+    effective_hints: AnalysisHints,
+    profile: ContentProfile,
+    config: AutoCutConfig,
+    root: Path,
+    accurate_cuts: bool,
+    write_outputs: bool,
+    confirm_cost: ConfirmHook | None,
+) -> AnalysisResult:
+    """Video-input path: compress + autonomous batch loop via the L2 engine.
+
+    No keyframe sampling and no pause/resume — the provider ingests the video
+    directly, so the run completes in one call. Reuses ``complete_from_plan``
+    for ranking + output dispatch (with zero scenes/keyframes).
+    """
+
+    def _confirm(estimated_usd: float, cap_usd: float) -> bool:
+        if confirm_cost is None:
+            return False
+        estimate = CostEstimate(
+            provider=provider.name,
+            model=getattr(provider, "model", "?"),
+            n_input_images=0,
+            estimated_input_tokens=0,
+            estimated_output_tokens=0,
+            estimated_total_usd=estimated_usd,
+        )
+        return confirm_cost(estimate, cap_usd)
+
+    video_id = video.stem or "video"
+    log.info(
+        "pipeline: video path via provider=%s model=%s",
+        provider.name,
+        getattr(provider, "model", "?"),
+    )
+    plan = await analyze_video(
+        video,
+        effective_hints,
+        provider,
+        video_id=video_id,
+        duration_sec=metadata.duration_sec,
+        cost_cap_usd=config.security.cost_cap_usd,
+        confirm_cost=_confirm,
+    )
+    log.info("pipeline: video analysis returned %d clip(s)", len(plan.clips))
+    result = complete_from_plan(
+        plan,
+        video=video,
+        metadata=metadata,
+        config=config,
+        output_root=root,
+        n_scenes=0,
+        n_keyframes=0,
+        sampling_strategy="video",
+        accurate_cuts=accurate_cuts,
+        write_outputs=write_outputs,
+        cost_estimate_usd=0.0,
+        keyframes=None,
         profile=profile,
     )
     _clear_resume_state(root)
