@@ -39,6 +39,7 @@ from autocut.vlm.prompts import (
     PROMPT_VERSION,
     build_system_prompt,
     build_user_prompt,
+    build_video_user_prompt,
 )
 
 log = logging.getLogger(__name__)
@@ -58,10 +59,24 @@ class HostAgentProvider(VLMProvider):
 
     name: ClassVar[str] = "host"
 
-    def __init__(self, work_dir: str | Path, *, agent_hint: str = "host-agent") -> None:
-        """Create a host-agent provider that uses ``work_dir`` for the handoff files."""
+    def __init__(
+        self,
+        work_dir: str | Path,
+        *,
+        agent_hint: str = "host-agent",
+        supports_video: bool = False,
+    ) -> None:
+        """Create a host-agent provider that uses ``work_dir`` for the handoff files.
+
+        ``supports_video`` declares whether the surrounding AI agent can ingest
+        a video file directly. There is no live capability endpoint for the
+        host (unlike OpenRouter's ``/models``), so this is opt-in: the user
+        sets it via ``autocut run --host-video`` only when they know the agent
+        can watch an MP4. Default ``False`` keeps the keyframe (stills) path.
+        """
         self._work_dir = Path(work_dir)
         self._agent_hint = agent_hint
+        self._supports_video = supports_video
 
     # ------------------------------------------------------------------
     # VLMProvider interface
@@ -102,6 +117,56 @@ class HostAgentProvider(VLMProvider):
         log.info(
             "host_agent paused: wrote %s, waiting for %s",
             request_path,
+            response_path,
+        )
+        raise HostAgentPauseRequested(request_path=request_path, response_path=response_path)
+
+    async def supports_video(self) -> bool:
+        """Whether the surrounding agent was declared video-capable (opt-in flag)."""
+        return self._supports_video
+
+    async def analyze_video_clip(
+        self,
+        clip_path: Path,
+        hints: AnalysisHints,
+        *,
+        video_id: str,
+        clip_duration_sec: float,
+        timeout_sec: int = 300,
+    ) -> ClipPlan:
+        """Write a VIDEO request and pause; the agent watches the MP4 directly.
+
+        The host transport has no base64 size ceiling (the agent reads the file
+        from disk, not an inline payload), so this is a single-pass handoff: the
+        whole compressed clip is referenced by path and the agent returns one
+        ``ClipPlan`` with timestamps relative to the clip — which, for the
+        whole-video single pass the pipeline uses today, equal absolute source
+        time. ``resume_from_disk`` (shared with the keyframe path) parses the
+        response. Raises ``HostAgentPauseRequested`` exactly like ``analyze``.
+        """
+        del timeout_sec  # the host pause has no network timeout
+        if not clip_path.is_file():
+            raise VLMError(f"host_agent.analyze_video_clip: video clip not found: {clip_path}")
+
+        self._work_dir.mkdir(parents=True, exist_ok=True)
+        request_path = self._work_dir / REQUEST_FILENAME
+        response_path = self._work_dir / RESPONSE_FILENAME
+
+        markdown = _render_video_request_markdown(
+            system_prompt=build_system_prompt(hints),
+            user_prompt=build_video_user_prompt(
+                video_id=video_id,
+                duration_sec=clip_duration_sec,
+                hints=hints,
+            ),
+            clip_path=clip_path,
+            response_path=response_path,
+        )
+        request_path.write_text(markdown, encoding="utf-8")
+        log.info(
+            "host_agent paused (video): wrote %s referencing %s, waiting for %s",
+            request_path,
+            clip_path,
             response_path,
         )
         raise HostAgentPauseRequested(request_path=request_path, response_path=response_path)
@@ -337,6 +402,66 @@ def _render_request_markdown(
     return _REQUEST_TEMPLATE.format(
         response_path=response_path,
         keyframe_listing="\n".join(listing_lines),
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+    )
+
+
+_VIDEO_REQUEST_TEMPLATE = """\
+# AutoCut — host-agent VLM request (VIDEO)
+
+The AutoCut pipeline is paused. You (the AI agent running this conversation)
+are being asked to do the vision analysis step on the agent subscription
+instead of calling an external API.
+
+## What to do
+
+1. Watch the video clip with your video/file tool:
+
+   `{clip_path}`
+
+   If you CANNOT open or analyse a video file, do NOT guess from a single
+   frame. Stop and tell the user to re-run `autocut run` WITHOUT the
+   `--host-video` flag so AutoCut falls back to the keyframe (stills) path.
+
+2. Decide which segments are worth keeping as highlight clips, applying the
+   constraints in the system prompt and the schema in the user prompt (both
+   reproduced below). Timestamps are RELATIVE to this clip — its first frame
+   is 00:00:00.000.
+
+3. Write the result as a single JSON object matching the ``ClipPlan`` schema
+   to:
+
+   `{response_path}`
+
+4. Tell the user to run `autocut resume`.
+
+Do not output anything else. The response file must contain only the JSON.
+
+## System prompt (verbatim)
+
+```
+{system_prompt}
+```
+
+## User prompt (verbatim — includes the JSON schema you must match)
+
+```
+{user_prompt}
+```
+"""
+
+
+def _render_video_request_markdown(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    clip_path: Path,
+    response_path: Path,
+) -> str:
+    return _VIDEO_REQUEST_TEMPLATE.format(
+        clip_path=clip_path,
+        response_path=response_path,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
     )

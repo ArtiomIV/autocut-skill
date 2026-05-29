@@ -6,8 +6,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Video-input analysis path (Phase G). Instead of sampling keyframes, the
+  source is compressed to an analysis-grade copy and the model watches the
+  video directly — it perceives motion and catches the decisive moment a flat
+  keyframe batch dilutes, at a fraction of the cost.
+  - **OpenRouter**: the compressed clip is sent inline as a base64 `video_url`
+    block (pinned to the Vertex backend), split into overlapping ~5-minute
+    batches by the L2 engine (`autocut.video_analysis`) when needed; the real
+    billed cost is surfaced in the manifest.
+  - **Host agent**: opt-in via `autocut run --vlm host --host-video`. The
+    compressed MP4 is referenced by path in `VLM_REQUEST.md` and the agent
+    watches it during the existing pause/resume — single pass, no base64 size
+    ceiling. Defaults off (keyframe path) and is honoured across `resume`. If
+    the agent cannot open a video, the request tells it to re-run without
+    `--host-video` to fall back to keyframes.
+- `autocut.pipeline._select_route` centralises the payload-x-transport routing
+  (keyframe / openrouter-video / host-video) in one table so new payloads
+  (e.g. audio) add a route and a thin runner rather than another `if` branch.
+
 ### Changed
 
+- The `motion` sampler now sends the model ONLY the hot windows (sampled at one
+  frame per second) and skips the dead time entirely, instead of a sparse
+  all-video baseline plus dense windows. Feeding a stills VLM just the key
+  moments stops the decisive action from being diluted by idle frames. With no
+  hot window detected it still falls back to a uniform baseline.
 - ffmpeg/ffprobe are now resolved through `autocut.video.ffmpeg_path`
   (system PATH first, then a bundled `static-ffmpeg` fallback fetched on first
   use). `static-ffmpeg` is a required dependency — it ships both `ffmpeg` and

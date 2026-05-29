@@ -114,3 +114,49 @@ def test_estimate_cost_is_zero() -> None:
     estimate = provider.estimate_cost(n_keyframes=100)
     assert estimate.is_free
     assert estimate.estimated_total_usd == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Video capability + video-input pause (host+video path)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_supports_video_defaults_false_and_opts_in(tmp_path: Path) -> None:
+    assert await HostAgentProvider(work_dir=tmp_path).supports_video() is False
+    assert await HostAgentProvider(work_dir=tmp_path, supports_video=True).supports_video() is True
+
+
+@pytest.mark.asyncio
+async def test_analyze_video_clip_writes_video_request_and_pauses(tmp_path: Path) -> None:
+    clip = tmp_path / "compressed.mp4"
+    clip.write_bytes(b"\x00\x00\x00")  # presence is enough; content is not read
+    provider = HostAgentProvider(work_dir=tmp_path, supports_video=True, agent_hint="claude")
+
+    with pytest.raises(HostAgentPauseRequested) as caught:
+        await provider.analyze_video_clip(
+            clip,
+            AnalysisHints(),
+            video_id="video_001",
+            clip_duration_sec=44.0,
+        )
+
+    assert caught.value.request_path == tmp_path / "VLM_REQUEST.md"
+    assert caught.value.response_path == tmp_path / "VLM_RESPONSE.json"
+    written = caught.value.request_path.read_text(encoding="utf-8")
+    assert "compressed.mp4" in written  # references the MP4 by path
+    assert "VIDEO" in written  # video-variant brief
+    assert "video_001" in written
+    assert "--host-video" in written  # fallback guidance for a non-video agent
+
+
+@pytest.mark.asyncio
+async def test_analyze_video_clip_errors_when_clip_missing(tmp_path: Path) -> None:
+    provider = HostAgentProvider(work_dir=tmp_path, supports_video=True)
+    with pytest.raises(VLMError, match="not found"):
+        await provider.analyze_video_clip(
+            tmp_path / "missing.mp4",
+            AnalysisHints(),
+            video_id="x",
+            clip_duration_sec=10.0,
+        )

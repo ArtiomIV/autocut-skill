@@ -45,6 +45,7 @@ def make_provider(
     model: str,
     work_dir: Path | None = None,
     api_key: str | None = None,
+    host_supports_video: bool = False,
 ) -> VLMProvider:
     """Return a ready-to-use ``VLMProvider`` for ``provider_name``.
 
@@ -52,13 +53,20 @@ def make_provider(
     ``work_dir`` is required for ``host`` — it is where ``VLM_REQUEST.md``
     and ``VLM_RESPONSE.json`` live during the pause/resume handshake.
     ``api_key`` is optional: if omitted we read it from the OS keyring.
+    ``host_supports_video`` declares the host agent video-capable (opt-in via
+    ``--host-video``); it is ignored by non-host providers, which discover
+    video support live from their model catalogue instead.
     """
     name = provider_name.strip().lower()
 
     if name == "host":
         if work_dir is None:
             raise VLMError("host provider requires work_dir for the request/response files")
-        return HostAgentProvider(work_dir=work_dir, agent_hint=model)
+        return HostAgentProvider(
+            work_dir=work_dir,
+            agent_hint=model,
+            supports_video=host_supports_video,
+        )
 
     if name == "openrouter":
         key = api_key or _resolve_keyring("openrouter")

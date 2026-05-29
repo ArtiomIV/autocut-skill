@@ -25,6 +25,7 @@ import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 from autocut.config import AutoCutConfig
@@ -48,6 +49,7 @@ from autocut.video import (
     find_hot_windows,
     probe_video,
 )
+from autocut.video.compress import compress_for_vlm
 from autocut.video_analysis import analyze_video
 from autocut.vlm import CostEstimate, VLMError, VLMProvider
 from autocut.vlm.base import HostAgentPauseRequested
@@ -68,6 +70,40 @@ _AUTO_DETECT_CONFIDENCE_THRESHOLD: float = 0.5
 # A confirm hook: returns True to proceed, False to abort. The CLI passes
 # its interactive prompt; tests pass a constant.
 ConfirmHook = Callable[[CostEstimate, float], bool]
+
+# Name of the compressed analysis copy the host-video path leaves in the work
+# dir for the agent to watch (persisted across the pause/resume, unlike the
+# L2 engine's self-cleaning temp dir).
+HOST_VIDEO_FILENAME = "compressed.mp4"
+
+
+class Route(Enum):
+    """How a run delivers the analysis payload to the model.
+
+    The selection is the payload (keyframe vs video) crossed with the
+    transport (host pause/resume vs OpenRouter API). Keeping it as one small
+    table here means each new payload (e.g. audio) is one extra route plus a
+    thin runner — the orchestrator does not grow an ad-hoc tree of ``if``s.
+    """
+
+    keyframe = "keyframe"  # stills path — host pause/resume OR openrouter images
+    openrouter_video = "openrouter_video"  # L2 autonomous batch loop (base64 video)
+    host_video = "host_video"  # single-pass compressed MP4 via host pause/resume
+
+
+def _select_route(provider_name: str, *, supports_video: bool) -> Route:
+    """Pick the analysis route from provider capability + identity.
+
+    Pure and side-effect free so it can be unit-tested without a live
+    provider. ``supports_video`` is the already-resolved capability
+    (``await provider.supports_video()``): OpenRouter discovers it from its
+    model catalogue, the host declares it via ``--host-video``.
+    """
+    if not supports_video:
+        return Route.keyframe
+    if provider_name == "host":
+        return Route.host_video
+    return Route.openrouter_video
 
 
 class CostCapExceeded(VLMError):  # noqa: N818
@@ -132,6 +168,9 @@ async def run_analysis(
                 sampling_strategy=sampling_strategy,
                 accurate_cuts=accurate_cuts,
                 write_outputs=write_outputs,
+                # Carry the host video capability across the process boundary so
+                # the post-detection resume picks the host-video route, not keyframes.
+                host_supports_video=await provider.supports_video(),
             )
             raise
         effective_hints = _apply_detection_to_hints(effective_hints, detection)
@@ -142,11 +181,12 @@ async def run_analysis(
         sampling_strategy if sampling_strategy != "hybrid" else profile.sampling_strategy
     )
 
-    # Capability gate: a provider that ingests video directly (openrouter with
-    # a video-capable model) takes the L2 video path — compress + autonomous
-    # batch loop, no keyframe sampling. Everything else (host, non-video
-    # models) falls through to the keyframe path below.
-    if await provider.supports_video():
+    # Capability gate: pick the payload x transport route once, then dispatch to
+    # a thin runner. Video-capable providers skip keyframe sampling entirely —
+    # openrouter via the L2 autonomous batch loop, the host via a single-pass
+    # compressed-MP4 pause/resume. Everything else takes the keyframe path below.
+    route = _select_route(provider.name, supports_video=await provider.supports_video())
+    if route is Route.openrouter_video:
         return await _run_video_analysis(
             video,
             provider,
@@ -158,6 +198,18 @@ async def run_analysis(
             accurate_cuts=accurate_cuts,
             write_outputs=write_outputs,
             confirm_cost=confirm_cost,
+        )
+    if route is Route.host_video:
+        return await _run_host_video_analysis(
+            video,
+            provider,
+            metadata=metadata,
+            effective_hints=effective_hints,
+            profile=profile,
+            config=config,
+            root=root,
+            accurate_cuts=accurate_cuts,
+            write_outputs=write_outputs,
         )
 
     log.info("pipeline: scene detect (threshold=%s)", config.advanced.scene_threshold)
@@ -347,6 +399,75 @@ async def _run_video_analysis(
         accurate_cuts=accurate_cuts,
         write_outputs=write_outputs,
         # real billed cost from usage.include (summed across batches), not an estimate
+        cost_estimate_usd=plan.metadata.cost_usd or 0.0,
+        keyframes=None,
+        profile=profile,
+    )
+    _clear_resume_state(root)
+    return result
+
+
+async def _run_host_video_analysis(
+    video: Path,
+    provider: VLMProvider,
+    *,
+    metadata: VideoMetadata,
+    effective_hints: AnalysisHints,
+    profile: ContentProfile,
+    config: AutoCutConfig,
+    root: Path,
+    accurate_cuts: bool,
+    write_outputs: bool,
+) -> AnalysisResult:
+    """Host video-input path: compress once, hand the MP4 to the agent, pause.
+
+    Single-pass by design. Unlike the OpenRouter path there is no base64 size
+    ceiling (the agent reads the file from disk), so the whole compressed video
+    is sent in one pause/resume — no batch loop, no L2 engine. The host's
+    ``analyze_video_clip`` writes ``VLM_REQUEST.md`` and raises
+    ``HostAgentPauseRequested``; the resume state written here lets
+    ``autocut resume`` finish via ``complete_from_plan`` after the agent fills
+    in ``VLM_RESPONSE.json``. Cutting still uses the ORIGINAL video, never the
+    compressed analysis copy.
+    """
+    log.info("pipeline: host video path — compressing %s for the agent", video)
+    compressed = compress_for_vlm(video, root / HOST_VIDEO_FILENAME)
+
+    # Persist before the pause so resume can complete (strategy="video",
+    # zero keyframes — the agent watched the clip, not stills).
+    _write_resume_state(
+        root,
+        video=video,
+        metadata=metadata,
+        n_scenes=0,
+        n_keyframes=0,
+        sampling_strategy="video",
+        accurate_cuts=accurate_cuts,
+        write_outputs=write_outputs,
+    )
+
+    video_id = video.stem or "video"
+    # Raises HostAgentPauseRequested (propagates to the CLI). The whole video is
+    # one clip, so clip-relative timestamps equal absolute source time. The
+    # return path below is unreachable for today's pausing host but kept so a
+    # future non-pausing host implementation completes cleanly.
+    plan = await provider.analyze_video_clip(
+        compressed,
+        effective_hints,
+        video_id=video_id,
+        clip_duration_sec=metadata.duration_sec,
+    )
+    result = complete_from_plan(
+        plan,
+        video=video,
+        metadata=metadata,
+        config=config,
+        output_root=root,
+        n_scenes=0,
+        n_keyframes=0,
+        sampling_strategy="video",
+        accurate_cuts=accurate_cuts,
+        write_outputs=write_outputs,
         cost_estimate_usd=plan.metadata.cost_usd or 0.0,
         keyframes=None,
         profile=profile,
@@ -555,6 +676,7 @@ def _write_detection_resume_state(
     sampling_strategy: str,
     accurate_cuts: bool,
     write_outputs: bool,
+    host_supports_video: bool = False,
 ) -> Path:
     """Persist enough state to continue the pipeline after a detection pause.
 
@@ -562,7 +684,9 @@ def _write_detection_resume_state(
     resume path applies exactly the same logic (threshold + model_copy)
     that the live path would have. Includes the probed metadata so we
     don't re-probe on resume (it's deterministic + cheap, but persistence
-    avoids any subtle timing inconsistency).
+    avoids any subtle timing inconsistency). ``host_supports_video`` is
+    persisted so the post-detection resume rebuilds a video-capable host
+    provider and re-enters on the host-video route.
     """
     output_root.mkdir(parents=True, exist_ok=True)
     state = {
@@ -574,6 +698,7 @@ def _write_detection_resume_state(
         "accurate_cuts": accurate_cuts,
         "write_outputs": write_outputs,
         "initial_hints": json.loads(initial_hints.model_dump_json()),
+        "host_supports_video": host_supports_video,
     }
     path = output_root / DETECTION_RESUME_STATE_FILENAME
     path.write_text(json.dumps(state, indent=2), encoding="utf-8")

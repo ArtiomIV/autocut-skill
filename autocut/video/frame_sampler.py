@@ -13,9 +13,12 @@ the realistic content types:
   missed entirely.
 - ``hybrid``: scene-based, but any scene longer than ``max_gap_sec`` gets
   topped up with additional uniform samples so no action is missed.
-- ``motion``: sparse baseline everywhere, dense inside ``HotWindow``
-  intervals produced by ``hot_windows.find_hot_windows``. Best when the
-  pipeline has precomputed motion + audio profiles for the video.
+- ``motion``: when hot windows fire, sample ONLY inside those ``HotWindow``
+  intervals (one frame per second by default) and skip the dead time
+  entirely — a stills VLM judges the action better when the key moments are
+  not diluted by idle frames. With no hot window detected, fall back to a
+  sparse uniform baseline so the caller never gets an empty list. Best when
+  the pipeline has precomputed motion + audio profiles for the video.
 
 Output is a list of ``FrameSpec`` records with the timestamp and the
 originating scene index (for traceability). The list is sorted by
@@ -51,8 +54,8 @@ _DEFAULT_MIN_KEYFRAMES = 3
 
 # Defaults for the ``motion`` strategy. Tunable per-call so the pipeline can
 # pass tighter values for sport-style profiles.
-_DEFAULT_MOTION_BASE_INTERVAL_SEC = 4.0  # sparse sampling outside hot windows
-_DEFAULT_MOTION_DENSE_INTERVAL_SEC = 0.5  # dense sampling inside hot windows
+_DEFAULT_MOTION_BASE_INTERVAL_SEC = 4.0  # uniform fallback when NO hot window fires
+_DEFAULT_MOTION_DENSE_INTERVAL_SEC = 1.0  # one frame per second inside hot windows
 _DEFAULT_MOTION_HOT_PADDING_SEC = 1.0  # widen each hot window by this on both sides
 
 
@@ -153,12 +156,13 @@ def sample_motion(
     dense_interval_sec: float = _DEFAULT_MOTION_DENSE_INTERVAL_SEC,
     hot_padding_sec: float = _DEFAULT_MOTION_HOT_PADDING_SEC,
 ) -> list[FrameSpec]:
-    """Sparse baseline + dense sampling inside ``hot_windows``.
+    """Dense sampling ONLY inside ``hot_windows`` — no all-video baseline.
 
-    The baseline pass guarantees the VLM sees every part of the video
-    even when no hot window fires — important for short videos and for
-    keeping context around the action. Inside each (padded) hot window
-    we add dense samples so motion bursts are captured frame-accurately.
+    When at least one hot window fires we sample exclusively inside the
+    (padded) windows at ``dense_interval_sec`` and skip every dead second:
+    feeding a stills VLM only the key moments stops the decisive action from
+    being diluted by idle frames (the failure mode that made a flat 67-frame
+    batch miss the climax).
 
     Empty ``hot_windows`` falls back to uniform sampling at
     ``base_interval_sec`` so the caller never gets an empty list when
@@ -171,8 +175,12 @@ def sample_motion(
     if hot_padding_sec < 0:
         raise ValueError("hot_padding_sec must be >= 0")
 
-    specs: list[FrameSpec] = list(sample_uniform(duration_sec, interval_sec=base_interval_sec))
+    if not hot_windows:
+        # No detected action: a sparse uniform pass keeps the VLM from getting
+        # an empty list while staying cheap.
+        return _dedupe_and_sort(sample_uniform(duration_sec, interval_sec=base_interval_sec))
 
+    specs: list[FrameSpec] = []
     for window in hot_windows:
         # Pad the window on both sides so we catch the lead-in to the action
         # and the immediate aftermath; clamp to the source bounds.

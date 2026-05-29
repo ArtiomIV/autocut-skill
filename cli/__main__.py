@@ -147,6 +147,18 @@ def run(
         str | None,
         typer.Option("--vlm-model", help="VLM model id override (provider-specific)."),
     ] = None,
+    host_video: Annotated[
+        bool,
+        typer.Option(
+            "--host-video",
+            help=(
+                "Only with --vlm host: declare the host agent video-capable so "
+                "AutoCut sends the compressed MP4 (one pause/resume) instead of "
+                "keyframes. Use only if the agent can watch a video file; "
+                "otherwise it falls back to keyframes."
+            ),
+        ),
+    ] = False,
     sampling: Annotated[
         str,
         typer.Option(
@@ -216,11 +228,16 @@ def run(
     out_root = (output_dir or cfg.output.base_dir).resolve()
     work_dir = out_root  # host-agent provider writes request/response files here
 
+    if host_video and provider_name.strip().lower() != "host":
+        err_console.print("--host-video only applies to --vlm host; ignoring it.")
+        host_video = False
+
     try:
         provider = make_provider(
             provider_name,
             model=model,
             work_dir=work_dir,
+            host_supports_video=host_video,
         )
     except UnavailableProviderError as exc:
         err_console.print(str(exc))
@@ -307,7 +324,13 @@ def _resume_detection_phase(base: Path, cfg: AutoCutConfig) -> None:
         err_console.print(str(exc))
         raise typer.Exit(code=1) from exc
 
-    provider = HostAgentProvider(work_dir=base, agent_hint=cfg.vlm.model)
+    # Rebuild the host provider with the same video capability the original
+    # run had, so re-entering the pipeline takes the host-video route again.
+    provider = HostAgentProvider(
+        work_dir=base,
+        agent_hint=cfg.vlm.model,
+        supports_video=bool(state.get("host_supports_video", False)),
+    )
     try:
         detection = provider.resume_detection_from_disk()
     except VLMError as exc:

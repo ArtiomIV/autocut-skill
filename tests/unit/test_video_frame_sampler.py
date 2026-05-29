@@ -184,7 +184,7 @@ def test_sample_motion_baseline_only_when_no_hot_windows() -> None:
     assert all(s.scene_index == -1 for s in specs)
 
 
-def test_sample_motion_densifies_inside_hot_window() -> None:
+def test_sample_motion_samples_only_inside_hot_window() -> None:
     # Hot window from 4-6 s with 1 s padding → dense range 3-7 s.
     hot = [HotWindow(start_sec=4.0, end_sec=6.0, score=1.0)]
     specs = sample_motion(
@@ -194,12 +194,13 @@ def test_sample_motion_densifies_inside_hot_window() -> None:
         dense_interval_sec=0.5,
         hot_padding_sec=1.0,
     )
-    # Baseline at 2, 6, 10, 14, 18 (5) + ~8 dense in [3,7) at 0.5 stride.
-    # Dedup tolerance can collapse one or two boundary collisions.
-    assert len(specs) >= 11
-    # At least 5 samples should sit in the dense region.
-    dense_count = sum(1 for s in specs if 3.0 <= s.timestamp.total_seconds() < 7.0)
-    assert dense_count >= 5
+    # No all-video baseline: every sample must sit inside the padded window
+    # [3,7). The dead time (7-20s, 0-3s) is skipped entirely.
+    times = [s.timestamp.total_seconds() for s in specs]
+    assert times, "expected dense samples inside the window"
+    assert all(3.0 <= t < 7.0 for t in times)
+    # ~8 dense samples in [3,7) at 0.5 stride (dedup may drop boundary dupes).
+    assert len(specs) >= 5
 
 
 def test_sample_motion_padding_is_clamped_at_video_bounds() -> None:
