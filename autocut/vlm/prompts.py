@@ -19,10 +19,13 @@ from typing import Final
 from autocut.models import AnalysisHints, ClipPlan, PromptTemplateId
 from autocut.video.frame_sampler import FrameSpec
 
+# v3 (2026-05-29): cap the sport lead-in at ~1-2s (no long approach/circling/
+# idle pause before the action) so clips stop drifting long and loose. Pairs
+# with temperature=0 on the analysis calls for run-to-run consistency.
 # v2 (2026-05-28): reworked sport/talk clip-boundary guidance so the model
 # includes the wind-up and follow-through of the key moment instead of cutting
 # tight on the impact. The detection prompt is unchanged, hence its own version.
-PROMPT_VERSION: Final[str] = "v2"
+PROMPT_VERSION: Final[str] = "v3"
 DETECTION_PROMPT_VERSION: Final[str] = "v1"
 
 
@@ -76,14 +79,14 @@ Content guidance — sport / combat / action:
 - Score < 7 examples: defensive guard, ref breaks, fighters circling
   or studying each other, single isolated jab without follow-up,
   movement without engagement.
-- Cut tight, but keep the moment readable. Start a beat BEFORE the
-  decisive action so it is legible (the wind-up, the combination
-  leading to a knockdown, the approach to the strike), and ALWAYS
-  include the immediate follow-through and reaction (the opponent
-  going down, the referee stepping in, the celebration). NEVER end on
-  the frame of impact itself — the aftermath is what makes the clip
-  land. Trim idle setup and dead air, not the action's natural
-  beginning and end.
+- Cut tight. Start AT MOST ~1-2 seconds before the decisive action —
+  just enough to make the wind-up of the landing combination legible,
+  NEVER more. Do NOT include the long approach, the circling, the
+  studying, or any idle pause before the action begins — those dead
+  seconds make the clip drag. ALWAYS include the immediate
+  follow-through and reaction (the opponent reeling, the referee
+  stepping in, the celebration), and NEVER end on the frame of impact
+  itself — the aftermath is what makes the clip land.
 """
 
 

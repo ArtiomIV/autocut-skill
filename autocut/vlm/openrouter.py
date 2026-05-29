@@ -143,6 +143,9 @@ class OpenRouterProvider(VLMProvider):
                     messages=messages,
                     response_format={"type": "json_object"},
                     max_tokens=4096,
+                    # Greedy decoding: clip selection should be repeatable for a
+                    # given video, not vary run-to-run.
+                    temperature=0,
                 ),
                 timeout=timeout_sec,
             )
@@ -230,6 +233,8 @@ class OpenRouterProvider(VLMProvider):
                     messages=messages,
                     response_format={"type": "json_object"},
                     max_tokens=4096,
+                    # Greedy decoding for repeatable clip selection.
+                    temperature=0,
                     extra_body={
                         # base64 video only works on the Vertex backend.
                         "provider": {"order": ["google-vertex"], "allow_fallbacks": False},

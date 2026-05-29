@@ -109,7 +109,7 @@ async def test_analyze_happy_path(fake_keyframes: list[Keyframe]) -> None:
     assert len(plan.clips) == 1
     assert plan.clips[0].score == 9
     # Provider injects metadata even if the model omitted it.
-    assert plan.metadata.prompt_version == "v2"
+    assert plan.metadata.prompt_version == "v3"
 
 
 @pytest.mark.asyncio
