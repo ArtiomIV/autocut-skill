@@ -42,24 +42,61 @@ async def list_openrouter_models(
     api_key: str | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> list[ModelInfo]:
-    """Return every vision-capable model exposed by OpenRouter.
+    """Return every model usable by AutoCut: declares BOTH audio and video input.
 
-    The endpoint is public; an ``api_key`` is optional and only used to
-    surface account-specific availability (e.g. region restrictions).
+    AutoCut routes one model across the whole content matrix — video for visual
+    analysis, audio for talk — so a model that lacks either modality cannot be
+    selected. We therefore filter the catalogue to models declaring both, and
+    the user only ever sees valid choices. The endpoint is public; an
+    ``api_key`` is optional and only surfaces account-specific availability.
     """
     raw_models = await _fetch_models_data(api_key=api_key, client=client)
 
-    vision_models: list[ModelInfo] = []
+    usable: list[ModelInfo] = []
     for raw in raw_models:
-        if not _is_vision_capable(raw):
+        if not _supports_audio_and_video(raw):
             continue
         info = _to_model_info(raw)
         if info is not None:
-            vision_models.append(info)
+            usable.append(info)
 
     # Cheapest input first — most users care about that ranking.
-    vision_models.sort(key=lambda m: (m.usd_per_1m_input is None, m.usd_per_1m_input or 0.0, m.id))
-    return vision_models
+    usable.sort(key=lambda m: (m.usd_per_1m_input is None, m.usd_per_1m_input or 0.0, m.id))
+    return usable
+
+
+async def validate_openrouter_model(
+    model_id: str,
+    *,
+    api_key: str | None = None,
+    client: httpx.AsyncClient | None = None,
+) -> None:
+    """Raise ``VLMError`` unless ``model_id`` declares BOTH audio and video input.
+
+    Hard gate enforced before a run so a model that cannot cover the whole
+    content matrix (e.g. a video-only or audio-only model) is rejected up front
+    with a clear message instead of failing mid-pipeline. Catalogue-fetch
+    failures propagate as ``VLMError`` (the caller cannot safely proceed without
+    knowing the capability).
+    """
+    models = await _fetch_models_data(api_key=api_key, client=client)
+    raw = _find_model(model_id, models)
+    if raw is None:
+        raise VLMError(
+            f"model {model_id!r} is not in the OpenRouter catalogue; "
+            f"run `autocut models list` to see the models AutoCut can use."
+        )
+    if not _supports_audio_and_video(raw):
+        has_audio = _has_modality(raw, "audio")
+        has_video = _has_modality(raw, "video")
+        missing = (
+            "video" if has_audio and not has_video else "audio" if has_video else "audio+video"
+        )
+        raise VLMError(
+            f"model {model_id!r} cannot be used: it does not declare {missing} input. "
+            f"AutoCut needs a model with BOTH audio and video — run "
+            f"`autocut models list` to pick one (e.g. google/gemini-2.5-flash)."
+        )
 
 
 async def model_supports_video(
@@ -77,6 +114,22 @@ async def model_supports_video(
     """
     models = await _fetch_models_data(api_key=api_key, client=client)
     return model_supports_video_input(model_id, models)
+
+
+async def model_supports_audio(
+    model_id: str,
+    *,
+    api_key: str | None = None,
+    client: httpx.AsyncClient | None = None,
+) -> bool:
+    """Live check: does ``model_id`` declare ``audio`` as an input modality?
+
+    Mirror of ``model_supports_video`` for the talk/podcast audio path. Raises
+    ``VLMError`` on a catalogue-fetch failure; capability-gate callers catch it
+    and treat failure as "no audio support".
+    """
+    models = await _fetch_models_data(api_key=api_key, client=client)
+    return model_supports_audio_input(model_id, models)
 
 
 # ---------------------------------------------------------------------------
@@ -119,9 +172,14 @@ async def _fetch_models_data(
     return [m for m in raw_models if isinstance(m, dict)]
 
 
-def _is_vision_capable(raw: dict[str, Any]) -> bool:
-    """OpenRouter encodes modality flags under ``architecture.modality``."""
-    return _has_modality(raw, "image")
+def _supports_audio_and_video(raw: dict[str, Any]) -> bool:
+    """True only if the model declares BOTH audio and video input modalities.
+
+    AutoCut's hard requirement: one model must cover the full content matrix
+    (video for visual, audio for talk). Modality flags live under
+    ``architecture`` (legacy ``modality`` string or ``input_modalities`` list).
+    """
+    return _has_modality(raw, "audio") and _has_modality(raw, "video")
 
 
 def _has_modality(raw: dict[str, Any], needle: str) -> bool:

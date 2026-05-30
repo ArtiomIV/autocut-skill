@@ -23,7 +23,12 @@ PromptTemplateId = Literal["sport", "talk", "hybrid"]
 # Timestamp parsing
 # ---------------------------------------------------------------------------
 
-_TIMESTAMP_RE = re.compile(r"^(?P<h>\d{1,2}):(?P<m>[0-5]\d):(?P<s>[0-5]\d)(?:\.(?P<ms>\d{1,3}))?$")
+# Accept both ``HH:MM:SS(.mmm)`` and ``MM:SS(.mmm)`` — different models format
+# clip-relative timestamps differently (Gemini 3.5 Flash emits HH:MM:SS, Gemini
+# 3.1 Pro emits MM:SS). The hours group is optional and defaults to 0.
+_TIMESTAMP_RE = re.compile(
+    r"^(?:(?P<h>\d{1,2}):)?(?P<m>[0-5]?\d):(?P<s>[0-5]\d)(?:\.(?P<ms>\d{1,3}))?$"
+)
 
 
 def _parse_timestamp(value: object) -> timedelta:
@@ -37,8 +42,10 @@ def _parse_timestamp(value: object) -> timedelta:
     if isinstance(value, str):
         match = _TIMESTAMP_RE.match(value.strip())
         if not match:
-            raise ValueError(f"invalid timestamp {value!r}; expected HH:MM:SS(.mmm) or seconds")
-        h = int(match.group("h"))
+            raise ValueError(
+                f"invalid timestamp {value!r}; expected HH:MM:SS(.mmm), MM:SS(.mmm) or seconds"
+            )
+        h = int(match.group("h") or 0)
         m = int(match.group("m"))
         s = int(match.group("s"))
         ms_raw = match.group("ms") or "0"
@@ -92,7 +99,7 @@ class Clip(BaseModel):
     start: Timestamp
     end: Timestamp
     category: Category
-    description: str = Field(min_length=1, max_length=200)
+    description: str = Field(min_length=1, max_length=500)
     score: int = Field(ge=0, le=10)
     rationale: str = Field(min_length=1, max_length=300)
     tags: list[str] = Field(default_factory=list, max_length=5)

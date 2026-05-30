@@ -50,6 +50,7 @@ from autocut.vlm import (
     VLMError,
     list_openrouter_models,
     make_provider,
+    validate_openrouter_model,
 )
 
 # Force UTF-8 on stdio so unicode chars (✓, →, …) used in rich output don't
@@ -245,6 +246,8 @@ def run(
     except VLMError as exc:
         err_console.print(str(exc))
         raise typer.Exit(code=1) from exc
+
+    _enforce_model_capabilities(provider_name, model)
 
     try:
         result = asyncio.run(
@@ -481,6 +484,8 @@ def detect(
     except VLMError as exc:
         err_console.print(str(exc))
         raise typer.Exit(code=1) from exc
+
+    _enforce_model_capabilities(provider_name, model)
 
     try:
         metadata = probe_video(video)
@@ -1039,6 +1044,23 @@ def _build_hints_from_cli(
         goal=defaults.goal,
         language=defaults.language,
     )
+
+
+def _enforce_model_capabilities(provider_name: str, model: str) -> None:
+    """For openrouter, reject a model that lacks BOTH audio and video input.
+
+    AutoCut routes one model across the whole content matrix; a video-only or
+    audio-only model cannot cover it, so we fail fast with a clear message
+    before any extraction or analysis happens. Host provider is exempt — its
+    capability is user-declared, not catalogue-derived.
+    """
+    if provider_name.strip().lower() != "openrouter":
+        return
+    try:
+        asyncio.run(validate_openrouter_model(model))
+    except VLMError as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(code=1) from exc
 
 
 def _make_cost_confirm(*, yes: bool):  # type: ignore[no-untyped-def]

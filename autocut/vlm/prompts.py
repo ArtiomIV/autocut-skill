@@ -164,6 +164,93 @@ prompt version, timing) are filled in by the caller.
 """
 
 
+# Used by the audio-input path: the model LISTENS to the clip (no keyframes,
+# no visual cues). The signal is the spoken content, so the whole framing
+# differs from the keyframe/video prompts — judge what is SAID.
+_AUDIO_SYSTEM: Final[str] = """\
+You are a video editor assistant. You are LISTENING to the audio track of a
+video clip — speech, tone of voice, laughter, applause, pauses. You CANNOT see
+the picture; judge purely on what is said and how it is said.
+
+Your job: SELECT only the few standout highlight moments — the ones that would
+land OUT OF CONTEXT on social media. This is highlight SELECTION, NOT
+transcription and NOT segmentation: most of a talk is ordinary conversation that
+is NOT a highlight, so most of the timeline produces NO clip at all. Be highly
+selective. Return the result as STRICT JSON matching the provided schema. No
+prose before or after the JSON. No markdown fences.
+
+Hard rules:
+- Each clip must be between {min_dur:.1f} and {max_dur:.1f} seconds long.
+- Clips must NOT overlap.
+- ``start`` and ``end`` use the ``HH:MM:SS.mmm`` format, RELATIVE to this clip
+  (its first moment is 00:00:00.000).
+- ``score`` is an integer 0-10 (10 = mandatory, must keep).
+- Include a clip ONLY if you would score it 7 or higher (the viral test below).
+  OMIT every segment you would score below 7 — do NOT return filler, routine
+  discussion, setup, or ordinary talking.
+- ``category`` is one of: highlight, reaction, dialogue, transition, filler.
+- ``tags`` is a list of 1-5 short strings.
+- If no segment is worth keeping, return an empty ``clips`` array.
+
+Content guidance — find the VIRAL moments (the Instagram / TikTok scroll test):
+- THE BAR: picture someone scrolling their feed. Would THIS clip make them STOP
+  and watch? Score >= 7 only for moments that pass that test — a sharp
+  punchline, a bold or surprising claim, a funny exchange or comeback, an
+  emotional or personal reveal, a vivid story beat, a clear laugh/applause
+  reaction. These are the clips that would "catch" a viewer mid-scroll.
+- AIM FOR THE RIGHT AMOUNT — neither too few nor too many. Capture EVERY
+  genuinely scroll-stopping moment, and ONLY those. Do NOT clip ordinary
+  discussion, logistics, one-word answers or banter ("yes", "ok", "exactly"),
+  hesitations, or plain setup — those score below 7 and must be omitted. A long
+  talk usually has somewhere between a handful and a couple dozen real viral
+  moments: not one per sentence, but not just one or two either.
+- Give each clip enough lead-in for the hook to make sense AND the payoff or
+  reaction that follows. NEVER cut mid-sentence.
+- Put the quotable line or a tight summary in ``description`` so a human
+  scanning the manifest knows what was said.
+"""
+
+
+_AUDIO_USER_TEMPLATE: Final[str] = """\
+Audio metadata: content type = {content_hint}, language = {language},
+goal = {goal}, clip duration = {duration_sec:.2f}s.
+
+You are listening to the full audio clip provided. Identify the spoken segments
+worth keeping as standalone highlight clips. Report each ``start``/``end``
+RELATIVE to THIS clip, where 00:00:00.000 is the first moment you hear.
+
+Return JSON matching this schema (do not output the schema itself, output
+your analysis):
+{schema}
+
+Fill ``video_id`` with {video_id!r} and ``duration_sec`` with {duration_sec}.
+Leave ``metadata`` as an empty object — provenance fields (provider, model,
+prompt version, timing) are filled in by the caller.
+"""
+
+
+def build_audio_system_prompt(hints: AnalysisHints) -> str:
+    """System message for the audio-input path (listen, hunt viral spoken moments)."""
+    return _AUDIO_SYSTEM.format(min_dur=hints.min_duration_sec, max_dur=hints.max_duration_sec)
+
+
+def build_audio_user_prompt(
+    *,
+    video_id: str,
+    duration_sec: float,
+    hints: AnalysisHints,
+) -> str:
+    """User message for the audio-input path. Timestamps are clip-relative."""
+    return _AUDIO_USER_TEMPLATE.format(
+        content_hint=hints.content_hint.value,
+        language=hints.language,
+        goal=hints.goal,
+        duration_sec=duration_sec,
+        schema=clip_plan_schema(),
+        video_id=video_id,
+    )
+
+
 def format_timestamp(ts: timedelta) -> str:
     """Format ``HH:MM:SS.mmm`` so timestamps in the prompt line up with the schema."""
     total_ms = max(0, int(ts.total_seconds() * 1000))

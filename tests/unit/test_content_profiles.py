@@ -57,14 +57,19 @@ def test_sport_profile_has_short_min_duration_and_high_keyframe_floor() -> None:
     assert SPORT_PROFILE.prompt_template == "sport"
 
 
-def test_talk_profile_has_long_clip_window() -> None:
-    # Verbal moments need setup + payoff so the clip window is wider.
+def test_talk_profile_has_tight_social_clip_window() -> None:
+    # A verbal moment needs >= ~8s of setup + payoff, but the upper bound is
+    # kept TIGHT (30s) so a clip does not sprawl into the next speaker's filler.
+    # Talk targets social platforms where short clips win (user feedback 2026-05-30).
     assert TALK_PROFILE.min_duration_sec >= 8.0
-    assert TALK_PROFILE.max_duration_sec >= 60.0
+    assert TALK_PROFILE.max_duration_sec == 30.0
     assert TALK_PROFILE.prompt_template == "talk"
 
 
 def test_hybrid_profile_sits_between_sport_and_talk() -> None:
+    # Min duration still rises sport -> hybrid -> talk (talk needs the most
+    # lead-in). Max duration no longer follows that order: talk is deliberately
+    # capped tight for social, so hybrid is now the widest catch-all window.
     assert (
         SPORT_PROFILE.min_duration_sec
         <= HYBRID_PROFILE.min_duration_sec
@@ -72,8 +77,8 @@ def test_hybrid_profile_sits_between_sport_and_talk() -> None:
     )
     assert (
         SPORT_PROFILE.max_duration_sec
-        <= HYBRID_PROFILE.max_duration_sec
         <= TALK_PROFILE.max_duration_sec
+        <= HYBRID_PROFILE.max_duration_sec
     )
     assert HYBRID_PROFILE.prompt_template == "hybrid"
 

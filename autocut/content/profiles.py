@@ -63,7 +63,7 @@ TALK_PROFILE = ContentProfile(
     sampling_strategy="hybrid",
     min_keyframes=5,
     min_duration_sec=8.0,
-    max_duration_sec=60.0,
+    max_duration_sec=30.0,
     prompt_template="talk",
 )
 

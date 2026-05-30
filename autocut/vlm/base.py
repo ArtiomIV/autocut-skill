@@ -155,6 +155,32 @@ class VLMProvider(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} does not support direct video analysis")
 
+    async def supports_audio(self) -> bool:
+        """Whether this provider can ingest an audio clip directly.
+
+        Default ``False``. Providers that override this to ``True`` MUST
+        implement ``analyze_audio_clip``. Used for the talk/podcast path where
+        the model hears speech instead of looking at frames.
+        """
+        return False
+
+    async def analyze_audio_clip(
+        self,
+        clip_path: Path,
+        hints: AnalysisHints,
+        *,
+        video_id: str,
+        clip_duration_sec: float,
+        timeout_sec: int = 300,
+    ) -> ClipPlan:
+        """Analyse a single (extracted) audio clip → ``ClipPlan``.
+
+        Only meaningful for providers whose ``supports_audio`` returns ``True``;
+        the default raises so a mis-routed call fails loudly. Timestamps are
+        returned RELATIVE to the clip.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support direct audio analysis")
+
     @abstractmethod
     def estimate_cost(self, n_keyframes: int) -> CostEstimate:
         """Return a best-effort pre-call cost estimate.

@@ -31,9 +31,11 @@ from pydantic import ValidationError
 from autocut.models import AnalysisHints, ClipPlan, DetectionResult, Keyframe
 from autocut.video.frame_sampler import FrameSpec
 from autocut.vlm.base import CostEstimate, VLMError, VLMProvider
-from autocut.vlm.discovery import model_supports_video
+from autocut.vlm.discovery import model_supports_audio, model_supports_video
 from autocut.vlm.prompts import (
     PROMPT_VERSION,
+    build_audio_system_prompt,
+    build_audio_user_prompt,
     build_detection_system_prompt,
     build_detection_user_prompt,
     build_system_prompt,
@@ -142,7 +144,7 @@ class OpenRouterProvider(VLMProvider):
                     model=self.model,
                     messages=messages,
                     response_format={"type": "json_object"},
-                    max_tokens=4096,
+                    max_tokens=16384,
                     # Greedy decoding: clip selection should be repeatable for a
                     # given video, not vary run-to-run.
                     temperature=0,
@@ -232,7 +234,7 @@ class OpenRouterProvider(VLMProvider):
                     model=self.model,
                     messages=messages,
                     response_format={"type": "json_object"},
-                    max_tokens=4096,
+                    max_tokens=16384,
                     # Greedy decoding for repeatable clip selection.
                     temperature=0,
                     extra_body={
@@ -264,6 +266,101 @@ class OpenRouterProvider(VLMProvider):
         )
         log.info(
             "openrouter video analyse complete: model=%s clips=%d elapsed=%.2fs cost=%s",
+            self.model,
+            len(plan.clips),
+            elapsed,
+            cost,
+        )
+        return plan
+
+    async def supports_audio(self) -> bool:
+        """True if the configured model declares audio input on OpenRouter.
+
+        Best-effort: a catalogue-fetch failure resolves to ``False`` so the
+        pipeline falls back to a non-audio path rather than erroring.
+        """
+        try:
+            return await model_supports_audio(self.model)
+        except VLMError:
+            return False
+
+    async def analyze_audio_clip(
+        self,
+        clip_path: Path,
+        hints: AnalysisHints,
+        *,
+        video_id: str,
+        clip_duration_sec: float,
+        timeout_sec: int = 300,
+    ) -> ClipPlan:
+        """Analyse an (extracted) audio clip via the model's audio modality.
+
+        Sends the clip as an ``input_audio`` block (raw base64 + ``format``,
+        NOT a data URL — that is the shape OpenRouter->Gemini accepts, verified
+        2026-05-30). Unlike video, no Vertex pin is needed: audio works on the
+        normal route. ``usage.include`` surfaces the real billed cost. The
+        returned ``ClipPlan`` carries timestamps RELATIVE to the clip; the batch
+        engine re-bases them. Raises ``VLMError`` on failure.
+        """
+        if not clip_path.is_file():
+            raise VLMError(f"audio clip not found: {clip_path}")
+
+        system_prompt = build_audio_system_prompt(hints)
+        user_prompt = build_audio_user_prompt(
+            video_id=video_id,
+            duration_sec=clip_duration_sec,
+            hints=hints,
+        )
+        content: list[dict[str, Any]] = [
+            {"type": "text", "text": user_prompt},
+            {
+                "type": "input_audio",
+                "input_audio": {"data": _encode_audio_base64(clip_path), "format": "mp3"},
+            },
+        ]
+        messages = cast(  # type: ignore[redundant-cast, unused-ignore]
+            list[ChatCompletionMessageParam],
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": content},
+            ],
+        )
+        start = time.monotonic()
+        try:
+            completion = await asyncio.wait_for(
+                self._client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    response_format={"type": "json_object"},
+                    max_tokens=16384,
+                    # Greedy decoding for repeatable clip selection.
+                    temperature=0,
+                    # ask OpenRouter for the real billed cost (no backend pin
+                    # needed for audio, unlike the base64-video path).
+                    extra_body={"usage": {"include": True}},
+                ),
+                timeout=timeout_sec,
+            )
+        except TimeoutError as exc:
+            raise VLMError(f"openrouter audio request timed out after {timeout_sec}s") from exc
+        except APIError as exc:
+            raise VLMError(f"openrouter audio API call failed: {exc}") from exc
+
+        elapsed = time.monotonic() - start
+        raw = (completion.choices[0].message.content or "").strip()
+        if not raw:
+            raise VLMError("openrouter returned an empty response body")
+
+        cost = _usage_cost(completion)
+        plan = _parse_response(
+            raw,
+            provider=self.name,
+            model=self.model,
+            elapsed_sec=elapsed,
+            cost_usd=cost,
+        )
+        log.info(
+            "openrouter audio analyse complete: model=%s clips=%d elapsed=%.2fs cost=%s",
             self.model,
             len(plan.clips),
             elapsed,
@@ -404,6 +501,16 @@ def _encode_video_to_data_url(path: Path) -> str:
         encoded = base64.b64encode(f.read()).decode("ascii")
     suffix = path.suffix.lower().lstrip(".") or "mp4"
     return f"data:video/{suffix};base64,{encoded}"
+
+
+def _encode_audio_base64(path: Path) -> str:
+    """Read an audio file and return RAW base64 (no data-URL wrapper).
+
+    The ``input_audio`` block carries the base64 in ``data`` with a separate
+    ``format`` field, unlike the video/image blocks which use a ``data:`` URL.
+    """
+    with path.open("rb") as f:
+        return base64.b64encode(f.read()).decode("ascii")
 
 
 def _usage_cost(completion: Any) -> float | None:

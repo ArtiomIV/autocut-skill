@@ -25,6 +25,7 @@ import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import timedelta
 from enum import Enum
 from pathlib import Path
 
@@ -50,7 +51,8 @@ from autocut.video import (
     probe_video,
 )
 from autocut.video.compress import compress_for_vlm
-from autocut.video_analysis import analyze_video
+from autocut.video.refine import refine_start_to_impact
+from autocut.video_analysis import analyze_audio, analyze_video
 from autocut.vlm import CostEstimate, VLMError, VLMProvider
 from autocut.vlm.base import HostAgentPauseRequested
 
@@ -88,22 +90,48 @@ class Route(Enum):
 
     keyframe = "keyframe"  # stills path — host pause/resume OR openrouter images
     openrouter_video = "openrouter_video"  # L2 autonomous batch loop (base64 video)
+    openrouter_audio = "openrouter_audio"  # L2 autonomous batch loop (audio, talk)
     host_video = "host_video"  # single-pass compressed MP4 via host pause/resume
 
 
-def _select_route(provider_name: str, *, supports_video: bool) -> Route:
-    """Pick the analysis route from provider capability + identity.
+# Content types whose signal is the spoken word — routed to audio when the model
+# can hear and the transport is cloud (the host cannot listen to audio yet).
+_TALK_HINTS: frozenset[ContentHint] = frozenset({ContentHint.talk, ContentHint.podcast})
 
-    Pure and side-effect free so it can be unit-tested without a live
-    provider. ``supports_video`` is the already-resolved capability
-    (``await provider.supports_video()``): OpenRouter discovers it from its
-    model catalogue, the host declares it via ``--host-video``.
+# Two-stage impact-snap boundary refine (autocut.video.refine). DISABLED
+# 2026-05-30: the v1 heuristic (biggest peak + walk-back) snaps imperfectly and,
+# on short clips that the model already placed well, it nudges good boundaries
+# without a measurable gain — so it muddies the runs. Re-enable once the v2 tuning
+# lands (burst-start + silence guard, audio as co-driver) AND the manifest records
+# the pre-refine start so the move is auditable.
+_REFINE_BOUNDARIES_ENABLED: bool = False
+
+
+def _select_route(
+    provider_name: str,
+    content_hint: ContentHint,
+    *,
+    supports_video: bool,
+    supports_audio: bool,
+) -> Route:
+    """Pick the analysis route from provider capability + content type.
+
+    Pure and side-effect free so it can be unit-tested without a live provider.
+    Capabilities are the already-resolved booleans (``await
+    provider.supports_video()`` / ``supports_audio()``). The host transport
+    cannot hear audio (no local transcription yet), so audio is cloud-only;
+    talk/podcast content with an audio-capable cloud model takes the audio
+    route, everything visual takes video, and anything without direct support
+    falls back to keyframes.
     """
-    if not supports_video:
-        return Route.keyframe
     if provider_name == "host":
-        return Route.host_video
-    return Route.openrouter_video
+        # Host has no audio path yet (cannot listen); video or stills only.
+        return Route.host_video if supports_video else Route.keyframe
+    if content_hint in _TALK_HINTS and supports_audio:
+        return Route.openrouter_audio
+    if supports_video:
+        return Route.openrouter_video
+    return Route.keyframe
 
 
 class CostCapExceeded(VLMError):  # noqa: N818
@@ -182,12 +210,22 @@ async def run_analysis(
     )
 
     # Capability gate: pick the payload x transport route once, then dispatch to
-    # a thin runner. Video-capable providers skip keyframe sampling entirely —
-    # openrouter via the L2 autonomous batch loop, the host via a single-pass
-    # compressed-MP4 pause/resume. Everything else takes the keyframe path below.
-    route = _select_route(provider.name, supports_video=await provider.supports_video())
+    # a thin runner. Video/audio-capable providers skip keyframe sampling —
+    # openrouter via the L2 autonomous batch loop (video, or audio for talk), the
+    # host via a single-pass compressed-MP4 pause/resume. Everything else takes
+    # the keyframe path below. ``supports_audio`` is only queried for talk
+    # content (a network call) so non-talk runs don't pay for it.
+    supports_video = await provider.supports_video()
+    is_talk = effective_hints.content_hint in _TALK_HINTS
+    supports_audio = bool(is_talk and await provider.supports_audio())
+    route = _select_route(
+        provider.name,
+        effective_hints.content_hint,
+        supports_video=supports_video,
+        supports_audio=supports_audio,
+    )
     if route is Route.openrouter_video:
-        return await _run_video_analysis(
+        return await _run_media_analysis(
             video,
             provider,
             metadata=metadata,
@@ -198,6 +236,21 @@ async def run_analysis(
             accurate_cuts=accurate_cuts,
             write_outputs=write_outputs,
             confirm_cost=confirm_cost,
+            kind="video",
+        )
+    if route is Route.openrouter_audio:
+        return await _run_media_analysis(
+            video,
+            provider,
+            metadata=metadata,
+            effective_hints=effective_hints,
+            profile=profile,
+            config=config,
+            root=root,
+            accurate_cuts=accurate_cuts,
+            write_outputs=write_outputs,
+            confirm_cost=confirm_cost,
+            kind="audio",
         )
     if route is Route.host_video:
         return await _run_host_video_analysis(
@@ -334,7 +387,7 @@ async def run_analysis(
     return result
 
 
-async def _run_video_analysis(
+async def _run_media_analysis(
     video: Path,
     provider: VLMProvider,
     *,
@@ -346,12 +399,16 @@ async def _run_video_analysis(
     accurate_cuts: bool,
     write_outputs: bool,
     confirm_cost: ConfirmHook | None,
+    kind: str,
 ) -> AnalysisResult:
-    """Video-input path: compress + autonomous batch loop via the L2 engine.
+    """Direct-payload path (openrouter): prepare + autonomous batch loop via L2.
 
-    No keyframe sampling and no pause/resume — the provider ingests the video
-    directly, so the run completes in one call. Reuses ``complete_from_plan``
-    for ranking + output dispatch (with zero scenes/keyframes).
+    ``kind`` selects the payload: ``"video"`` compresses the clip and calls
+    ``analyze_video``; ``"audio"`` extracts a mono MP3 and calls
+    ``analyze_audio`` (talk content). No keyframe sampling and no pause/resume —
+    the provider ingests the media directly, so the run completes in one call.
+    Reuses ``complete_from_plan`` for ranking + output dispatch (with zero
+    scenes/keyframes), cutting the highlights from the ORIGINAL video either way.
     """
 
     def _confirm(estimated_usd: float, cap_usd: float) -> bool:
@@ -369,24 +426,42 @@ async def _run_video_analysis(
 
     video_id = video.stem or "video"
     log.info(
-        "pipeline: video path via provider=%s model=%s",
+        "pipeline: %s path via provider=%s model=%s",
+        kind,
         provider.name,
         getattr(provider, "model", "?"),
     )
-    plan = await analyze_video(
-        video,
-        effective_hints,
-        provider,
-        video_id=video_id,
-        duration_sec=metadata.duration_sec,
-        cost_cap_usd=config.security.cost_cap_usd,
-        confirm_cost=_confirm,
-    )
+    # Branch explicitly (not a ternary on the function) so each call type-checks
+    # against its own provider protocol — analyze_audio/analyze_video take
+    # structurally different providers.
+    if kind == "audio":
+        plan = await analyze_audio(
+            video,
+            effective_hints,
+            provider,
+            video_id=video_id,
+            duration_sec=metadata.duration_sec,
+            cost_cap_usd=config.security.cost_cap_usd,
+            confirm_cost=_confirm,
+        )
+    else:
+        plan = await analyze_video(
+            video,
+            effective_hints,
+            provider,
+            video_id=video_id,
+            duration_sec=metadata.duration_sec,
+            cost_cap_usd=config.security.cost_cap_usd,
+            confirm_cost=_confirm,
+        )
     log.info(
-        "pipeline: video analysis returned %d clip(s), real cost %s USD",
+        "pipeline: %s analysis returned %d clip(s), real cost %s USD",
+        kind,
         len(plan.clips),
         plan.metadata.cost_usd,
     )
+    if _REFINE_BOUNDARIES_ENABLED and _should_refine_boundaries(kind, profile):
+        plan = _refine_action_boundaries(plan, video=video, duration_sec=metadata.duration_sec)
     result = complete_from_plan(
         plan,
         video=video,
@@ -395,7 +470,7 @@ async def _run_video_analysis(
         output_root=root,
         n_scenes=0,
         n_keyframes=0,
-        sampling_strategy="video",
+        sampling_strategy=kind,
         accurate_cuts=accurate_cuts,
         write_outputs=write_outputs,
         # real billed cost from usage.include (summed across batches), not an estimate
@@ -405,6 +480,47 @@ async def _run_video_analysis(
     )
     _clear_resume_state(root)
     return result
+
+
+def _should_refine_boundaries(kind: str, profile: ContentProfile) -> bool:
+    """Refine clip starts only for the sport/action profile on the video route.
+
+    Sport moments are physical impacts (a punch, a knockdown) whose precise
+    instant the ~1fps video model misses. The refiner is self-gating, so even
+    here a non-impact clip (a ring entrance) is left untouched — but we only
+    *attempt* it for sport, where impacts are expected. Talk/audio has no impact
+    signal (word-boundary refine via Whisper is a separate, future path).
+    """
+    return kind == "video" and profile.name == "sport"
+
+
+def _refine_action_boundaries(plan: ClipPlan, *, video: Path, duration_sec: float) -> ClipPlan:
+    """Return ``plan`` with each clip's START snapped to the real impact instant.
+
+    Best-effort and self-gating: a clip whose window has no dominant impact
+    spike is returned unchanged. Only the ``start`` moves (always earlier);
+    ``end`` and every other field are preserved.
+    """
+    refined = []
+    moved = 0
+    for clip in plan.clips:
+        result = refine_start_to_impact(
+            video,
+            clip.start.total_seconds(),
+            clip.end.total_seconds(),
+            duration_sec,
+        )
+        if result.moved:
+            moved += 1
+            refined.append(
+                clip.model_copy(update={"start": timedelta(seconds=result.refined_start_sec)})
+            )
+        else:
+            refined.append(clip)
+    log.info(
+        "pipeline: boundary refine snapped %d/%d clip start(s) to impact", moved, len(plan.clips)
+    )
+    return plan.model_copy(update={"clips": refined})
 
 
 async def _run_host_video_analysis(

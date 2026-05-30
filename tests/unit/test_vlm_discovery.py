@@ -10,6 +10,7 @@ from autocut.vlm import VLMError
 from autocut.vlm.discovery import (
     OPENROUTER_MODELS_URL,
     list_openrouter_models,
+    validate_openrouter_model,
 )
 
 
@@ -20,33 +21,44 @@ def _models_payload() -> dict[str, object]:
                 "id": "google/gemini-2.5-flash",
                 "name": "Gemini 2.5 Flash",
                 "context_length": 1_000_000,
-                "architecture": {"modality": "text+image->text"},
+                # audio + video -> usable by AutoCut
+                "architecture": {"input_modalities": ["text", "image", "audio", "video"]},
                 "pricing": {"prompt": "0.000000075", "completion": "0.0000003"},
             },
             {
                 "id": "openai/gpt-4o",
                 "name": "GPT-4o",
                 "context_length": 128000,
+                # image only -> filtered out (no audio, no video)
                 "architecture": {"input_modalities": ["text", "image"]},
                 "pricing": {"prompt": "0.0000025", "completion": "0.00001"},
             },
             {
-                "id": "text-only-model",
-                "context_length": 8000,
-                "architecture": {"modality": "text->text"},
+                "id": "video-only-model",
+                "context_length": 64000,
+                # video but no audio -> filtered out
+                "architecture": {"input_modalities": ["text", "image", "video"]},
+                "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+            },
+            {
+                "id": "audio-only-model",
+                "context_length": 64000,
+                # audio but no video -> filtered out
+                "architecture": {"input_modalities": ["text", "audio"]},
                 "pricing": {"prompt": "0.000001", "completion": "0.000002"},
             },
             {
                 "id": "missing-pricing",
                 "context_length": 32000,
-                "architecture": {"modality": "text+image->text"},
+                # audio + video, no pricing -> usable, sorts last
+                "architecture": {"modality": "text+image+audio+video->text"},
             },
         ]
     }
 
 
 @pytest.mark.asyncio
-async def test_filters_vision_capable_models() -> None:
+async def test_filters_to_audio_and_video_models() -> None:
     with respx.mock() as router:
         router.get(OPENROUTER_MODELS_URL).mock(
             return_value=httpx.Response(200, json=_models_payload())
@@ -54,9 +66,11 @@ async def test_filters_vision_capable_models() -> None:
         models = await list_openrouter_models()
     ids = [m.id for m in models]
     assert "google/gemini-2.5-flash" in ids
-    assert "openai/gpt-4o" in ids
-    assert "missing-pricing" in ids
-    assert "text-only-model" not in ids  # text-only filtered out
+    assert "missing-pricing" in ids  # audio+video via legacy modality string
+    # Anything missing audio OR video is filtered out.
+    assert "openai/gpt-4o" not in ids  # image only
+    assert "video-only-model" not in ids  # no audio
+    assert "audio-only-model" not in ids  # no video
 
 
 @pytest.mark.asyncio
@@ -68,7 +82,7 @@ async def test_normalises_pricing_to_per_million_tokens() -> None:
         models = await list_openrouter_models()
     by_id = {m.id: m for m in models}
     assert by_id["google/gemini-2.5-flash"].usd_per_1m_input == pytest.approx(0.075)
-    assert by_id["openai/gpt-4o"].usd_per_1m_input == pytest.approx(2.5)
+    assert by_id["google/gemini-2.5-flash"].usd_per_1m_output == pytest.approx(0.3)
 
 
 @pytest.mark.asyncio
@@ -96,6 +110,36 @@ async def test_passes_authorization_header_when_key_present() -> None:
         router.get(OPENROUTER_MODELS_URL).mock(side_effect=_capture)
         await list_openrouter_models(api_key="sk-or-secret-key-1234567890")
     assert seen_headers.get("authorization", "").startswith("Bearer ")
+
+
+@pytest.mark.asyncio
+async def test_validate_model_passes_for_audio_video_model() -> None:
+    with respx.mock() as router:
+        router.get(OPENROUTER_MODELS_URL).mock(
+            return_value=httpx.Response(200, json=_models_payload())
+        )
+        # Should not raise: gemini-2.5-flash declares both audio and video.
+        await validate_openrouter_model("google/gemini-2.5-flash")
+
+
+@pytest.mark.asyncio
+async def test_validate_model_rejects_video_only_model() -> None:
+    with respx.mock() as router:
+        router.get(OPENROUTER_MODELS_URL).mock(
+            return_value=httpx.Response(200, json=_models_payload())
+        )
+        with pytest.raises(VLMError, match="does not declare audio"):
+            await validate_openrouter_model("video-only-model")
+
+
+@pytest.mark.asyncio
+async def test_validate_model_rejects_unknown_model() -> None:
+    with respx.mock() as router:
+        router.get(OPENROUTER_MODELS_URL).mock(
+            return_value=httpx.Response(200, json=_models_payload())
+        )
+        with pytest.raises(VLMError, match="not in the OpenRouter catalogue"):
+            await validate_openrouter_model("no/such-model")
 
 
 @pytest.mark.asyncio

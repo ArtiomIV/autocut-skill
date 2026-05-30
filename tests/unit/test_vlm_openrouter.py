@@ -146,6 +146,63 @@ async def test_analyze_video_clip_missing_file_raises(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_analyze_audio_clip_happy_path(tmp_path: Path) -> None:
+    clip = tmp_path / "clip.mp3"
+    clip.write_bytes(b"ID3\x04\x00fake-mp3-bytes")
+    captured: dict[str, object] = {}
+
+    def _capture(request: httpx.Request) -> httpx.Response:
+        captured["body"] = request.content.decode("utf-8", "replace")
+        return httpx.Response(200, json=_chat_completion_payload(_valid_clipplan_json()))
+
+    with respx.mock(base_url="https://openrouter.ai/api/v1", assert_all_called=True) as router:
+        router.post("/chat/completions").mock(side_effect=_capture)
+        provider = OpenRouterProvider(api_key="sk-or-test", model="google/gemini-2.5-flash")
+        plan = await provider.analyze_audio_clip(
+            clip,
+            AnalysisHints(),
+            video_id="video_001",
+            clip_duration_sec=120.0,
+        )
+    assert len(plan.clips) == 1
+    assert plan.metadata.vlm_model == "google/gemini-2.5-flash"
+    assert plan.metadata.vlm_provider == "openrouter"
+    # The request must carry an input_audio block with format mp3 (the verified
+    # OpenRouter->Gemini shape), NOT an image/video block.
+    body = str(captured["body"])
+    assert "input_audio" in body
+    assert '"format"' in body and "mp3" in body
+
+
+@pytest.mark.asyncio
+async def test_analyze_audio_clip_missing_file_raises(tmp_path: Path) -> None:
+    provider = OpenRouterProvider(api_key="sk-or-test", model="x")
+    with pytest.raises(VLMError, match="audio clip not found"):
+        await provider.analyze_audio_clip(
+            tmp_path / "nope.mp3",
+            AnalysisHints(),
+            video_id="v",
+            clip_duration_sec=10.0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_supports_audio_true_when_model_declares_it() -> None:
+    payload = {
+        "data": [
+            {
+                "id": "google/gemini-2.5-flash",
+                "architecture": {"input_modalities": ["text", "image", "audio", "video"]},
+            }
+        ]
+    }
+    with respx.mock(base_url="https://openrouter.ai/api/v1", assert_all_called=True) as router:
+        router.get("/models").mock(return_value=httpx.Response(200, json=payload))
+        provider = OpenRouterProvider(api_key="sk-or-test", model="google/gemini-2.5-flash")
+        assert await provider.supports_audio() is True
+
+
+@pytest.mark.asyncio
 async def test_supports_video_true_when_model_declares_it() -> None:
     payload = {
         "data": [
