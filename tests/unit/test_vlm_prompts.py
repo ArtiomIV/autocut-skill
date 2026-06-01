@@ -8,6 +8,7 @@ from datetime import timedelta
 from autocut.models import AnalysisHints, ContentHint
 from autocut.video.frame_sampler import FrameSpec
 from autocut.vlm.prompts import (
+    build_audio_system_prompt,
     build_system_prompt,
     build_user_prompt,
     clip_plan_schema,
@@ -52,7 +53,7 @@ def test_user_prompt_lists_every_keyframe_timestamp() -> None:
     text = build_user_prompt(
         video_id="match_001",
         duration_sec=60.0,
-        hints=AnalysisHints(content_hint=ContentHint.boxing),
+        hints=AnalysisHints(content_hint=ContentHint.highlights),
         specs=specs,
     )
     assert "frame 1" in text
@@ -62,7 +63,7 @@ def test_user_prompt_lists_every_keyframe_timestamp() -> None:
     assert "frame 3" in text
     assert "00:00:12.000" in text
     assert "match_001" in text
-    assert "boxing" in text
+    assert "highlights" in text
 
 
 def test_format_timestamp_matches_extractor_format() -> None:
@@ -76,13 +77,14 @@ def test_format_timestamp_matches_extractor_format() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_system_prompt_sport_template_includes_multi_frame_rule() -> None:
-    hints = AnalysisHints(prompt_template="sport")
+def test_system_prompt_highlights_template_includes_confirmation_rule() -> None:
+    hints = AnalysisHints(prompt_template="highlights")
     text = build_system_prompt(hints)
-    # The boxing-feedback rule must be present so the VLM is conservative.
+    # The conservative-scoring rule must be present so the VLM does not
+    # over-score a single ambiguous frame.
     lowered = text.lower()
-    assert "multi" in lowered or "consecutive" in lowered
-    assert "sport" in lowered or "combat" in lowered or "action" in lowered
+    assert "confirm" in lowered or "ambiguous" in lowered
+    assert "highlight" in lowered or "viral" in lowered or "action" in lowered
 
 
 def test_system_prompt_talk_template_targets_verbal_content() -> None:
@@ -108,3 +110,49 @@ def test_system_prompt_falls_back_to_hybrid_for_unknown_template() -> None:
     # Should produce SOME prompt with shared core rules.
     assert "highlight" in text
     assert "json" in text
+
+
+# ---------------------------------------------------------------------------
+# v4: two-pass (coarse) + query prompt selection
+# ---------------------------------------------------------------------------
+
+
+def test_coarse_template_optimises_for_recall() -> None:
+    hints = AnalysisHints(prompt_template="coarse")
+    text = build_system_prompt(hints).lower()
+    assert "coarse" in text
+    assert "recall" in text
+    # No query target block when no query is set.
+    assert "user request" not in text
+    assert "target" not in text
+
+
+def test_coarse_with_query_appends_target() -> None:
+    hints = AnalysisHints(prompt_template="coarse", query="the knockdown in round 3")
+    text = build_system_prompt(hints)
+    assert "recall" in text.lower()
+    assert "the knockdown in round 3" in text
+    assert "TARGET" in text
+
+
+def test_query_overrides_fine_mode() -> None:
+    # A query takes precedence over the per-mode fine guidance: even with the
+    # highlights template, a query produces the USER REQUEST prompt (not auto-best).
+    hints = AnalysisHints(prompt_template="highlights", query="when she admits the mistake")
+    text = build_system_prompt(hints)
+    assert "USER REQUEST" in text
+    assert "when she admits the mistake" in text
+    assert "NOT to pick the" in text  # the "not auto-highlights" instruction
+
+
+def test_audio_coarse_and_query_selection() -> None:
+    coarse = build_audio_system_prompt(AnalysisHints(prompt_template="coarse")).lower()
+    assert "recall" in coarse
+    assert "audio track" in coarse
+
+    q = build_audio_system_prompt(AnalysisHints(query="when they mention prices"))
+    assert "USER REQUEST" in q
+    assert "when they mention prices" in q
+
+    default = build_audio_system_prompt(AnalysisHints()).lower()
+    assert "viral" in default or "scroll" in default

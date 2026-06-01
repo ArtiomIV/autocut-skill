@@ -94,7 +94,7 @@ class _StubProvider(VLMProvider):
             video_clip_paths,
         )
         return DetectionResult(
-            content_hint=ContentHint.other,
+            content_hint=ContentHint.hybrid,
             confidence=0.0,
             reasoning="stub provider — cost-cap test fixture",
         )
@@ -148,18 +148,8 @@ def _stub_video_stack(monkeypatch: pytest.MonkeyPatch) -> None:
         "autocut.pipeline.extract_keyframes",
         lambda video, specs, out_dir, long_edge_px: fake_keyframes,
     )
-
-    # Phase E: bypass auto-detect entirely so cost-cap tests stay focused on
-    # the cost gate. Return a low-confidence ``other`` so the pipeline falls
-    # back to HYBRID without running ffmpeg on a fake path.
-    async def _stub_auto_detect(*_args: object, **_kwargs: object) -> DetectionResult:
-        return DetectionResult(
-            content_hint=ContentHint.other,
-            confidence=0.0,
-            reasoning="cost-cap test fixture bypassing detection",
-        )
-
-    monkeypatch.setattr("autocut.pipeline._run_auto_detect", _stub_auto_detect)
+    # ``run`` no longer auto-detects: an unset mode defaults to HYBRID, so the
+    # cost-cap tests reach the cost gate without any detection stubbing.
 
 
 # ---------------------------------------------------------------------------

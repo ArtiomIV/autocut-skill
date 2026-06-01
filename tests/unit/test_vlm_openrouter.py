@@ -12,7 +12,53 @@ import respx
 
 from autocut.models import AnalysisHints, ContentHint, Keyframe
 from autocut.vlm import VLMError
-from autocut.vlm.openrouter import OpenRouterProvider, _extract_json
+from autocut.vlm.openrouter import OpenRouterProvider, _extract_json, _parse_response
+
+
+def _clip_json(cid: str, start: str, end: str, *, tags: object = None) -> dict[str, object]:
+    clip: dict[str, object] = {
+        "id": cid,
+        "start": start,
+        "end": end,
+        "category": "highlight",
+        "description": "d",
+        "score": 8,
+        "rationale": "r",
+    }
+    if tags is not None:
+        clip["tags"] = tags
+    return clip
+
+
+def test_parse_response_drops_malformed_clip_keeps_valid() -> None:
+    # One good clip + one with end <= start (invalid). The bad clip is dropped,
+    # the run survives with the good one — a single malformed clip must not sink
+    # the whole (paid) batch.
+    payload = {
+        "video_id": "v",
+        "duration_sec": 60.0,
+        "clips": [
+            _clip_json("good", "00:00:05.000", "00:00:10.000"),
+            _clip_json("bad", "00:00:20.000", "00:00:18.000"),  # end < start
+        ],
+        "metadata": {},
+    }
+    plan = _parse_response(json.dumps(payload), provider="openrouter", model="m", elapsed_sec=1.0)
+    assert [c.id for c in plan.clips] == ["good"]
+
+
+def test_parse_response_coerces_null_tags() -> None:
+    # A clip with ``tags: null`` must not fail validation (the model emits this).
+    payload = {
+        "video_id": "v",
+        "duration_sec": 60.0,
+        "clips": [_clip_json("c", "00:00:05.000", "00:00:10.000", tags=None)],
+        "metadata": {},
+    }
+    # Force the null through (the helper drops None, so set it explicitly).
+    payload["clips"][0]["tags"] = None  # type: ignore[index]
+    plan = _parse_response(json.dumps(payload), provider="openrouter", model="m", elapsed_sec=1.0)
+    assert plan.clips[0].tags == []
 
 
 def _kf(idx: int, secs: float, path: Path) -> Keyframe:
@@ -109,7 +155,7 @@ async def test_analyze_happy_path(fake_keyframes: list[Keyframe]) -> None:
     assert len(plan.clips) == 1
     assert plan.clips[0].score == 9
     # Provider injects metadata even if the model omitted it.
-    assert plan.metadata.prompt_version == "v3"
+    assert plan.metadata.prompt_version == "v11"
 
 
 @pytest.mark.asyncio
@@ -255,31 +301,56 @@ async def test_analyze_wraps_invalid_json(fake_keyframes: list[Keyframe]) -> Non
 
 
 @pytest.mark.asyncio
-async def test_analyze_wraps_schema_violation(fake_keyframes: list[Keyframe]) -> None:
-    bad_json = json.dumps(
+async def test_analyze_drops_malformed_clip(fake_keyframes: list[Keyframe]) -> None:
+    # A clip missing a required field is DROPPED (not fatal): the run survives
+    # with the well-formed clips. One good clip + one missing ``rationale``.
+    json_body = json.dumps(
         {
             "video_id": "v",
-            "duration_sec": 10.0,
-            # Missing required ``rationale`` field on the clip -> schema violation.
+            "duration_sec": 30.0,
             "clips": [
                 {
-                    "id": "c1",
-                    "start": "00:00:00",
-                    "end": "00:00:05",
+                    "id": "good",
+                    "start": "00:00:01",
+                    "end": "00:00:06",
+                    "category": "highlight",
+                    "description": "d",
+                    "score": 8,
+                    "rationale": "r",
+                },
+                {
+                    "id": "bad",
+                    "start": "00:00:10",
+                    "end": "00:00:15",
                     "category": "highlight",
                     "description": "d",
                     "score": 5,
-                }
+                    # missing ``rationale`` -> this clip is dropped
+                },
             ],
             "metadata": {"vlm_provider": "openrouter", "vlm_model": "x"},
         }
     )
     with respx.mock(base_url="https://openrouter.ai/api/v1") as router:
         router.post("/chat/completions").mock(
-            return_value=httpx.Response(200, json=_chat_completion_payload(bad_json))
+            return_value=httpx.Response(200, json=_chat_completion_payload(json_body))
         )
         provider = OpenRouterProvider(api_key="sk-or-test", model="x")
-        with pytest.raises(VLMError, match="ClipPlan validation"):
+        plan = await provider.analyze(
+            fake_keyframes, AnalysisHints(), video_id="v", duration_sec=30.0
+        )
+    assert [c.id for c in plan.clips] == ["good"]
+
+
+@pytest.mark.asyncio
+async def test_analyze_wraps_non_object_response(fake_keyframes: list[Keyframe]) -> None:
+    # A genuinely broken response (top-level not an object) still raises VLMError.
+    with respx.mock(base_url="https://openrouter.ai/api/v1") as router:
+        router.post("/chat/completions").mock(
+            return_value=httpx.Response(200, json=_chat_completion_payload("[1, 2, 3]"))
+        )
+        provider = OpenRouterProvider(api_key="sk-or-test", model="x")
+        with pytest.raises(VLMError):
             await provider.analyze(
                 fake_keyframes,
                 AnalysisHints(),
@@ -304,14 +375,79 @@ async def test_analyze_wraps_empty_response(fake_keyframes: list[Keyframe]) -> N
             )
 
 
+@pytest.mark.asyncio
+async def test_analyze_retries_then_succeeds_on_bad_json(fake_keyframes: list[Keyframe]) -> None:
+    # First reply is unparseable, second is valid: the request is RE-ISSUED and
+    # the run succeeds — a malformed JSON must never crash the pipeline.
+    responses = [
+        httpx.Response(200, json=_chat_completion_payload("not json at all")),
+        httpx.Response(200, json=_chat_completion_payload(_valid_clipplan_json())),
+    ]
+    with respx.mock(base_url="https://openrouter.ai/api/v1") as router:
+        route = router.post("/chat/completions").mock(side_effect=responses)
+        provider = OpenRouterProvider(api_key="sk-or-test", model="x")
+        plan = await provider.analyze(
+            fake_keyframes, AnalysisHints(), video_id="v", duration_sec=10.0
+        )
+    assert len(plan.clips) == 1
+    assert route.call_count == 2  # one bad attempt, one good retry
+
+
+@pytest.mark.asyncio
+async def test_analyze_retries_on_transient_5xx(fake_keyframes: list[Keyframe]) -> None:
+    # A transient 503 is retried (with backoff); the second attempt succeeds.
+    responses = [
+        httpx.Response(503, text="upstream temporarily unavailable"),
+        httpx.Response(200, json=_chat_completion_payload(_valid_clipplan_json())),
+    ]
+    with respx.mock(base_url="https://openrouter.ai/api/v1") as router:
+        route = router.post("/chat/completions").mock(side_effect=responses)
+        provider = OpenRouterProvider(api_key="sk-or-test", model="x")
+        plan = await provider.analyze(
+            fake_keyframes, AnalysisHints(), video_id="v", duration_sec=10.0
+        )
+    assert len(plan.clips) == 1
+    assert route.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_analyze_does_not_retry_client_error(fake_keyframes: list[Keyframe]) -> None:
+    # A permanent 400 (bad request) is NOT retried — re-issuing the same request
+    # cannot help, so it raises at once after a single call.
+    with respx.mock(base_url="https://openrouter.ai/api/v1") as router:
+        route = router.post("/chat/completions").mock(
+            return_value=httpx.Response(400, text="bad request")
+        )
+        provider = OpenRouterProvider(api_key="sk-or-test", model="x")
+        with pytest.raises(VLMError, match="API call failed"):
+            await provider.analyze(fake_keyframes, AnalysisHints(), video_id="v", duration_sec=10.0)
+        assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_analyze_raises_after_exhausting_retries(fake_keyframes: list[Keyframe]) -> None:
+    # Every attempt returns junk: after _MAX_REQUEST_ATTEMPTS the last error is
+    # surfaced (it carries the diagnostic), and the call count is bounded.
+    from autocut.vlm.openrouter import _MAX_REQUEST_ATTEMPTS
+
+    with respx.mock(base_url="https://openrouter.ai/api/v1") as router:
+        route = router.post("/chat/completions").mock(
+            return_value=httpx.Response(200, json=_chat_completion_payload("still not json"))
+        )
+        provider = OpenRouterProvider(api_key="sk-or-test", model="x")
+        with pytest.raises(VLMError, match="not valid JSON"):
+            await provider.analyze(fake_keyframes, AnalysisHints(), video_id="v", duration_sec=10.0)
+        assert route.call_count == _MAX_REQUEST_ATTEMPTS
+
+
 def test_extract_json_passes_clean_object_through() -> None:
-    clean = '{"content_hint": "boxing", "confidence": 1.0}'
+    clean = '{"content_hint": "highlights", "confidence": 1.0}'
     assert _extract_json(clean) == clean
 
 
 def test_extract_json_strips_markdown_fence() -> None:
-    fenced = '```json\n{"content_hint": "boxing", "confidence": 1.0}\n```'
-    assert json.loads(_extract_json(fenced)) == {"content_hint": "boxing", "confidence": 1.0}
+    fenced = '```json\n{"content_hint": "highlights", "confidence": 1.0}\n```'
+    assert json.loads(_extract_json(fenced)) == {"content_hint": "highlights", "confidence": 1.0}
 
 
 def test_extract_json_isolates_object_from_prose() -> None:
@@ -323,7 +459,8 @@ def test_extract_json_isolates_object_from_prose() -> None:
 async def test_detect_content_parses_fenced_response(fake_keyframes: list[Keyframe]) -> None:
     # A model that wraps its JSON in a markdown fence must still be parsed.
     fenced = (
-        '```json\n{"content_hint": "boxing", "confidence": 0.95, "reasoning": "ring + gloves"}\n```'
+        '```json\n{"content_hint": "highlights", "confidence": 0.95,'
+        ' "reasoning": "ring + gloves"}\n```'
     )
     with respx.mock(base_url="https://openrouter.ai/api/v1", assert_all_called=True) as router:
         router.post("/chat/completions").mock(
@@ -336,7 +473,7 @@ async def test_detect_content_parses_fenced_response(fake_keyframes: list[Keyfra
             video_id="v",
             duration_sec=24.0,
         )
-    assert result.content_hint == ContentHint.boxing
+    assert result.content_hint == ContentHint.highlights
     assert result.confidence == 0.95
 
 

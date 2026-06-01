@@ -20,11 +20,13 @@ from pathlib import Path
 import pytest
 
 from autocut.config import AutoCutConfig
+from autocut.content import HIGHLIGHTS_PROFILE
 from autocut.models import (
     Category,
     Clip,
     ClipPlan,
     ClipPlanMetadata,
+    ContentHint,
     VideoMetadata,
 )
 from autocut.pipeline import (
@@ -95,6 +97,7 @@ def test_write_resume_state_serialises_every_field(tmp_path: Path) -> None:
         sampling_strategy="hybrid",
         accurate_cuts=True,
         write_outputs=True,
+        content_hint=ContentHint.highlights,
     )
     assert path == tmp_path / RESUME_STATE_FILENAME
     raw = json.loads(path.read_text(encoding="utf-8"))
@@ -106,6 +109,7 @@ def test_write_resume_state_serialises_every_field(tmp_path: Path) -> None:
     assert raw["write_outputs"] is True
     assert raw["n_scenes"] == 1
     assert raw["n_keyframes"] == 11
+    assert raw["content_hint"] == "highlights"
 
 
 def test_load_resume_state_round_trips(tmp_path: Path) -> None:
@@ -118,11 +122,13 @@ def test_load_resume_state_round_trips(tmp_path: Path) -> None:
         sampling_strategy="uniform",
         accurate_cuts=False,
         write_outputs=False,
+        content_hint=ContentHint.talk,
     )
     loaded = load_resume_state(tmp_path)
     assert loaded["sampling_strategy"] == "uniform"
     assert loaded["accurate_cuts"] is False
     assert loaded["n_keyframes"] == 8
+    assert loaded["content_hint"] == "talk"
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +198,7 @@ def test_complete_from_plan_drops_clips_below_min_score(tmp_path: Path) -> None:
             Clip(
                 id="weak",
                 start=timedelta(seconds=0),
-                end=timedelta(seconds=1),  # 1s -> heur 3, vlm 0 -> final 1
+                end=timedelta(seconds=1),  # 1s -> heur 2 (penalty), vlm 0 -> final 0
                 category=Category.filler,
                 description="weak",
                 score=0,
@@ -223,3 +229,111 @@ def test_complete_from_plan_drops_clips_below_min_score(tmp_path: Path) -> None:
         write_outputs=False,
     )
     assert [r.clip.id for r in result.ranked] == ["strong"]
+
+
+def _weak_mid_strong_plan() -> ClipPlan:
+    """A plan spanning the highlights keep boundary: weak/mid/strong clips.
+
+    All clips last >3 s so the duration heuristic is neutral (5) and the nudge
+    is zero -> ``final == vlm``:
+    - weak  (vlm=5) -> final 5
+    - mid   (vlm=7) -> final 7  (a strong-impact moment)
+    - strong(vlm=9) -> final 9
+    """
+    return ClipPlan(
+        video_id="vid",
+        duration_sec=60.0,
+        clips=[
+            Clip(
+                id="weak",
+                start=timedelta(seconds=0),
+                end=timedelta(seconds=10),
+                category=Category.highlight,
+                description="weak",
+                score=5,
+                rationale="placeholder",
+            ),
+            Clip(
+                id="mid",
+                start=timedelta(seconds=20),
+                end=timedelta(seconds=30),
+                category=Category.highlight,
+                description="mid",
+                score=7,
+                rationale="placeholder",
+            ),
+            Clip(
+                id="strong",
+                start=timedelta(seconds=40),
+                end=timedelta(seconds=55),
+                category=Category.highlight,
+                description="strong",
+                score=9,
+                rationale="placeholder",
+            ),
+        ],
+        metadata=ClipPlanMetadata(vlm_provider="host", vlm_model="m"),
+    )
+
+
+def test_highlights_profile_keeps_threshold_at_7(tmp_path: Path) -> None:
+    # Default config (min_score=5) keeps all three clips (weak final=5 clears 5).
+    kwargs = {
+        "video": Path("/fake/video.mp4"),
+        "metadata": _metadata(),
+        "config": AutoCutConfig(),
+        "output_root": tmp_path,
+        "n_scenes": 1,
+        "n_keyframes": 4,
+        "sampling_strategy": "hybrid",
+        "accurate_cuts": False,
+        "write_outputs": False,
+    }
+    default_result = complete_from_plan(_weak_mid_strong_plan(), **kwargs)  # type: ignore[arg-type]
+    assert [r.clip.id for r in default_result.ranked] == ["strong", "mid", "weak"]
+
+    # The highlights profile (min_score=7) drops the weak clip but KEEPS the mid
+    # one (final=7) — the strong-impact moments the model rates 7 must survive.
+    highlights_result = complete_from_plan(
+        _weak_mid_strong_plan(),
+        profile=HIGHLIGHTS_PROFILE,
+        **kwargs,  # type: ignore[arg-type]
+    )
+    assert [r.clip.id for r in highlights_result.ranked] == ["strong", "mid"]
+
+
+def test_highlights_profile_allows_empty_output(tmp_path: Path) -> None:
+    # A plan whose only clip is weak (vlm=5 -> final=5, below the highlights
+    # threshold of 7) yields ZERO clips — an empty result is a valid, honest
+    # outcome rather than shipping a best-of-nothing.
+    plan = ClipPlan(
+        video_id="vid",
+        duration_sec=60.0,
+        clips=[
+            Clip(
+                id="weak",
+                start=timedelta(seconds=0),
+                end=timedelta(seconds=10),
+                category=Category.highlight,
+                description="weak",
+                score=5,
+                rationale="placeholder",
+            ),
+        ],
+        metadata=ClipPlanMetadata(vlm_provider="host", vlm_model="m"),
+    )
+    result = complete_from_plan(
+        plan,
+        video=Path("/fake/video.mp4"),
+        metadata=_metadata(),
+        config=AutoCutConfig(),
+        output_root=tmp_path,
+        n_scenes=1,
+        n_keyframes=4,
+        sampling_strategy="hybrid",
+        accurate_cuts=False,
+        write_outputs=True,
+        profile=HIGHLIGHTS_PROFILE,
+    )
+    assert result.ranked == []
+    assert result.dispatch is None  # nothing cleared the bar -> no files written

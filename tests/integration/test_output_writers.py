@@ -69,8 +69,9 @@ def test_separate_writer_produces_one_mp4_per_clip(medium_video: Path, tmp_path:
     for i, w in enumerate(written, start=1):
         assert w.path.is_file()
         assert w.path.parent.name == "separate"
-        # Filename must encode rank + final_score + slug.
-        assert w.path.name.startswith(f"clip_{i:03d}_s")
+        # Filename must LEAD with the final score, then rank + slug.
+        assert w.path.name.startswith("s")
+        assert f"_clip_{i:03d}_" in w.path.name
         assert w.path.suffix == ".mp4"
 
     # Durations: probe each output and confirm we got what we asked for.

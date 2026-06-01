@@ -30,12 +30,11 @@ from enum import Enum
 from pathlib import Path
 
 from autocut.config import AutoCutConfig
-from autocut.content import ContentProfile, detect_content_hint, profile_for
+from autocut.content import ContentProfile, profile_for
 from autocut.models import (
     AnalysisHints,
     ClipPlan,
     ContentHint,
-    DetectionResult,
     Keyframe,
     VideoMetadata,
 )
@@ -54,20 +53,11 @@ from autocut.video.compress import compress_for_vlm
 from autocut.video.refine import refine_start_to_impact
 from autocut.video_analysis import analyze_audio, analyze_video
 from autocut.vlm import CostEstimate, VLMError, VLMProvider
-from autocut.vlm.base import HostAgentPauseRequested
 
 log = logging.getLogger(__name__)
 
 DEFAULT_KEYFRAME_SUBDIR = "keyframes"
 RESUME_STATE_FILENAME = ".autocut_resume.json"
-# Phase E: separate state file so detection-phase resume and analysis-phase
-# resume don't collide. The CLI checks the detection file first.
-DETECTION_RESUME_STATE_FILENAME = ".autocut_detect_resume.json"
-
-# Detection confidence below this threshold falls back to HYBRID_PROFILE.
-# 0.5 is permissive: we trust the model's self-assessment except when it
-# explicitly signals uncertainty. Retunable after empirical runs.
-_AUTO_DETECT_CONFIDENCE_THRESHOLD: float = 0.5
 
 # A confirm hook: returns True to proceed, False to abort. The CLI passes
 # its interactive prompt; tests pass a constant.
@@ -96,7 +86,7 @@ class Route(Enum):
 
 # Content types whose signal is the spoken word — routed to audio when the model
 # can hear and the transport is cloud (the host cannot listen to audio yet).
-_TALK_HINTS: frozenset[ContentHint] = frozenset({ContentHint.talk, ContentHint.podcast})
+_TALK_HINTS: frozenset[ContentHint] = frozenset({ContentHint.talk})
 
 # Two-stage impact-snap boundary refine (autocut.video.refine). DISABLED
 # 2026-05-30: the v1 heuristic (biggest peak + walk-back) snaps imperfectly and,
@@ -167,8 +157,14 @@ async def run_analysis(
     write_outputs: bool = True,
     accurate_cuts: bool = False,
     confirm_cost: ConfirmHook | None = None,
+    two_pass: bool = False,
 ) -> AnalysisResult:
-    """Run the full pipeline. Returns a populated ``AnalysisResult``."""
+    """Run the full pipeline. Returns a populated ``AnalysisResult``.
+
+    ``two_pass`` enables the coarse→fine locate/analyse pipeline on the direct
+    openrouter media routes for long sources (a no-op on the host and keyframe
+    routes, which stay single-pass).
+    """
     video = Path(video_path)
     root = (output_root or config.output.base_dir).resolve()
     keyframe_dir = root / DEFAULT_KEYFRAME_SUBDIR
@@ -178,36 +174,32 @@ async def run_analysis(
     log.info("pipeline: probe %s", video)
     metadata = probe_video(video)
 
-    # Phase E: if the caller asked for auto-detect (or didn't pass a hint
-    # at all), run the detection pre-step before picking the profile.
+    # The orchestrating agent picks the editing MODE up front (from the user's
+    # request crossed with the kind of video) and passes it as ``content_hint``
+    # / ``query`` — so ``run`` itself does NO content detection. If the agent
+    # leaves the mode unset, default to HYBRID (the safe, general profile)
+    # rather than spend a VLM call guessing. Explicit auto-classification stays
+    # available as the standalone ``autocut detect`` subcommand.
     if effective_hints.content_hint == ContentHint.auto:
-        try:
-            detection = await _run_auto_detect(video, provider, metadata=metadata, output_root=root)
-        except HostAgentPauseRequested:
-            # Host-agent detection pause: persist enough state that the
-            # CLI can re-enter the pipeline after the agent fills in
-            # DETECTION_RESPONSE.json, then re-raise so the CLI prints
-            # the pause message and exits cleanly.
-            _write_detection_resume_state(
-                root,
-                video=video,
-                metadata=metadata,
-                initial_hints=effective_hints,
-                sampling_strategy=sampling_strategy,
-                accurate_cuts=accurate_cuts,
-                write_outputs=write_outputs,
-                # Carry the host video capability across the process boundary so
-                # the post-detection resume picks the host-video route, not keyframes.
-                host_supports_video=await provider.supports_video(),
-            )
-            raise
-        effective_hints = _apply_detection_to_hints(effective_hints, detection)
+        log.info("pipeline: no explicit mode supplied; defaulting to HYBRID")
+        effective_hints = effective_hints.model_copy(update={"content_hint": ContentHint.hybrid})
 
     profile = profile_for(effective_hints.content_hint)
     effective_hints = _apply_profile_to_hints(effective_hints, profile)
     effective_sampling_strategy = (
         sampling_strategy if sampling_strategy != "hybrid" else profile.sampling_strategy
     )
+
+    # A custom query hunts a SPECIFIC described moment, which may sit in a calm,
+    # low-motion stretch (e.g. "when the ring girl enters"). The motion sampler
+    # bakes in "interesting == high motion/sound" and would discard such a target
+    # before the model ever sees it. So when a query is present we drop the
+    # motion pre-filter and show the model the whole timeline (uniform-dense on
+    # the keyframe path); the query itself is the smart filter. Transport routing
+    # (video/audio/keyframe) is unchanged — it stays capability-driven.
+    if effective_hints.query and effective_sampling_strategy == "motion":
+        log.info("pipeline: query present — disabling motion pre-filter (uniform sampling)")
+        effective_sampling_strategy = "uniform"
 
     # Capability gate: pick the payload x transport route once, then dispatch to
     # a thin runner. Video/audio-capable providers skip keyframe sampling —
@@ -237,6 +229,7 @@ async def run_analysis(
             write_outputs=write_outputs,
             confirm_cost=confirm_cost,
             kind="video",
+            two_pass=two_pass,
         )
     if route is Route.openrouter_audio:
         return await _run_media_analysis(
@@ -251,6 +244,7 @@ async def run_analysis(
             write_outputs=write_outputs,
             confirm_cost=confirm_cost,
             kind="audio",
+            two_pass=two_pass,
         )
     if route is Route.host_video:
         return await _run_host_video_analysis(
@@ -351,6 +345,7 @@ async def run_analysis(
         sampling_strategy=sampling_strategy,
         accurate_cuts=accurate_cuts,
         write_outputs=write_outputs,
+        content_hint=effective_hints.content_hint,
     )
 
     video_id = video.stem or "video"
@@ -400,6 +395,7 @@ async def _run_media_analysis(
     write_outputs: bool,
     confirm_cost: ConfirmHook | None,
     kind: str,
+    two_pass: bool = False,
 ) -> AnalysisResult:
     """Direct-payload path (openrouter): prepare + autonomous batch loop via L2.
 
@@ -443,6 +439,7 @@ async def _run_media_analysis(
             duration_sec=metadata.duration_sec,
             cost_cap_usd=config.security.cost_cap_usd,
             confirm_cost=_confirm,
+            two_pass=two_pass,
         )
     else:
         plan = await analyze_video(
@@ -453,6 +450,7 @@ async def _run_media_analysis(
             duration_sec=metadata.duration_sec,
             cost_cap_usd=config.security.cost_cap_usd,
             confirm_cost=_confirm,
+            two_pass=two_pass,
         )
     log.info(
         "pipeline: %s analysis returned %d clip(s), real cost %s USD",
@@ -491,7 +489,7 @@ def _should_refine_boundaries(kind: str, profile: ContentProfile) -> bool:
     *attempt* it for sport, where impacts are expected. Talk/audio has no impact
     signal (word-boundary refine via Whisper is a separate, future path).
     """
-    return kind == "video" and profile.name == "sport"
+    return kind == "video" and profile.name == "highlights"
 
 
 def _refine_action_boundaries(plan: ClipPlan, *, video: Path, duration_sec: float) -> ClipPlan:
@@ -560,6 +558,7 @@ async def _run_host_video_analysis(
         sampling_strategy="video",
         accurate_cuts=accurate_cuts,
         write_outputs=write_outputs,
+        content_hint=effective_hints.content_hint,
     )
 
     video_id = video.stem or "video"
@@ -615,8 +614,15 @@ def complete_from_plan(
     written ``VLM_RESPONSE.json``. ``profile`` is forwarded to the dispatcher
     so per-content-type padding (currently 0 everywhere) reaches the cutter.
     """
-    ranked = rank_clips(plan, config.scoring)
-    log.info("pipeline: %d clip(s) survived ranking", len(ranked))
+    # A mode can raise the keep threshold above the global default (highlights
+    # uses 7). When it does, overlay it on the scoring config for this run so
+    # weak clips are dropped — an empty result is a valid, honest outcome.
+    scoring = config.scoring
+    if profile is not None and profile.min_score is not None:
+        scoring = scoring.model_copy(update={"min_score": profile.min_score})
+
+    ranked = rank_clips(plan, scoring)
+    log.info("pipeline: %d clip(s) survived ranking (min_score=%d)", len(ranked), scoring.min_score)
 
     pre_roll = profile.pre_roll_sec if profile else 0.0
     post_roll = profile.post_roll_sec if profile else 0.0
@@ -673,8 +679,15 @@ def _write_resume_state(
     sampling_strategy: str,
     accurate_cuts: bool,
     write_outputs: bool,
+    content_hint: ContentHint,
 ) -> Path:
-    """Persist the parameters ``complete_from_plan`` needs to finish later."""
+    """Persist the parameters ``complete_from_plan`` needs to finish later.
+
+    ``content_hint`` is persisted so the resumed analysis rebuilds the same
+    profile and applies the same per-mode keep threshold (e.g. highlights=7)
+    that the live path would have — without it a resumed host run would
+    silently fall back to the global default.
+    """
     output_root.mkdir(parents=True, exist_ok=True)
     state = {
         "video_path": str(video.resolve()),
@@ -685,6 +698,7 @@ def _write_resume_state(
         "write_outputs": write_outputs,
         "n_scenes": n_scenes,
         "n_keyframes": n_keyframes,
+        "content_hint": content_hint.value,
     }
     path = output_root / RESUME_STATE_FILENAME
     path.write_text(json.dumps(state, indent=2), encoding="utf-8")
@@ -718,197 +732,6 @@ def load_resume_state(output_root: Path) -> dict[str, object]:
     if missing:
         raise ResumeStateError(f"resume state missing required keys: {sorted(missing)}")
     return data
-
-
-async def _run_auto_detect(
-    video: Path,
-    provider: VLMProvider,
-    *,
-    metadata: VideoMetadata,
-    output_root: Path,
-) -> DetectionResult:
-    """Run Phase E detection and surface a clean DetectionResult.
-
-    Wraps ``detect_content_hint`` in defensive handling for ``VLMError``
-    only. ``HostAgentPauseRequested`` is allowed to propagate so the
-    caller can persist a detection-phase resume state and re-raise to the
-    CLI (which prints the resume instructions).
-    """
-    try:
-        return await detect_content_hint(
-            video,
-            provider,
-            metadata=metadata,
-            output_root=output_root,
-        )
-    except VLMError as exc:
-        log.warning("pipeline: auto-detect failed (%s); HYBRID fallback", exc)
-        return DetectionResult(
-            content_hint=ContentHint.other,
-            confidence=0.0,
-            reasoning=f"auto-detect failed: {exc}",
-        )
-
-
-def _apply_detection_to_hints(
-    hints: AnalysisHints,
-    detection: DetectionResult,
-) -> AnalysisHints:
-    """Update hints with the detected content_hint when confidence is high enough.
-
-    Below the threshold we keep ``content_hint == auto`` so ``profile_for``
-    falls back to HYBRID. Returning the hints unchanged in that case keeps
-    a single ownership rule (only this helper decides whether to apply).
-    """
-    if detection.confidence >= _AUTO_DETECT_CONFIDENCE_THRESHOLD:
-        log.info(
-            "pipeline: auto-detect picked %s (confidence %.2f) — %s",
-            detection.content_hint.value,
-            detection.confidence,
-            detection.reasoning,
-        )
-        return hints.model_copy(update={"content_hint": detection.content_hint})
-    log.warning(
-        "pipeline: detection confidence %.2f below %.2f; HYBRID fallback (detected=%s, reason=%r)",
-        detection.confidence,
-        _AUTO_DETECT_CONFIDENCE_THRESHOLD,
-        detection.content_hint.value,
-        detection.reasoning,
-    )
-    return hints
-
-
-# ---------------------------------------------------------------------------
-# Detection-phase resume (Phase E host-agent path)
-# ---------------------------------------------------------------------------
-
-
-def _write_detection_resume_state(
-    output_root: Path,
-    *,
-    video: Path,
-    metadata: VideoMetadata,
-    initial_hints: AnalysisHints,
-    sampling_strategy: str,
-    accurate_cuts: bool,
-    write_outputs: bool,
-    host_supports_video: bool = False,
-) -> Path:
-    """Persist enough state to continue the pipeline after a detection pause.
-
-    Stores the AnalysisHints **before** detection updates them, so the
-    resume path applies exactly the same logic (threshold + model_copy)
-    that the live path would have. Includes the probed metadata so we
-    don't re-probe on resume (it's deterministic + cheap, but persistence
-    avoids any subtle timing inconsistency). ``host_supports_video`` is
-    persisted so the post-detection resume rebuilds a video-capable host
-    provider and re-enters on the host-video route.
-    """
-    output_root.mkdir(parents=True, exist_ok=True)
-    state = {
-        "phase": "detection",
-        "video_path": str(video.resolve()),
-        "video_metadata": json.loads(metadata.model_dump_json()),
-        "output_root": str(output_root.resolve()),
-        "sampling_strategy": sampling_strategy,
-        "accurate_cuts": accurate_cuts,
-        "write_outputs": write_outputs,
-        "initial_hints": json.loads(initial_hints.model_dump_json()),
-        "host_supports_video": host_supports_video,
-    }
-    path = output_root / DETECTION_RESUME_STATE_FILENAME
-    path.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    log.info("pipeline: detection resume state written → %s", path)
-    return path
-
-
-def _clear_detection_resume_state(output_root: Path) -> None:
-    """Best-effort delete of the detection sidecar after that phase completes."""
-    path = output_root / DETECTION_RESUME_STATE_FILENAME
-    try:
-        path.unlink(missing_ok=True)
-    except OSError as exc:
-        log.debug("could not clear detection resume state %s: %s", path, exc)
-
-
-def load_detection_resume_state(output_root: Path) -> dict[str, object]:
-    """Load the detection sidecar. Raises ``ResumeStateError`` on issues."""
-    path = output_root / DETECTION_RESUME_STATE_FILENAME
-    if not path.is_file():
-        raise ResumeStateError(
-            f"detection resume state file not found: {path} "
-            f"(no paused detection to resume in this output dir)"
-        )
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ResumeStateError(f"failed to read detection resume state: {exc}") from exc
-    if not isinstance(data, dict):
-        raise ResumeStateError("detection resume state top-level value is not an object")
-    required = {"video_path", "video_metadata", "initial_hints"}
-    missing = required - data.keys()
-    if missing:
-        raise ResumeStateError(f"detection resume state missing required keys: {sorted(missing)}")
-    return data
-
-
-async def resume_after_detection(
-    detection: DetectionResult,
-    *,
-    state: dict[str, object],
-    provider: VLMProvider,
-    config: AutoCutConfig,
-    confirm_cost: ConfirmHook | None = None,
-) -> AnalysisResult:
-    """Re-enter the pipeline after detection has been resolved.
-
-    The CLI loads ``DETECTION_RESPONSE.json`` via the provider, calls
-    this with the resulting ``DetectionResult``, and the rest of the
-    pipeline runs as if the live path had produced the same detection.
-    The analysis pause (``HostAgentPauseRequested``) is allowed to
-    propagate so the CLI can show its second pause message.
-    """
-    video = Path(str(state["video_path"]))
-    if not video.is_file():
-        raise ResumeStateError(f"original video no longer at {video}; cannot resume detection")
-
-    try:
-        metadata = VideoMetadata.model_validate(state["video_metadata"])
-    except Exception as exc:
-        raise ResumeStateError(f"resume state video_metadata is invalid: {exc}") from exc
-    try:
-        initial_hints = AnalysisHints.model_validate(state["initial_hints"])
-    except Exception as exc:
-        raise ResumeStateError(f"resume state initial_hints is invalid: {exc}") from exc
-
-    output_root = Path(str(state.get("output_root", str(config.output.base_dir)))).resolve()
-    sampling_strategy = str(state.get("sampling_strategy", "hybrid"))
-    accurate_cuts = bool(state.get("accurate_cuts", False))
-    write_outputs = bool(state.get("write_outputs", True))
-
-    # Apply the detection just like the live path does (threshold etc.).
-    effective_hints = _apply_detection_to_hints(initial_hints, detection)
-
-    # Detection step is done; drop the sidecar so a subsequent failure
-    # doesn't re-trigger detection resume next time.
-    _clear_detection_resume_state(output_root)
-
-    # Re-enter the pipeline with the resolved hint. We pass it explicitly
-    # so ``run_analysis`` does NOT enter the auto-detect branch again.
-    # The pipeline will re-probe (cheap, ~0.5s, deterministic), so we
-    # discard the persisted metadata at this layer.
-    del metadata
-    return await run_analysis(
-        video,
-        provider,
-        config=config,
-        hints=effective_hints,
-        output_root=output_root,
-        sampling_strategy=sampling_strategy,
-        write_outputs=write_outputs,
-        accurate_cuts=accurate_cuts,
-        confirm_cost=confirm_cost,
-    )
 
 
 def _resolve_hints(

@@ -160,12 +160,9 @@ def test_detection_result_rejects_auto_as_output() -> None:
 
 def test_detection_result_accepts_committed_categories() -> None:
     for hint in (
-        ContentHint.boxing,
-        ContentHint.sport,
-        ContentHint.gameplay,
+        ContentHint.highlights,
         ContentHint.talk,
-        ContentHint.podcast,
-        ContentHint.other,
+        ContentHint.hybrid,
     ):
         DetectionResult(content_hint=hint, confidence=0.5, reasoning="ok")
 

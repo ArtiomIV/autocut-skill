@@ -21,14 +21,15 @@ import base64
 import json
 import logging
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, Final, TypeVar, cast
 
 from openai import APIError, AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from pydantic import ValidationError
 
-from autocut.models import AnalysisHints, ClipPlan, DetectionResult, Keyframe
+from autocut.models import AnalysisHints, Clip, ClipPlan, DetectionResult, Keyframe
 from autocut.video.frame_sampler import FrameSpec
 from autocut.vlm.base import CostEstimate, VLMError, VLMProvider
 from autocut.vlm.discovery import model_supports_audio, model_supports_video
@@ -57,6 +58,18 @@ _TOKENS_OUTPUT_PER_CLIP: int = 120
 _FALLBACK_USD_PER_1M_INPUT: float = 3.0
 _FALLBACK_USD_PER_1M_OUTPUT: float = 15.0
 
+# Request resilience: the model occasionally returns an empty body, prose-wrapped
+# or truncated JSON, or a transient transport error (429/5xx/connection drop).
+# None of those must crash a (paid, long-running) pipeline, so every request is
+# re-issued up to this many times before the last error is surfaced.
+_MAX_REQUEST_ATTEMPTS: Final[int] = 3
+_RETRY_BACKOFF_BASE_SEC: Final[float] = 0.5
+# Transport failures worth re-issuing: rate limits, 5xx, request timeout/conflict.
+# A 4xx like 400/401/403 is permanent (bad request / key) — retrying won't help.
+_RETRYABLE_STATUS: Final[frozenset[int]] = frozenset({408, 409, 429, 500, 502, 503, 504})
+
+_T = TypeVar("_T")
+
 
 class OpenRouterProvider(VLMProvider):
     """OpenAI-SDK shim that points at OpenRouter."""
@@ -84,12 +97,99 @@ class OpenRouterProvider(VLMProvider):
         self._client = client or AsyncOpenAI(
             base_url=self.BASE_URL,
             api_key=api_key,
+            # Disable the SDK's own retry layer: ``_complete_and_parse`` owns ALL
+            # retries (transport AND unusable-body), so leaving the SDK's default
+            # max_retries=2 in place would multiply attempts unpredictably.
+            max_retries=0,
             default_headers={
                 # OpenRouter uses these headers for attribution analytics.
                 "HTTP-Referer": attribution_url,
                 "X-Title": attribution_title,
             },
         )
+
+    # ------------------------------------------------------------------
+    # Request primitive (shared by every analyse/detect call)
+    # ------------------------------------------------------------------
+
+    async def _complete_and_parse(
+        self,
+        *,
+        base_messages: list[dict[str, Any]],
+        parse: Callable[[str, Any, float], _T],
+        max_tokens: int,
+        timeout_sec: int,
+        label: str,
+        extra_body: dict[str, Any] | None = None,
+    ) -> _T:
+        """Issue one chat completion and parse it, with bounded retries.
+
+        ``parse(raw, completion, elapsed)`` returns the parsed value or raises
+        ``VLMError`` when the body is unusable. The request is re-issued up to
+        ``_MAX_REQUEST_ATTEMPTS`` times when:
+
+        - the body is empty / not valid JSON / fails schema validation — a
+          corrective instruction is appended and the model is asked again, OR
+        - the transport fails transiently (timeout / 429 / 5xx) — we back off.
+
+        A permanent client error (4xx other than 408/409/429) raises at once. A
+        ``parse`` that *returns* (e.g. after dropping a single malformed clip but
+        keeping the good ones) is a success, NOT a retry trigger — so the per-clip
+        drop stays the last-resort net. Only when every attempt is spent do we
+        raise the last error (it carries the diagnostic the caller relies on).
+        """
+        messages: list[dict[str, Any]] = list(base_messages)
+        last_error: VLMError | None = None
+        for attempt in range(1, _MAX_REQUEST_ATTEMPTS + 1):
+            start = time.monotonic()
+            try:
+                completion = await asyncio.wait_for(
+                    self._client.chat.completions.create(
+                        model=self.model,
+                        messages=cast(  # type: ignore[redundant-cast, unused-ignore]
+                            list[ChatCompletionMessageParam], messages
+                        ),
+                        response_format={"type": "json_object"},
+                        max_tokens=max_tokens,
+                        # Greedy decoding keeps selection repeatable; the
+                        # corrective message (not temperature) breaks a bad-JSON
+                        # loop by changing the prompt on retry.
+                        temperature=0,
+                        # ``None`` is the SDK default (no provider pin / usage flag).
+                        extra_body=extra_body,
+                    ),
+                    timeout=timeout_sec,
+                )
+            except TimeoutError:
+                last_error = VLMError(f"openrouter {label} timed out after {timeout_sec}s")
+                await _backoff(attempt)
+                continue
+            except APIError as exc:
+                if not _is_retryable_api_error(exc):
+                    raise VLMError(f"openrouter {label} API call failed: {exc}") from exc
+                last_error = VLMError(f"openrouter {label} API call failed: {exc}")
+                await _backoff(attempt)
+                continue
+
+            elapsed = time.monotonic() - start
+            raw = (completion.choices[0].message.content or "").strip()
+            try:
+                if not raw:
+                    raise VLMError(f"openrouter {label} returned an empty response body")
+                return parse(raw, completion, elapsed)
+            except VLMError as exc:
+                last_error = exc
+                log.warning(
+                    "openrouter %s: unusable response on attempt %d/%d: %s",
+                    label,
+                    attempt,
+                    _MAX_REQUEST_ATTEMPTS,
+                    exc,
+                )
+                messages = [*base_messages, _corrective_message(raw)]
+
+        assert last_error is not None  # the loop body always sets it before falling through
+        raise last_error
 
     # ------------------------------------------------------------------
     # VLMProvider interface
@@ -127,51 +227,26 @@ class OpenRouterProvider(VLMProvider):
                 }
             )
 
-        # Local mypy sees openai's strict TypedDict union and rejects the
-        # dict-literal; pre-commit mypy has no openai stubs and treats the
-        # cast as redundant. Silence both with the combined ignore.
-        messages = cast(  # type: ignore[redundant-cast, unused-ignore]
-            list[ChatCompletionMessageParam],
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": content},
-            ],
-        )
-        start = time.monotonic()
-        try:
-            completion = await asyncio.wait_for(
-                self._client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    response_format={"type": "json_object"},
-                    max_tokens=16384,
-                    # Greedy decoding: clip selection should be repeatable for a
-                    # given video, not vary run-to-run.
-                    temperature=0,
-                ),
-                timeout=timeout_sec,
-            )
-        except TimeoutError as exc:
-            raise VLMError(f"openrouter request timed out after {timeout_sec}s") from exc
-        except APIError as exc:
-            raise VLMError(f"openrouter API call failed: {exc}") from exc
+        base_messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ]
 
-        elapsed = time.monotonic() - start
-        raw = (completion.choices[0].message.content or "").strip()
-        if not raw:
-            raise VLMError("openrouter returned an empty response body")
+        def _parse(raw: str, _completion: Any, elapsed: float) -> ClipPlan:
+            return _parse_response(raw, provider=self.name, model=self.model, elapsed_sec=elapsed)
 
-        plan = _parse_response(
-            raw,
-            provider=self.name,
-            model=self.model,
-            elapsed_sec=elapsed,
+        plan = await self._complete_and_parse(
+            base_messages=base_messages,
+            parse=_parse,
+            max_tokens=16384,
+            timeout_sec=timeout_sec,
+            label="analyse",
         )
         log.info(
             "openrouter analyse complete: model=%s clips=%d elapsed=%.2fs",
             self.model,
             len(plan.clips),
-            elapsed,
+            plan.metadata.analysis_time_sec or 0.0,
         )
         return plan
 
@@ -220,56 +295,39 @@ class OpenRouterProvider(VLMProvider):
                 "video_url": {"url": _encode_video_to_data_url(clip_path)},
             },
         ]
-        messages = cast(  # type: ignore[redundant-cast, unused-ignore]
-            list[ChatCompletionMessageParam],
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": content},
-            ],
-        )
-        start = time.monotonic()
-        try:
-            completion = await asyncio.wait_for(
-                self._client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    response_format={"type": "json_object"},
-                    max_tokens=16384,
-                    # Greedy decoding for repeatable clip selection.
-                    temperature=0,
-                    extra_body={
-                        # base64 video only works on the Vertex backend.
-                        "provider": {"order": ["google-vertex"], "allow_fallbacks": False},
-                        # ask OpenRouter to return the real billed cost.
-                        "usage": {"include": True},
-                    },
-                ),
-                timeout=timeout_sec,
+        base_messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ]
+
+        def _parse(raw: str, completion: Any, elapsed: float) -> ClipPlan:
+            return _parse_response(
+                raw,
+                provider=self.name,
+                model=self.model,
+                elapsed_sec=elapsed,
+                cost_usd=_usage_cost(completion),
             )
-        except TimeoutError as exc:
-            raise VLMError(f"openrouter video request timed out after {timeout_sec}s") from exc
-        except APIError as exc:
-            raise VLMError(f"openrouter video API call failed: {exc}") from exc
 
-        elapsed = time.monotonic() - start
-        raw = (completion.choices[0].message.content or "").strip()
-        if not raw:
-            raise VLMError("openrouter returned an empty response body")
-
-        cost = _usage_cost(completion)
-        plan = _parse_response(
-            raw,
-            provider=self.name,
-            model=self.model,
-            elapsed_sec=elapsed,
-            cost_usd=cost,
+        plan = await self._complete_and_parse(
+            base_messages=base_messages,
+            parse=_parse,
+            max_tokens=16384,
+            timeout_sec=timeout_sec,
+            label="video analyse",
+            extra_body={
+                # base64 video only works on the Vertex backend.
+                "provider": {"order": ["google-vertex"], "allow_fallbacks": False},
+                # ask OpenRouter to return the real billed cost.
+                "usage": {"include": True},
+            },
         )
         log.info(
             "openrouter video analyse complete: model=%s clips=%d elapsed=%.2fs cost=%s",
             self.model,
             len(plan.clips),
-            elapsed,
-            cost,
+            plan.metadata.analysis_time_sec or 0.0,
+            getattr(plan.metadata, "cost_usd", None),
         )
         return plan
 
@@ -318,53 +376,36 @@ class OpenRouterProvider(VLMProvider):
                 "input_audio": {"data": _encode_audio_base64(clip_path), "format": "mp3"},
             },
         ]
-        messages = cast(  # type: ignore[redundant-cast, unused-ignore]
-            list[ChatCompletionMessageParam],
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": content},
-            ],
-        )
-        start = time.monotonic()
-        try:
-            completion = await asyncio.wait_for(
-                self._client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    response_format={"type": "json_object"},
-                    max_tokens=16384,
-                    # Greedy decoding for repeatable clip selection.
-                    temperature=0,
-                    # ask OpenRouter for the real billed cost (no backend pin
-                    # needed for audio, unlike the base64-video path).
-                    extra_body={"usage": {"include": True}},
-                ),
-                timeout=timeout_sec,
+        base_messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ]
+
+        def _parse(raw: str, completion: Any, elapsed: float) -> ClipPlan:
+            return _parse_response(
+                raw,
+                provider=self.name,
+                model=self.model,
+                elapsed_sec=elapsed,
+                cost_usd=_usage_cost(completion),
             )
-        except TimeoutError as exc:
-            raise VLMError(f"openrouter audio request timed out after {timeout_sec}s") from exc
-        except APIError as exc:
-            raise VLMError(f"openrouter audio API call failed: {exc}") from exc
 
-        elapsed = time.monotonic() - start
-        raw = (completion.choices[0].message.content or "").strip()
-        if not raw:
-            raise VLMError("openrouter returned an empty response body")
-
-        cost = _usage_cost(completion)
-        plan = _parse_response(
-            raw,
-            provider=self.name,
-            model=self.model,
-            elapsed_sec=elapsed,
-            cost_usd=cost,
+        plan = await self._complete_and_parse(
+            base_messages=base_messages,
+            parse=_parse,
+            max_tokens=16384,
+            timeout_sec=timeout_sec,
+            label="audio analyse",
+            # ask OpenRouter for the real billed cost (no backend pin needed for
+            # audio, unlike the base64-video path).
+            extra_body={"usage": {"include": True}},
         )
         log.info(
             "openrouter audio analyse complete: model=%s clips=%d elapsed=%.2fs cost=%s",
             self.model,
             len(plan.clips),
-            elapsed,
-            cost,
+            plan.metadata.analysis_time_sec or 0.0,
+            getattr(plan.metadata, "cost_usd", None),
         )
         return plan
 
@@ -410,44 +451,27 @@ class OpenRouterProvider(VLMProvider):
                 }
             )
 
-        messages = cast(  # type: ignore[redundant-cast, unused-ignore]
-            list[ChatCompletionMessageParam],
-            [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": content},
-            ],
+        base_messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ]
+
+        def _parse(raw: str, _completion: Any, _elapsed: float) -> DetectionResult:
+            log.debug("openrouter detection raw response: %s", raw[:300])
+            return _parse_detection_response(raw, model=self.model, video_id=video_id)
+
+        return await self._complete_and_parse(
+            base_messages=base_messages,
+            parse=_parse,
+            # The detection JSON itself is tiny, but "thinking" models (e.g.
+            # Gemini 3.x Flash) spend part of the token budget on internal
+            # reasoning before emitting output. A 256 cap left too little for the
+            # JSON, truncating it mid-string. Give enough headroom that the object
+            # always completes; unused tokens are not billed.
+            max_tokens=2048,
+            timeout_sec=timeout_sec,
+            label="detection",
         )
-        start = time.monotonic()
-        try:
-            completion = await asyncio.wait_for(
-                self._client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    response_format={"type": "json_object"},
-                    # The detection JSON itself is tiny, but "thinking" models
-                    # (e.g. Gemini 3.x Flash) spend part of the token budget on
-                    # internal reasoning before emitting output. A 256 cap left
-                    # too little for the JSON, truncating it mid-string. Give
-                    # enough headroom that the object always completes; unused
-                    # tokens are not billed.
-                    max_tokens=2048,
-                ),
-                timeout=timeout_sec,
-            )
-        except TimeoutError as exc:
-            raise VLMError(f"openrouter detection timed out after {timeout_sec}s") from exc
-        except APIError as exc:
-            raise VLMError(f"openrouter detection API call failed: {exc}") from exc
-
-        elapsed = time.monotonic() - start
-        # Suppress unused-variable warning when timing is not logged.
-        del elapsed
-        raw = (completion.choices[0].message.content or "").strip()
-        if not raw:
-            raise VLMError("openrouter detection returned an empty response body")
-        log.debug("openrouter detection raw response: %s", raw[:300])
-
-        return _parse_detection_response(raw, model=self.model, video_id=video_id)
 
     def estimate_cost(self, n_keyframes: int) -> CostEstimate:
         input_tokens = _TOKENS_PER_PROMPT_OVERHEAD + n_keyframes * _TOKENS_PER_IMAGE
@@ -484,6 +508,46 @@ class OpenRouterProvider(VLMProvider):
 
 async def _async_health_probe(client: AsyncOpenAI) -> None:
     await client.models.list()
+
+
+def _is_retryable_api_error(exc: APIError) -> bool:
+    """Whether re-issuing the request could plausibly succeed.
+
+    Connection drops and timeouts (``APIConnectionError`` / ``APITimeoutError``)
+    carry no status code and are transient → retry. A status error is retryable
+    only for rate limits and 5xx (and 408/409); a 400/401/403/404 is a permanent
+    client error that the same request will keep hitting → do not retry.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        return True
+    return status in _RETRYABLE_STATUS
+
+
+async def _backoff(attempt: int) -> None:
+    """Exponential backoff between transport retries (no sleep after the last)."""
+    if attempt >= _MAX_REQUEST_ATTEMPTS:
+        return
+    await asyncio.sleep(_RETRY_BACKOFF_BASE_SEC * (2 ** (attempt - 1)))
+
+
+def _corrective_message(raw: str) -> dict[str, Any]:
+    """A follow-up user turn appended after an unusable reply.
+
+    Changing the prompt (rather than the temperature) is what breaks a
+    deterministic bad-JSON loop at ``temperature=0``: the model sees that its
+    last reply was rejected and is asked for a clean object instead.
+    """
+    return {
+        "role": "user",
+        "content": (
+            "Your previous reply could not be used: it must be a SINGLE valid "
+            "JSON object that matches the schema exactly — no prose, no markdown "
+            "fences, not truncated. "
+            f"Your previous reply began with: {raw[:400]!r}. "
+            "Send ONLY the corrected JSON object now."
+        ),
+    }
 
 
 def _encode_image_to_data_url(path: Path) -> str:
@@ -644,6 +708,23 @@ def _parse_response(
     metadata["analysis_time_sec"] = round(elapsed_sec, 2)
     if cost_usd is not None:
         metadata["cost_usd"] = cost_usd
+
+    # Validate clips individually so one malformed clip (e.g. a bad timestamp or
+    # an over-length field) does not sink the whole batch — which, on a long
+    # paid run, would waste every other clip too. Drop the offenders, keep the
+    # rest. The ClipPlan re-validation below then only sees clean clips.
+    raw_clips = payload.get("clips")
+    if isinstance(raw_clips, list):
+        # Collect validated Clip instances (NOT re-serialised dicts: dumping a
+        # Timestamp back to JSON yields ISO-8601 "PT1S", which our timestamp
+        # parser does not accept). Pydantic accepts already-built submodels.
+        kept: list[Clip] = []
+        for index, clip in enumerate(raw_clips):
+            try:
+                kept.append(Clip.model_validate(clip))
+            except ValidationError as exc:
+                log.warning("openrouter (%s): dropping malformed clip %d: %s", model, index, exc)
+        payload["clips"] = kept
 
     try:
         return ClipPlan.model_validate(payload)

@@ -19,19 +19,15 @@ from rich.table import Table
 
 from autocut import __version__
 from autocut.config import AutoCutConfig, AutoCutSettings, config_path
-from autocut.models import AnalysisHints, ClipPlan, ContentHint, VideoMetadata
+from autocut.models import AnalysisHints, ContentHint, VideoMetadata
 from autocut.pipeline import (
-    DETECTION_RESUME_STATE_FILENAME,
     AnalysisResult,
     CostCapExceeded,
     ResumeStateError,
     complete_from_plan,
-    load_detection_resume_state,
     load_resume_state,
-    resume_after_detection,
     run_analysis,
 )
-from autocut.scoring import RankedClip
 from autocut.security import (
     SERVICE_NAME,
     KeyringError,
@@ -176,9 +172,22 @@ def run(
         typer.Option(
             "--content-hint",
             help=(
-                "Override content type (auto | boxing | sport | gameplay | talk | "
-                "podcast | other). Selects the matching profile: sport tunes for "
-                "dense action, talk for verbal content, auto/other for hybrid."
+                "Editing MODE (auto | highlights | hybrid | talk). 'highlights' "
+                "auto-selects the best/viral moments (strict, may return nothing); "
+                "'talk' is for speech-driven content; 'hybrid' is the conservative "
+                "default. Unset/auto -> hybrid. The orchestrating agent picks this."
+            ),
+        ),
+    ] = None,
+    query: Annotated[
+        str | None,
+        typer.Option(
+            "--query",
+            help=(
+                "Find a SPECIFIC described moment instead of auto-highlights "
+                '(e.g. "the knockdown in round 3", "when they mention prices"). '
+                "Disables the motion pre-filter so low-motion targets are not "
+                "sampled away — the model filters via the query instead."
             ),
         ),
     ] = None,
@@ -208,6 +217,20 @@ def run(
             help="Run the analysis but do not write any output files.",
         ),
     ] = False,
+    two_pass: Annotated[
+        bool,
+        typer.Option(
+            "--two-pass/--single-pass",
+            help=(
+                "Default ON for long (>60s) openrouter video/audio runs: locate "
+                "candidate regions coarsely first, then re-analyse each in isolation "
+                "for tighter, more accurate cut boundaries (validated to start KO "
+                "clips on the punch, not the referee count). Costs ~2x the calls; "
+                "pass --single-pass to disable. No effect on short videos or the "
+                "host/keyframe routes."
+            ),
+        ),
+    ] = True,
 ) -> None:
     """Run the analysis pipeline on a video and produce the highlight clips."""
     if not video.exists() or not video.is_file():
@@ -222,7 +245,7 @@ def run(
     # resume sidecar trivially consistent (no output mode to persist).
     cfg.output.modes = ["separate"]
 
-    hints_override = _build_hints_from_cli(content_hint, cfg)
+    hints_override = _build_hints_from_cli(content_hint, query, cfg)
 
     provider_name = vlm or cfg.vlm.provider
     model = vlm_model or cfg.vlm.model
@@ -261,6 +284,7 @@ def run(
                 write_outputs=not dry_run,
                 accurate_cuts=accurate,
                 confirm_cost=_make_cost_confirm(yes=yes),
+                two_pass=two_pass,
             )
         )
     except HostAgentPauseRequested as pause:
@@ -288,90 +312,18 @@ def resume(
 ) -> None:
     """Resume a paused host-agent run.
 
-    Two phases (in order) are supported:
-
-    1. **Detection** (Phase E) — if ``DETECTION_REQUEST.md`` was written
-       and a ``.autocut_detect_resume.json`` sidecar exists, this loads
-       ``DETECTION_RESPONSE.json``, applies the classification, then
-       re-enters the pipeline (which will pause again at the analysis
-       step with a fresh ``VLM_REQUEST.md``).
-
-    2. **Analysis** — if the standard ``.autocut_resume.json`` sidecar
-       exists, this loads ``VLM_RESPONSE.json``, ranks clips, runs the
-       output writers, and writes the manifest.
-
-    The detection sidecar takes precedence: a single run can produce both
-    files in sequence, and we always continue from the earliest pending
-    phase.
+    The host agent pauses once, at the analysis step: ``run`` writes
+    ``VLM_REQUEST.md`` and a ``.autocut_resume.json`` sidecar. This loads
+    the agent's ``VLM_RESPONSE.json``, ranks clips, runs the output
+    writers, and writes the manifest. (Content classification is no longer
+    a pause — the orchestrating agent picks the mode up front, or calls the
+    standalone ``autocut detect`` subcommand.)
     """
     settings = AutoCutSettings.load()
     cfg = settings.config
     base = (work_dir or cfg.output.base_dir).resolve()
 
-    if (base / DETECTION_RESUME_STATE_FILENAME).is_file():
-        _resume_detection_phase(base, cfg)
-        return
     _resume_analysis_phase(base, cfg)
-
-
-def _resume_detection_phase(base: Path, cfg: AutoCutConfig) -> None:
-    """Handle the Phase E detection resume.
-
-    Loads the detection state + the host agent's DetectionResult JSON,
-    invokes ``resume_after_detection`` which re-enters the pipeline,
-    catches the analysis-step pause and prints the second pause message.
-    """
-    try:
-        state = load_detection_resume_state(base)
-    except ResumeStateError as exc:
-        err_console.print(str(exc))
-        raise typer.Exit(code=1) from exc
-
-    # Rebuild the host provider with the same video capability the original
-    # run had, so re-entering the pipeline takes the host-video route again.
-    provider = HostAgentProvider(
-        work_dir=base,
-        agent_hint=cfg.vlm.model,
-        supports_video=bool(state.get("host_supports_video", False)),
-    )
-    try:
-        detection = provider.resume_detection_from_disk()
-    except VLMError as exc:
-        err_console.print(str(exc))
-        raise typer.Exit(code=1) from exc
-
-    console.print(
-        f"[green]OK[/] detection resolved: "
-        f"[bold]{detection.content_hint.value}[/] "
-        f"(confidence {detection.confidence:.2f})\n"
-        f"  reasoning: {detection.reasoning}\n"
-        f"[dim]Re-entering pipeline; expect a second pause at the analysis step.[/]\n"
-    )
-
-    try:
-        result = asyncio.run(
-            resume_after_detection(
-                detection,
-                state=state,
-                provider=provider,
-                config=cfg,
-                confirm_cost=_make_cost_confirm(yes=False),
-            )
-        )
-    except HostAgentPauseRequested as pause:
-        # Expected: second pause for the analysis step. Show its message.
-        _print_pause_message(pause)
-        raise typer.Exit(code=0) from None
-    except CostCapExceeded as exc:
-        err_console.print(str(exc))
-        raise typer.Exit(code=1) from exc
-    except VLMError as exc:
-        err_console.print(f"VLM error during resume: {exc}")
-        raise typer.Exit(code=1) from exc
-
-    # Unexpected: pipeline returned without pausing (e.g. provider isn't
-    # host-agent — keep the path defensive). Render the summary anyway.
-    _render_analysis_summary(result)
 
 
 def _resume_analysis_phase(base: Path, cfg: AutoCutConfig) -> None:
@@ -405,6 +357,16 @@ def _resume_analysis_phase(base: Path, cfg: AutoCutConfig) -> None:
         err_console.print(f"resume state video_metadata is invalid: {exc}")
         raise typer.Exit(code=1) from exc
 
+    # Rebuild the profile from the persisted mode so the resumed ranking
+    # applies the same per-mode keep threshold the live path would have.
+    from autocut.content import profile_for
+
+    try:
+        resumed_hint = ContentHint(str(state.get("content_hint", ContentHint.hybrid.value)))
+    except ValueError:
+        resumed_hint = ContentHint.hybrid
+    profile = profile_for(resumed_hint)
+
     result = complete_from_plan(
         plan,
         video=video,
@@ -416,6 +378,7 @@ def _resume_analysis_phase(base: Path, cfg: AutoCutConfig) -> None:
         sampling_strategy=str(state.get("sampling_strategy", "hybrid")),
         accurate_cuts=bool(state.get("accurate_cuts", False)),
         write_outputs=bool(state.get("write_outputs", True)),
+        profile=profile,
     )
     # Resume succeeded end-to-end; the sidecar has served its purpose.
     with contextlib.suppress(OSError):
@@ -498,6 +461,16 @@ def detect(
                 n_keyframes=n_keyframes,
             )
         )
+    except HostAgentPauseRequested as exc:
+        # Standalone detection is synchronous (openrouter). The host agent
+        # is itself the orchestrator and should classify the video directly
+        # instead of going through a paused two-phase detection cycle.
+        err_console.print(
+            "autocut detect needs a synchronous (cloud) provider, e.g. "
+            "--vlm openrouter. The host agent should pick the editing mode "
+            "directly and pass it to `autocut run --content-hint <mode>`."
+        )
+        raise typer.Exit(code=2) from exc
     except VLMError as exc:
         err_console.print(f"detect failed: {exc}")
         raise typer.Exit(code=1) from exc
@@ -1022,27 +995,36 @@ def _state_int(state: dict[str, object], key: str) -> int:
 
 def _build_hints_from_cli(
     content_hint_raw: str | None,
+    query: str | None,
     cfg: AutoCutConfig,
 ) -> AnalysisHints | None:
-    """Build ``AnalysisHints`` from the CLI ``--content-hint`` override.
+    """Build ``AnalysisHints`` from the CLI ``--content-hint`` / ``--query``.
 
-    Returns ``None`` if no override is given so the pipeline falls back to
-    its own resolution from ``cfg.content_defaults`` (unchanged behaviour).
+    Returns ``None`` only when NEITHER override is given, so the pipeline
+    falls back to its own resolution from ``cfg.content_defaults``. A bare
+    ``--query`` (no explicit mode) still builds hints so the query is not
+    lost — the mode then resolves to the default (HYBRID) downstream.
     """
-    if content_hint_raw is None:
+    query = (query.strip() or None) if query else None
+    if content_hint_raw is None and not query:
         return None
-    try:
-        hint = ContentHint(content_hint_raw.lower())
-    except ValueError as exc:
-        valid = ", ".join(h.value for h in ContentHint)
-        raise typer.BadParameter(
-            f"unknown --content-hint {content_hint_raw!r}; choose from: {valid}"
-        ) from exc
+
+    hint = ContentHint.auto
+    if content_hint_raw is not None:
+        try:
+            hint = ContentHint(content_hint_raw.lower())
+        except ValueError as exc:
+            valid = ", ".join(h.value for h in ContentHint)
+            raise typer.BadParameter(
+                f"unknown --content-hint {content_hint_raw!r}; choose from: {valid}"
+            ) from exc
+
     defaults = cfg.content_defaults
     return AnalysisHints(
         content_hint=hint,
         goal=defaults.goal,
         language=defaults.language,
+        query=query,
     )
 
 
@@ -1095,7 +1077,17 @@ def _render_analysis_summary(result: AnalysisResult) -> None:
         console.print("[yellow]No clips were proposed.[/]")
         return
 
-    table = Table(title=f"{len(plan.clips)} clip candidate(s) ranked")
+    if not result.ranked:
+        # The model proposed clips but none cleared the keep threshold
+        # (highlights = 7). An empty result is a valid, honest outcome — we do
+        # not ship a best-of-nothing.
+        console.print(
+            f"[yellow]{len(plan.clips)} candidate(s) proposed, but none cleared "
+            f"the keep threshold — no clips produced.[/]"
+        )
+        return
+
+    table = Table(title=f"{len(result.ranked)} clip(s) kept")
     table.add_column("#", justify="right")
     table.add_column("Start → End", style="bold")
     table.add_column("VLM", justify="right")
@@ -1104,8 +1096,7 @@ def _render_analysis_summary(result: AnalysisResult) -> None:
     table.add_column("Category")
     table.add_column("Description")
 
-    rows_source = result.ranked if result.ranked else _fallback_rows(plan)
-    for i, ranked in enumerate(rows_source, start=1):
+    for i, ranked in enumerate(result.ranked, start=1):
         table.add_row(
             str(i),
             f"{ranked.clip.start} → {ranked.clip.end}",
@@ -1133,19 +1124,6 @@ def _render_analysis_summary(result: AnalysisResult) -> None:
     console.print(
         f"\n[dim]Full ClipPlan JSON:[/]\n{json.dumps(plan.model_dump(mode='json'), indent=2)}"
     )
-
-
-def _fallback_rows(plan: ClipPlan) -> list[RankedClip]:
-    """Build display rows from raw ``ClipPlan`` when ranking dropped everything."""
-    return [
-        RankedClip(
-            clip=clip,
-            vlm_score=clip.score,
-            heuristic_score=0,
-            final_score=clip.score,
-        )
-        for clip in plan.clips
-    ]
 
 
 if __name__ == "__main__":  # pragma: no cover

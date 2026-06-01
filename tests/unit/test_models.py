@@ -136,17 +136,32 @@ def test_clip_rejects_extra_fields() -> None:
 
 
 def test_clip_caps_tags_to_five() -> None:
-    with pytest.raises(ValidationError):
-        Clip(
-            id="x",
-            start="00:00:00",  # type: ignore[arg-type]
-            end="00:00:10",  # type: ignore[arg-type]
-            category=Category.highlight,
-            description="d",
-            score=5,
-            rationale="r",
-            tags=["a", "b", "c", "d", "e", "f"],
-        )
+    # More than five tags are TRUNCATED to five (robust to the model), not rejected.
+    clip = Clip(
+        id="x",
+        start="00:00:00",  # type: ignore[arg-type]
+        end="00:00:10",  # type: ignore[arg-type]
+        category=Category.highlight,
+        description="d",
+        score=5,
+        rationale="r",
+        tags=["a", "b", "c", "d", "e", "f"],
+    )
+    assert clip.tags == ["a", "b", "c", "d", "e"]
+
+
+def test_clip_coerces_null_and_string_tags() -> None:
+    base = {
+        "id": "x",
+        "start": "00:00:00",
+        "end": "00:00:10",
+        "category": "highlight",
+        "description": "d",
+        "score": 5,
+        "rationale": "r",
+    }
+    assert Clip.model_validate({**base, "tags": None}).tags == []
+    assert Clip.model_validate({**base, "tags": "solo"}).tags == ["solo"]
 
 
 def test_clip_duration_properties() -> None:
@@ -194,7 +209,7 @@ def test_clipplan_validates_full_payload() -> None:
         }
     )
     assert len(plan.clips) == 1
-    assert plan.metadata.prompt_version == "v3"
+    assert plan.metadata.prompt_version == "v11"
 
 
 def test_clipplan_metadata_allows_extra_fields() -> None:

@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import pytest
-
 from autocut.models import ContentHint
 from autocut.pipeline import Route, _select_route
 
 
 def _route(
     provider: str,
-    hint: ContentHint = ContentHint.other,
+    hint: ContentHint = ContentHint.hybrid,
     *,
     video: bool = False,
     audio: bool = False,
@@ -24,13 +22,13 @@ def _route(
 
 
 def test_host_without_video_takes_keyframe() -> None:
-    assert _route("host", ContentHint.boxing, video=False) is Route.keyframe
+    assert _route("host", ContentHint.highlights, video=False) is Route.keyframe
     # Even talk content stays on keyframes for the host — no audio path yet.
     assert _route("host", ContentHint.talk, video=False, audio=True) is Route.keyframe
 
 
 def test_host_with_video_takes_host_video() -> None:
-    assert _route("host", ContentHint.boxing, video=True) is Route.host_video
+    assert _route("host", ContentHint.highlights, video=True) is Route.host_video
 
 
 # ---------------------------------------------------------------------------
@@ -38,9 +36,8 @@ def test_host_with_video_takes_host_video() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("hint", [ContentHint.talk, ContentHint.podcast])
-def test_talk_with_audio_takes_audio_route(hint: ContentHint) -> None:
-    assert _route("openrouter", hint, video=True, audio=True) is Route.openrouter_audio
+def test_talk_with_audio_takes_audio_route() -> None:
+    assert _route("openrouter", ContentHint.talk, video=True, audio=True) is Route.openrouter_audio
 
 
 def test_talk_without_audio_falls_back_to_video() -> None:
@@ -48,13 +45,14 @@ def test_talk_without_audio_falls_back_to_video() -> None:
 
 
 def test_non_talk_takes_video_even_if_audio_capable() -> None:
-    # Audio routing is reserved for talk/podcast; a boxing clip uses video.
+    # Audio routing is reserved for talk; a highlights clip uses video.
     assert (
-        _route("openrouter", ContentHint.boxing, video=True, audio=True) is Route.openrouter_video
+        _route("openrouter", ContentHint.highlights, video=True, audio=True)
+        is Route.openrouter_video
     )
 
 
 def test_no_direct_support_takes_keyframe() -> None:
-    assert _route("openrouter", ContentHint.other, video=False, audio=False) is Route.keyframe
+    assert _route("openrouter", ContentHint.hybrid, video=False, audio=False) is Route.keyframe
     # Audio-capable but talk-less + no video still ends up on keyframes.
-    assert _route("openrouter", ContentHint.boxing, video=False, audio=True) is Route.keyframe
+    assert _route("openrouter", ContentHint.highlights, video=False, audio=True) is Route.keyframe

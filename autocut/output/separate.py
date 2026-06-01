@@ -1,8 +1,9 @@
 """``separate`` output mode — one MP4 per ranked clip.
 
-Naming pattern: ``clip_<NNN>_s<score>_<slug>.mp4`` where
+Naming pattern: ``s<score>_clip_<NNN>_<slug>.mp4`` where
+- ``<score>`` is the zero-padded final score 0-10 (LEADS the name so files
+  group by score — sort the name column descending to put the best first)
 - ``<NNN>`` is the zero-padded rank position
-- ``<score>`` is the final score 0-10
 - ``<slug>`` is a sanitised excerpt of the clip description
 
 We delegate the actual cutting to ``autocut.video.cutter`` so the
@@ -68,4 +69,4 @@ class SeparateWriter(OutputWriter):
 
 def _clip_filename(rank: int, ranked: RankedClip) -> str:
     slug = slugify(ranked.clip.description)
-    return f"clip_{rank:03d}_s{ranked.final_score:02d}_{slug}.mp4"
+    return f"s{ranked.final_score:02d}_clip_{rank:03d}_{slug}.mp4"

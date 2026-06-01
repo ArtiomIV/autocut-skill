@@ -12,12 +12,19 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 # Prompt template IDs the VLM prompt builder dispatches on. Kept here (not
 # in ``autocut.content.profiles``) so ``AnalysisHints`` can reference the
 # Literal without an import cycle.
-PromptTemplateId = Literal["sport", "talk", "hybrid"]
+PromptTemplateId = Literal["highlights", "talk", "hybrid", "coarse", "query"]
 
 # ---------------------------------------------------------------------------
 # Timestamp parsing
@@ -74,15 +81,26 @@ class Category(StrEnum):
 
 
 class ContentHint(StrEnum):
-    """Type of content. ``auto`` lets the VLM decide."""
+    """Editing MODE for a run, not a content domain.
+
+    The orchestrating agent picks the mode from the user's request crossed with
+    the kind of video (see the routing matrix in the skill docs):
+
+    - ``highlights``: auto-select the best, viral-worthy moments. Content-agnostic
+      (boxing, skate, goals, reactions — all the same mode). If nothing clears the
+      bar, the run returns NO clip rather than a best-of-nothing.
+    - ``hybrid``: generic / unclear content; conservative general judgement.
+    - ``talk``: speech-driven (interview, podcast). Quality tuning waits on Whisper.
+    - ``auto``: input asking a detector to commit to one of the above (host path).
+
+    A request for a SPECIFIC described moment ("the ring girl", "the KO in round 3")
+    is NOT ``highlights`` — it travels as a free-text ``query`` on ``AnalysisHints``.
+    """
 
     auto = "auto"
-    boxing = "boxing"
+    highlights = "highlights"
+    hybrid = "hybrid"
     talk = "talk"
-    podcast = "podcast"
-    sport = "sport"
-    gameplay = "gameplay"
-    other = "other"
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +121,23 @@ class Clip(BaseModel):
     score: int = Field(ge=0, le=10)
     rationale: str = Field(min_length=1, max_length=300)
     tags: list[str] = Field(default_factory=list, max_length=5)
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def _coerce_tags(cls, value: object) -> object:
+        """Tolerate the model's occasional malformed ``tags``.
+
+        Models sometimes emit ``null``, a bare string, or more than five tags.
+        Coerce to a clean list of at most five strings rather than failing the
+        whole clip (and, with it, a long paid run).
+        """
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        if isinstance(value, list | tuple):
+            return [str(t) for t in value if t is not None][:5]
+        return value
 
     @model_validator(mode="after")
     def _end_after_start(self) -> Clip:
@@ -129,7 +164,7 @@ class ClipPlanMetadata(BaseModel):
 
     vlm_provider: str
     vlm_model: str
-    prompt_version: str = "v3"
+    prompt_version: str = "v11"
     analysis_time_sec: float | None = None
     # Real billed cost reported by the provider (via OpenRouter usage.include),
     # summed across batches. ``None`` when the provider does not report it
@@ -198,6 +233,13 @@ class AnalysisHints(BaseModel):
 
     content_hint: ContentHint = ContentHint.auto
     goal: str = Field(default="highlight reel", max_length=200)
+    # Free-text request for a SPECIFIC moment, elaborated by the orchestrating
+    # agent from the user's words ("find when the ring girl enters"). When set,
+    # the run switches to query mode: the model hunts THIS moment instead of
+    # auto-selecting the best ones, and the motion pre-filter is disabled (a
+    # low-motion target must not be sampled away). ``None`` = ordinary highlight
+    # selection driven by ``content_hint``.
+    query: str | None = Field(default=None, max_length=300)
     language: str = Field(default="it", pattern=r"^[a-z]{2}(-[A-Z]{2})?$")
     target_clip_count: int | None = Field(default=None, ge=1, le=100)
     min_duration_sec: float = Field(default=2.0, gt=0)

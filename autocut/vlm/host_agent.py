@@ -494,17 +494,20 @@ Do NOT output anything else in the response file. JSON only.
 
 ```
 {{
-  "content_hint": "boxing|sport|gameplay|talk|podcast|other",
+  "content_hint": "highlights|talk|hybrid",
   "confidence":  <number 0.0..1.0>,
   "reasoning":   "<one short sentence describing the dominant signal>"
 }}
 ```
 
 Guidance:
+- ``content_hint`` is the editing MODE: ``highlights`` for footage whose value
+  is its best visual moments (sport/action/gameplay/reactions), ``talk`` for
+  speech-driven content (interview/podcast/monologue), ``hybrid`` for anything
+  unclear or mixed.
 - ``confidence`` is your self-assessment. Use >= 0.8 only when visual +
   audio signals clearly agree.
-- When undecided between two categories, prefer ``other`` over a guess;
-  AutoCut will fall back to HYBRID gracefully.
+- When undecided between two modes, prefer ``hybrid`` over a guess.
 
 ## Audio profile (computed from the waveform, no transcription)
 

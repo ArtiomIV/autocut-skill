@@ -8,8 +8,8 @@ from autocut.content.detector import (
     detect_content_hint,
 )
 from autocut.content.profiles import (
+    HIGHLIGHTS_PROFILE,
     HYBRID_PROFILE,
-    SPORT_PROFILE,
     TALK_PROFILE,
     ContentProfile,
     profile_for,
@@ -18,8 +18,8 @@ from autocut.content.profiles import (
 __all__ = [
     "DETECTION_KEYFRAME_COUNT",
     "DETECTION_KEYFRAME_SUBDIR",
+    "HIGHLIGHTS_PROFILE",
     "HYBRID_PROFILE",
-    "SPORT_PROFILE",
     "TALK_PROFILE",
     "ContentProfile",
     "DetectionContext",
