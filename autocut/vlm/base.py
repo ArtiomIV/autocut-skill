@@ -155,6 +155,26 @@ class VLMProvider(ABC):
         """
         raise NotImplementedError(f"{type(self).__name__} does not support direct video analysis")
 
+    async def analyze_contact_sheets(
+        self,
+        sheets: list[Path],
+        hints: AnalysisHints,
+        *,
+        video_id: str,
+        duration_sec: float,
+        frame_times: list[float],
+        timeout_sec: int = 300,
+    ) -> ClipPlan:
+        """Analyse a candidate window rendered as indexed contact sheet(s).
+
+        Used by the two-pass fine pass on the video route: each sheet is a grid of
+        small frames, each cell labelled with its index, paired with a
+        ``frame_times`` index->time map. Only meaningful for providers that also
+        implement ``analyze_video_clip``; the default raises so a mis-routed call
+        fails loudly. Timestamps are returned RELATIVE to the clip.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support contact-sheet analysis")
+
     async def supports_audio(self) -> bool:
         """Whether this provider can ingest an audio clip directly.
 

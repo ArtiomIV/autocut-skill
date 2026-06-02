@@ -16,10 +16,11 @@ Each ``ContentHint`` value maps to exactly one of these profiles via
 ``profile_for``. The pipeline reads the profile and forwards its fields to
 the sampler, the prompt builder, and the cutter.
 
-Pre/post-roll padding fields exist on the profile but every built-in
-ships with ``0.0`` — the user wants tight cuts by default. The plumbing
-is wired through the cutter so future profiles can opt in by changing a
-single number.
+Pre/post-roll padding widens each cut at write time (clamped to the source).
+The **highlights** profile uses 3s on both sides so a knockdown/goal clip shows
+its lead-in and its consequences (e.g. the referee count) even though the model
+tends to cut right on the event; talk/hybrid keep tight cuts (0.0). The plumbing
+is wired through the cutter so any profile opts in by changing a single number.
 """
 
 from __future__ import annotations
@@ -64,6 +65,13 @@ HIGHLIGHTS_PROFILE = ContentProfile(
     min_duration_sec=3.0,
     max_duration_sec=20.0,
     prompt_template="highlights",
+    # The model cuts where it perceives the event ends (it ingests video at ~1fps),
+    # so a knockdown clip can stop right on the fall and miss the count/consequences
+    # that follow. A code-level 3s pad guarantees the lead-in and the aftermath are
+    # shown regardless of the model's exact boundary — the prompt is a weak lever
+    # for this. Highlights only; talk/hybrid keep tight cuts (0.0).
+    pre_roll_sec=3.0,
+    post_roll_sec=3.0,
     min_score=7,  # final == vlm now: keep the model's strong moments (>=7), drop VLM=6 filler
 )
 

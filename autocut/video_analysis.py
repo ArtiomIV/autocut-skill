@@ -34,12 +34,11 @@ from pathlib import Path
 from typing import Protocol
 
 from autocut.chunking import Chunk, merge_plans, split_into_chunks
-from autocut.models import AnalysisHints, ClipPlan, Keyframe
+from autocut.models import AnalysisHints, ClipPlan
 from autocut.video.audio_extract import extract_audio_for_vlm
 from autocut.video.compress import compress_for_vlm
+from autocut.video.contact_sheet import build_contact_sheets
 from autocut.video.cutter import CutRequest, cut_clip
-from autocut.video.frame_sampler import sample_uniform
-from autocut.video.keyframes import extract_keyframes
 
 log = logging.getLogger(__name__)
 
@@ -84,26 +83,28 @@ _COARSE_MAX_DURATION_SEC: float = 60.0
 # re-analyses the padded candidates (<=~1x more). 2x is a safe upper bound.
 _TWO_PASS_COST_FACTOR: float = 2.0
 
-# Fine pass as DENSE LABELLED STILLS (the dev experiment). The coarse pass keeps
-# ingesting video (cheap, high recall over the whole timeline), but the fine pass
-# samples each candidate window at 2 FPS and sends the frames + their timestamps
-# to the model instead of a video clip. Rationale: the model re-samples a video to
-# ~1fps internally and never sees a sub-second impact, so a KO clip opened on the
-# referee count instead of the punch; explicit 2 FPS stills double the temporal
-# resolution AND carry exact timestamps in the prompt, so boundaries land ~±0.5s.
-# Small/downscaled frames keep the token cost low — for BOUNDARY detection we need
-# temporal density, not spatial resolution.
+# Fine pass as a TIMESTAMPED CONTACT SHEET (the dev experiment). The coarse pass
+# keeps ingesting video (cheap, high recall over the whole timeline), but the fine
+# pass renders each candidate window as one or a few grids of small frames sampled
+# at ~2 FPS, each cell labelled with its own burned-in timestamp. Rationale: the
+# model re-samples a video to ~1fps internally and never sees a sub-second impact,
+# so a KO clip opened on the referee count instead of the punch. A contact sheet
+# restores 2-FPS temporal density AND prints the exact time on every frame, so the
+# model reads boundaries straight off the cells (~±0.5s). Sending ONE image per
+# sheet (vs dozens of separate stills) keeps the request small and reliable — an
+# earlier separate-stills E2E overloaded the request and got empty responses.
 _FINE_FRAME_INTERVAL_SEC: float = 0.5  # 2 FPS target sampling of the candidate window
-_FINE_FRAME_LONG_EDGE_PX: int = 256  # tiny frames: many cheap stills beat few big ones
-# Tighter padding for the stills fine pass than the classic ±20s video fine pass:
-# a smaller window keeps the frame count (and so the payload + cost) bounded.
-_FINE_FRAME_PAD_SEC: float = 10.0
-# HARD CAP on frames per candidate. An E2E showed ~120 frames (±20s window @2fps)
-# made the payload so large that the model returned an empty body and the retries
-# re-sent all the frames — a cost sink. ~67 stills were historically fine, so we
-# cap at 48: if 2 FPS over the window would exceed it, we widen the interval (drop
-# below 2 FPS) so the payload always stays in the proven-safe range.
-_FINE_FRAME_MAX_FRAMES: int = 48
+_FINE_CELL_PX: int = 192  # per-cell long edge: small cells keep the pixel-area cost low
+# Padding for the fine pass. ±20s gives the window room to include a moment's
+# lead-in/follow-through AND the slow-motion replay that follows the live action
+# (which often comes after a referee count, ~10-15s later); ±10/±15 windows cut
+# the replay off. Paired with a higher frame cap so the wider window keeps ~2 FPS.
+_FINE_FRAME_PAD_SEC: float = 20.0
+# HARD CAP on frames per candidate. Bounds cost (it scales with total pixel area)
+# and the number of sheets. 120 keeps ~2 FPS over a ±20s-padded window (a ~60s
+# window -> 120 frames = three 6x8 sheets); if 2 FPS would exceed it, we widen the
+# interval (drop below 2 FPS) so the count stays put.
+_FINE_FRAME_MAX_FRAMES: int = 120
 
 # A provider call for one prepared media segment: (segment, hints, duration) ->
 # clip-relative ClipPlan. Both passes use this; only the hints differ.
@@ -111,11 +112,11 @@ AnalyzeFn = Callable[[Path, AnalysisHints, float], Awaitable[ClipPlan]]
 
 
 class SupportsVideoAnalysis(Protocol):
-    """Structural type for a provider with both video and stills analysis.
+    """Structural type for a provider with both video and contact-sheet analysis.
 
     The coarse pass uses ``analyze_video_clip`` (video payload); the two-pass
-    fine pass uses ``analyze`` (dense labelled stills). A single openrouter
-    provider implements both, so the video route requires both methods.
+    fine pass uses ``analyze_contact_sheets`` (timestamped frame grids). A single
+    openrouter provider implements both, so the video route requires both.
     """
 
     async def analyze_video_clip(
@@ -128,13 +129,14 @@ class SupportsVideoAnalysis(Protocol):
         timeout_sec: int = 300,
     ) -> ClipPlan: ...
 
-    async def analyze(
+    async def analyze_contact_sheets(
         self,
-        keyframes: list[Keyframe],
+        sheets: list[Path],
         hints: AnalysisHints,
         *,
         video_id: str,
         duration_sec: float,
+        frame_times: list[float],
         timeout_sec: int = 300,
     ) -> ClipPlan: ...
 
@@ -181,22 +183,25 @@ async def analyze_video(
             segment, h, video_id=video_id, clip_duration_sec=dur
         )
 
-    async def _fine_frames(segment: Path, h: AnalysisHints, dur: float) -> ClipPlan:
-        # Sample the candidate window densely (2 FPS target) and hand the model the
-        # frames + their (clip-relative) timestamps via the stills path, NOT a
-        # video clip the model would re-sample to ~1fps. The frame count is capped
-        # (_FINE_FRAME_MAX_FRAMES): if 2 FPS would exceed it, widen the interval so
-        # the payload stays small and the model never gets an empty-body overload.
-        # Frames are written next to the candidate segment in the run's scratch
-        # dir. ``provider.analyze`` returns clip-relative timestamps, which
-        # ``_run_two_pass`` re-bases to absolute source time.
+    async def _fine_sheets(segment: Path, h: AnalysisHints, dur: float) -> ClipPlan:
+        # Render the candidate window as timestamped contact sheet(s) at ~2 FPS
+        # and hand the model the grid image(s), NOT a video clip it would
+        # re-sample to ~1fps. The frame count is capped (_FINE_FRAME_MAX_FRAMES):
+        # if 2 FPS would exceed it, widen the interval (lower fps) so the sheet
+        # count and cost stay bounded. The burned-in timestamps are clip-relative;
+        # ``_run_two_pass`` re-bases the returned boundaries to absolute time.
         interval = max(_FINE_FRAME_INTERVAL_SEC, dur / _FINE_FRAME_MAX_FRAMES)
-        specs = sample_uniform(dur, interval_sec=interval)
-        frames_dir = segment.parent / f"{segment.stem}_frames"
-        keyframes = extract_keyframes(
-            segment, specs, frames_dir, long_edge_px=_FINE_FRAME_LONG_EDGE_PX
+        fps = 1.0 / interval
+        n_frames = max(1, int(dur / interval))
+        # Each cell shows its 0-based index; the model looks the index up in this
+        # map for the EXACT clip-relative time. The fps filter emits frame i at
+        # i/fps seconds, so index i -> i*interval.
+        frame_times = [i * interval for i in range(n_frames)]
+        sheets_dir = segment.parent / f"{segment.stem}_sheets"
+        sheets = build_contact_sheets(segment, sheets_dir, fps=fps, cell_px=_FINE_CELL_PX)
+        return await provider.analyze_contact_sheets(
+            sheets, h, video_id=video_id, duration_sec=dur, frame_times=frame_times
         )
-        return await provider.analyze(keyframes, h, video_id=video_id, duration_sec=dur)
 
     return await _run(
         src,
@@ -211,7 +216,7 @@ async def analyze_video(
         prepare=lambda s, scratch: compress_for_vlm(s, scratch / "compressed.mp4"),
         segment_suffix=".mp4",
         analyze=_analyze,
-        fine_analyze=_fine_frames,
+        fine_analyze=_fine_sheets,
         fine_pad_sec=_FINE_FRAME_PAD_SEC,
         kind="video",
         two_pass=two_pass,

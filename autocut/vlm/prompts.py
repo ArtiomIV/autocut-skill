@@ -19,6 +19,21 @@ from typing import Final
 from autocut.models import AnalysisHints, ClipPlan, PromptTemplateId
 from autocut.video.frame_sampler import FrameSpec
 
+# v12 (2026-06-02): contact-sheet E2E review. (a) HIGHLIGHTS+COARSE: slow-motion
+# REPLAYS are key highlights and must be located (coarse) and kept (fine) — the
+# model was never told, so it dropped every replay as draggy aftermath. (b)
+# HIGHLIGHTS: anti-fabrication — report ONLY visible action; a ring entrance /
+# walk-in / posing is NOT a knockdown (the model invented a KO from Efe's ring
+# entrance at 0:29). (c) HIGHLIGHTS: explicit SCORING rubric — the score must
+# track how spectacular the moment is (extraordinary events KO/goal and their
+# slow-mo replays = 9-10, density of spectacular landed strikes raises the score,
+# reserve 10 for the peak); the model had been flattening everything to 7-8.
+# (d) HIGHLIGHTS+COARSE: a knockdown/KO must ALWAYS be captured (coarse flags it
+# high so it survives the top-12 candidate cap; fine never omits it) + a NEGATIVE
+# list (no-action / no clean strike landing / clinch / circling = OMIT) — KO1 was
+# being dropped while low-action exchanges were kept.
+# Pairs with the fine pad widened to ±20s so the replay that follows the live
+# action falls inside the candidate window.
 # v11 (2026-06-01): two fixes from E2E v10 frame review. (a) CORE: tell the model its
 # view is low-frame-rate so a fast impact lands 2-5s BEFORE the frame where its effect
 # shows -> set start 3-5s earlier (the real KO punch at 5:30 was missed, clip opened on
@@ -58,7 +73,7 @@ from autocut.video.frame_sampler import FrameSpec
 # v2 (2026-05-28): reworked sport/talk clip-boundary guidance so the model
 # includes the wind-up and follow-through of the key moment instead of cutting
 # tight on the impact. The detection prompt is unchanged, hence its own version.
-PROMPT_VERSION: Final[str] = "v11"
+PROMPT_VERSION: Final[str] = "v12"
 DETECTION_PROMPT_VERSION: Final[str] = "v1"
 
 
@@ -144,21 +159,60 @@ Content guidance — highlights (the best, viral-worthy moments; any content):
   action surges, an official intervenes. Stay selective even so — this is NOT
   every exchange, throw or routine action, only the moments where the intensity
   clearly PEAKS.
+- ABSOLUTE RULE: a KNOCKDOWN or KNOCKOUT is ALWAYS a highlight. Capture it EVERY
+  single time it occurs, score it 9-10, and NEVER omit one for any reason — it is
+  the most important moment in the whole video.
+- NEGATIVE — these are NOT highlights, OMIT them (do not emit a clip, score low):
+  - dead time with no real action: fighters circling, feeling each other out,
+    footwork with no exchange, an empty or near-empty ring, idle waiting.
+  - clinching, holding, or leaning with no punches landing; resting on the ropes.
+  - an "exchange" where no clean strike actually LANDS — thrown-and-missed or
+    blocked punches with no impact are not a highlight on their own.
+  - walking, repositioning between flurries, posing, talking to the referee.
+  If no clean strike LANDS and nothing decisive happens in the window, there is NO
+  highlight here — return empty rather than emit a low-action clip.
 - Pre-action and ceremony are NOT highlights, no matter how well produced.
   Entrances and walk-ins, introductions and line-ups, anthems, warm-ups, the
   coin toss or staredown, interviews, podium and award moments, and idle waiting
   set the scene but do NOT stand on their own in a feed. Score them low and OMIT
   them even when the lighting, crowd, or production looks dramatic — dramatic
   staging is not the same as a dramatic action.
+- Report ONLY what you can actually see happening across the frames. Do NOT
+  fabricate or infer an event that is not visible: a fighter walking to the ring,
+  posing, gloves-up, or standing around is an ENTRANCE or dead time, NOT a strike
+  or a knockdown — no matter what might happen later. If the frames do not clearly
+  SHOW the action, OMIT the segment rather than invent one to justify a clip.
+- Slow-motion REPLAYS are highlights, not filler — KEEP them. Broadcasts replay a
+  key action (a knockdown, a goal, a big hit) in slow motion, often right after
+  the live action or after the referee's count; that replay is among the most
+  valuable, viral-ready footage. Include the slow-motion replay — extend the clip
+  through it, or emit it as its own clip. This is the ONE case where running well
+  past the live action and its immediate aftermath is CORRECT, not dragging.
 - Breaks IN the action are not highlights either: the round-ending bell and the
   rest between rounds, timeouts, stoppages, substitutions, restarts, and the
   lull while an official separates or resets the competitors. Do NOT anchor a
   clip on the round-ending buzzer, and do NOT extend a clip into the break that
-  follows — end it on the last live action.
+  follows — end it on the last live action (a slow-motion replay of the action is
+  NOT a break — keep it, per the rule above).
 - Confirm before scoring high. A single ambiguous frame (a blur that might be a
   strike, a face that might be reacting) is often nothing — a feint, a study
   phase, a transition. Score >= 7 ONLY when the moment is clearly readable
   across the frames, not on one lucky still.
+- SCORING — the score MUST track how spectacular the moment is, so the best clips
+  rank first. Do NOT flatten everything to 7-8; spread the scores and let the
+  peaks stand out:
+  - 9-10: an EXTRAORDINARY, decisive event — a knockdown / knockout, a scored
+    goal, a fight- or match-ending finish, a truly spectacular highlight-reel
+    beat. A slow-motion REPLAY of such a key action ALSO scores 9-10 — the replay
+    is the clou moment, give it one of the highest scores.
+  - 7-8: a strong moment without a definitive outcome — a near-KO or staggering
+    blow, a heated sustained exchange, a dangerous attack, a clear momentum swing.
+  - The MORE spectacular clean strikes (or big plays) packed into one segment, the
+    HIGHER the score: a sustained flurry of heavy LANDED blows outranks a single
+    ordinary exchange. Density of real impact raises the score.
+  - Reserve 10 for the single most spectacular moment(s) of the whole video (the
+    KO / decisive finish and its slow-motion replay). If you see such an event,
+    it MUST get the top score — never rate it the same as an ordinary exchange.
 - Cut tight WHEN YOU CAN SEE THE EVENT. Start ~1-2 seconds before the decisive
   beat — and the decisive beat is the EVENT ITSELF (the landing punch, the goal),
   NOT its aftermath; when you can see only the aftermath, the ANCHOR-ON-THE-EVENT
@@ -232,6 +286,13 @@ Hard rules:
   context on both sides — the next pass trims it.
 - It is BETTER to include a borderline region than to miss it. Do NOT be
   conservative here: over-inclusion is corrected downstream, a miss is permanent.
+- A KNOCKDOWN, KNOCKOUT or any decisive fight-/match-ending action is the single
+  MOST important thing to catch. ALWAYS flag it with a HIGH score, wherever it
+  occurs in the footage — a knockdown must NEVER be missed by this pass.
+- Slow-motion REPLAYS count as worth keeping. When a key action is replayed in
+  slow motion (often just after the live action or after a referee's count), flag
+  that replay too — either extend the region to cover the live action AND its
+  replay, or add a separate region for the replay. Do NOT skip replays.
 - Regions must NOT overlap; if two moments are adjacent, return ONE region that
   covers both.
 - ``start`` and ``end`` use the ``HH:MM:SS.mmm`` format, RELATIVE to this clip
@@ -303,6 +364,44 @@ goal = {goal}, clip duration = {duration_sec:.2f}s.
 You are watching the full video clip provided. Identify the segments worth
 keeping as standalone highlight clips. Report each ``start``/``end`` RELATIVE
 to THIS clip, where 00:00:00.000 is the first frame you see.
+
+Return JSON matching this schema (do not output the schema itself, output
+your analysis):
+{schema}
+
+Fill ``video_id`` with {video_id!r} and ``duration_sec`` with {duration_sec}.
+Leave ``metadata`` as an empty object — provenance fields (provider, model,
+prompt version, timing) are filled in by the caller.
+"""
+
+
+# Used by the two-pass fine pass on the contact-sheet path: the candidate window
+# is rendered as one or more grids of small frames, each frame labelled with its
+# own timestamp burned in. The model reads boundaries straight off the labels.
+_CONTACT_SHEET_USER_TEMPLATE: Final[str] = """\
+Video metadata: content type = {content_hint}, language = {language},
+goal = {goal}, clip duration = {duration_sec:.2f}s.
+
+You are given {n_sheets} contact-sheet image(s). Each sheet is a GRID of frames
+sampled from THIS video clip at about 2 frames per second, in chronological
+reading order: left to right, then top to bottom. The frame INDEX is CONTINUOUS
+across sheets — the first sheet holds the lowest indices and each following sheet
+continues immediately after the previous one — so all the sheets together form
+ONE uninterrupted timeline of the same clip (an action may run across the seam
+between two sheets).
+
+Every frame has a short INTEGER INDEX printed in its TOP-LEFT corner (yellow
+number). To get a frame's exact time, look its index up in this map (index ->
+clip-relative ``HH:MM:SS.mmm``, where index 0 is 00:00:00.000):
+{index_map}
+
+Find the frame where an action starts/ends, read its corner index, and use the
+mapped time as the boundary — do NOT estimate times by counting cells. Compare
+consecutive cells to pin a fast event to the exact frame, then set ``start`` a
+beat before it.
+
+Identify the segments worth keeping as standalone highlight clips and report each
+``start``/``end`` using those mapped, clip-relative timestamps.
 
 Return JSON matching this schema (do not output the schema itself, output
 your analysis):
@@ -658,6 +757,37 @@ def build_video_user_prompt(
         language=hints.language,
         goal=hints.goal,
         duration_sec=duration_sec,
+        schema=clip_plan_schema(),
+        video_id=video_id,
+    )
+
+
+def build_contact_sheet_user_prompt(
+    *,
+    video_id: str,
+    duration_sec: float,
+    hints: AnalysisHints,
+    n_sheets: int,
+    frame_times: list[float],
+) -> str:
+    """User message for the contact-sheet fine pass (grids of indexed frames).
+
+    Each cell shows a 0-based integer index; ``frame_times[i]`` is that frame's
+    exact clip-relative time in seconds. The map is rendered as ``index ->
+    HH:MM:SS.mmm`` so the model reads a cell's index and looks up the precise
+    boundary time (no decimals to OCR, no cell-counting). The engine re-bases the
+    returned timestamps to absolute source time, like the other fine-pass payloads.
+    """
+    index_map = "\n".join(
+        f"  {i} -> {format_timestamp(timedelta(seconds=t))}" for i, t in enumerate(frame_times)
+    )
+    return _CONTACT_SHEET_USER_TEMPLATE.format(
+        content_hint=hints.content_hint.value,
+        language=hints.language,
+        goal=hints.goal,
+        duration_sec=duration_sec,
+        n_sheets=n_sheets,
+        index_map=index_map,
         schema=clip_plan_schema(),
         video_id=video_id,
     )

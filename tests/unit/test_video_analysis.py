@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from autocut import video_analysis
-from autocut.models import AnalysisHints, Clip, ClipPlan, ClipPlanMetadata, Keyframe
+from autocut.models import AnalysisHints, Clip, ClipPlan, ClipPlanMetadata
 from autocut.video_analysis import VideoAnalysisError, analyze_video
 
 
@@ -61,15 +61,11 @@ def _stub_ffmpeg(monkeypatch: pytest.MonkeyPatch) -> None:
         video_analysis, "cut_clip", lambda video, request, **kw: request.output_path
     )
 
-    def _fake_extract(video: Path, specs: list, out_dir: Path, **kw: object) -> list[Keyframe]:
-        # Mirror the requested specs as Keyframe records without touching ffmpeg,
-        # so the fine-frames pass yields one keyframe per sampled timestamp.
-        return [
-            Keyframe(scene_index=None, timestamp=s.timestamp, path=Path(out_dir) / f"f{i}.jpg")
-            for i, s in enumerate(specs)
-        ]
+    def _fake_sheets(segment: Path, out_dir: Path, **kw: object) -> list[Path]:
+        # Pretend ffmpeg rendered one contact sheet without touching ffmpeg.
+        return [Path(out_dir) / "sheet_001.jpg"]
 
-    monkeypatch.setattr(video_analysis, "extract_keyframes", _fake_extract)
+    monkeypatch.setattr(video_analysis, "build_contact_sheets", _fake_sheets)
 
 
 @pytest.mark.asyncio
@@ -182,7 +178,7 @@ class _CoarseThenFineProvider:
         self.coarse_calls = 0
         self.video_clip_calls = 0
         self.fine_durations: list[float] = []
-        self.fine_keyframe_counts: list[int] = []
+        self.fine_n_frames: list[int] = []
 
     async def analyze_video_clip(
         self,
@@ -225,18 +221,19 @@ class _CoarseThenFineProvider:
         # Single-pass fallback (no two-pass): one neutral clip.
         return _one_clip_plan(video_id, clip_duration_sec)
 
-    async def analyze(
+    async def analyze_contact_sheets(
         self,
-        keyframes: list[Keyframe],
+        sheets: list[Path],
         hints: AnalysisHints,
         *,
         video_id: str,
         duration_sec: float,
+        frame_times: list[float],
         timeout_sec: int = 300,
     ) -> ClipPlan:
-        # The fine pass: dense stills + their timestamps.
+        # The fine pass: indexed contact sheet(s) + index->time map.
         self.fine_durations.append(duration_sec)
-        self.fine_keyframe_counts.append(len(keyframes))
+        self.fine_n_frames.append(len(frame_times))
         return _tight_fine_plan(video_id, duration_sec)
 
 
@@ -257,11 +254,11 @@ async def test_two_pass_locates_then_refines(_stub_ffmpeg: None, tmp_path: Path)
     # One coarse locate call, then one fine call per candidate region (2).
     assert provider.coarse_calls == 1
     assert len(provider.fine_durations) == 2
-    # Final clips are re-based to absolute with the stills fine pad ±10s:
-    # candidate 1 padded start = max(0, 30-10) = 20, plus the fine clip's 5s
-    # relative start -> 25s; candidate 2 -> max(0, 120-10) + 5 = 115s.
+    # Final clips are re-based to absolute with the fine pad ±20s: candidate 1
+    # padded start = max(0, 30-20) = 10, plus the fine clip's 5s relative start
+    # -> 15s; candidate 2 -> max(0, 120-20) + 5 = 105s.
     starts = sorted(c.start.total_seconds() for c in plan.clips)
-    assert starts == [25.0, 115.0]
+    assert starts == [15.0, 105.0]
 
 
 class _CoarseThenEmptyProvider:
@@ -300,13 +297,14 @@ class _CoarseThenEmptyProvider:
             metadata=ClipPlanMetadata(vlm_provider="openrouter", vlm_model="m"),
         )
 
-    async def analyze(
+    async def analyze_contact_sheets(
         self,
-        keyframes: list[Keyframe],
+        sheets: list[Path],
         hints: AnalysisHints,
         *,
         video_id: str,
         duration_sec: float,
+        frame_times: list[float],
         timeout_sec: int = 300,
     ) -> ClipPlan:
         # Fine pass: nothing valid here -> empty.
@@ -373,13 +371,14 @@ class _CoarseThenFlakyProvider:
             metadata=ClipPlanMetadata(vlm_provider="openrouter", vlm_model="m"),
         )
 
-    async def analyze(
+    async def analyze_contact_sheets(
         self,
-        keyframes: list[Keyframe],
+        sheets: list[Path],
         hints: AnalysisHints,
         *,
         video_id: str,
         duration_sec: float,
+        frame_times: list[float],
         timeout_sec: int = 300,
     ) -> ClipPlan:
         self.fine_calls += 1
@@ -497,11 +496,12 @@ async def test_two_pass_skipped_for_short_video(_stub_ffmpeg: None, tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_two_pass_fine_uses_dense_stills_not_video(
+async def test_two_pass_fine_uses_contact_sheets_not_video(
     _stub_ffmpeg: None, tmp_path: Path
 ) -> None:
-    # The fine pass must go through the STILLS path (provider.analyze), NOT a
-    # second video clip, and feed ~2 FPS frames over each padded candidate window.
+    # The fine pass must go through the CONTACT-SHEET path
+    # (provider.analyze_contact_sheets), NOT a second video clip, and cover the
+    # padded candidate window at ~2 FPS.
     provider = _CoarseThenFineProvider()
     hints = AnalysisHints(min_duration_sec=3, max_duration_sec=20)
     await analyze_video(
@@ -514,16 +514,15 @@ async def test_two_pass_fine_uses_dense_stills_not_video(
         work_dir=tmp_path,
         two_pass=True,
     )
-    # Only the coarse locate touched the video payload; both fine passes used stills.
+    # Only the coarse locate touched the video payload; both fine passes used sheets.
     assert provider.video_clip_calls == 1
     assert provider.coarse_calls == 1
     assert len(provider.fine_durations) == 2
-    # Each candidate is a 20s region padded ±10s -> a 40s window. At 2 FPS that
-    # would be 80 frames, over the cap, so the interval widens and the frame count
-    # is clamped to _FINE_FRAME_MAX_FRAMES — the payload never blows up.
-    for n in provider.fine_keyframe_counts:
+    # Each candidate is a 20s region padded ±20s -> a 60s window. At 2 FPS that is
+    # 120 frames (= the cap), so 2 FPS is preserved while the count stays bounded.
+    for n in provider.fine_n_frames:
         assert 0 < n <= video_analysis._FINE_FRAME_MAX_FRAMES
-    assert max(provider.fine_keyframe_counts) == video_analysis._FINE_FRAME_MAX_FRAMES
+    assert max(provider.fine_n_frames) == video_analysis._FINE_FRAME_MAX_FRAMES
 
 
 class _ShortCoarseFineProvider:
@@ -532,7 +531,7 @@ class _ShortCoarseFineProvider:
     def __init__(self) -> None:
         self.coarse_calls = 0
         self.fine_calls = 0
-        self.fine_keyframe_counts: list[int] = []
+        self.fine_n_frames: list[int] = []
 
     async def analyze_video_clip(
         self,
@@ -561,17 +560,18 @@ class _ShortCoarseFineProvider:
             metadata=ClipPlanMetadata(vlm_provider="openrouter", vlm_model="m"),
         )
 
-    async def analyze(
+    async def analyze_contact_sheets(
         self,
-        keyframes: list[Keyframe],
+        sheets: list[Path],
         hints: AnalysisHints,
         *,
         video_id: str,
         duration_sec: float,
+        frame_times: list[float],
         timeout_sec: int = 300,
     ) -> ClipPlan:
         self.fine_calls += 1
-        self.fine_keyframe_counts.append(len(keyframes))
+        self.fine_n_frames.append(len(frame_times))
         return _tight_fine_plan(video_id, duration_sec)
 
 
@@ -594,8 +594,8 @@ async def test_force_two_pass_runs_on_short_video(_stub_ffmpeg: None, tmp_path: 
     assert provider.coarse_calls == 1
     assert provider.fine_calls == 1
     assert len(plan.clips) >= 1
-    # Small window (3s region padded ±10s -> ~23s) stays under the cap, so it keeps
-    # the full 2 FPS density (interval not widened): ~2 frames per second.
-    (n,) = provider.fine_keyframe_counts
+    # Small window (3s region padded ±20s, clamped to the 40s source -> ~33s)
+    # stays under the cap, so it keeps the full 2 FPS density: ~2 frames per second.
+    (n,) = provider.fine_n_frames
     assert n <= video_analysis._FINE_FRAME_MAX_FRAMES
-    assert n == pytest.approx(23 * 2, abs=2)
+    assert n == pytest.approx(33 * 2, abs=2)

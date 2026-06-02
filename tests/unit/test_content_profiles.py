@@ -80,10 +80,13 @@ def test_hybrid_profile_sits_between_highlights_and_talk() -> None:
     assert HYBRID_PROFILE.prompt_template == "hybrid"
 
 
-def test_all_builtin_profiles_default_to_zero_padding() -> None:
-    # Per user feedback the cutter should produce tight cuts by default.
-    # Profiles ship with 0 padding; the plumbing exists to flip the number later.
-    for profile in (HIGHLIGHTS_PROFILE, TALK_PROFILE, HYBRID_PROFILE):
+def test_profile_padding() -> None:
+    # Highlights pads 3s each side so a knockdown/goal clip shows its lead-in and
+    # its consequences (the model tends to cut right on the event). Talk and hybrid
+    # keep tight cuts (0 padding).
+    assert HIGHLIGHTS_PROFILE.pre_roll_sec == 3.0
+    assert HIGHLIGHTS_PROFILE.post_roll_sec == 3.0
+    for profile in (TALK_PROFILE, HYBRID_PROFILE):
         assert profile.pre_roll_sec == 0.0
         assert profile.post_roll_sec == 0.0
 

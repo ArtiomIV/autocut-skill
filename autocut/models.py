@@ -164,7 +164,7 @@ class ClipPlanMetadata(BaseModel):
 
     vlm_provider: str
     vlm_model: str
-    prompt_version: str = "v11"
+    prompt_version: str = "v12"
     analysis_time_sec: float | None = None
     # Real billed cost reported by the provider (via OpenRouter usage.include),
     # summed across batches. ``None`` when the provider does not report it

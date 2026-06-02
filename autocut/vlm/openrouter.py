@@ -37,6 +37,7 @@ from autocut.vlm.prompts import (
     PROMPT_VERSION,
     build_audio_system_prompt,
     build_audio_user_prompt,
+    build_contact_sheet_user_prompt,
     build_detection_system_prompt,
     build_detection_user_prompt,
     build_system_prompt,
@@ -336,6 +337,75 @@ class OpenRouterProvider(VLMProvider):
             self.model,
             len(plan.clips),
             plan.metadata.analysis_time_sec or 0.0,
+            getattr(plan.metadata, "cost_usd", None),
+        )
+        return plan
+
+    async def analyze_contact_sheets(
+        self,
+        sheets: list[Path],
+        hints: AnalysisHints,
+        *,
+        video_id: str,
+        duration_sec: float,
+        frame_times: list[float],
+        timeout_sec: int = 300,
+    ) -> ClipPlan:
+        """Analyse a candidate window rendered as indexed contact sheets.
+
+        Each sheet is a grid of small frames; each cell shows its 0-based index
+        and ``frame_times[i]`` is that frame's exact clip-relative time. The
+        prompt carries the index->time map, so the model reads a cell index and
+        looks up the precise boundary. Sending one (or a few) images instead of
+        dozens of separate stills keeps the request small and reliable. The
+        returned ``ClipPlan`` carries clip-relative timestamps; the batch engine
+        re-bases them to absolute source time. ``usage.include`` surfaces the real
+        billed cost. Raises ``VLMError`` on failure.
+        """
+        if not sheets:
+            raise VLMError("analyze_contact_sheets called with no sheets")
+
+        system_prompt = build_system_prompt(hints)
+        user_prompt = build_contact_sheet_user_prompt(
+            video_id=video_id,
+            duration_sec=duration_sec,
+            hints=hints,
+            n_sheets=len(sheets),
+            frame_times=frame_times,
+        )
+        content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
+        for sheet in sheets:
+            content.append(
+                {"type": "image_url", "image_url": {"url": _encode_image_to_data_url(sheet)}}
+            )
+        base_messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": content},
+        ]
+
+        def _parse(raw: str, completion: Any, elapsed: float) -> ClipPlan:
+            return _parse_response(
+                raw,
+                provider=self.name,
+                model=self.model,
+                elapsed_sec=elapsed,
+                cost_usd=_usage_cost(completion),
+            )
+
+        plan = await self._complete_and_parse(
+            base_messages=base_messages,
+            parse=_parse,
+            max_tokens=16384,
+            timeout_sec=timeout_sec,
+            label="contact-sheet analyse",
+            extra_body={"usage": {"include": True}},
+        )
+        log.info(
+            "openrouter contact-sheet analyse complete: model=%s sheets=%d frames=%d clips=%d cost=%s",
+            self.model,
+            len(sheets),
+            len(frame_times),
+            len(plan.clips),
             getattr(plan.metadata, "cost_usd", None),
         )
         return plan
