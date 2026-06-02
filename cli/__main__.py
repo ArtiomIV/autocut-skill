@@ -501,31 +501,59 @@ def detect(
 
 @app.command()
 def cut(
-    video: Annotated[Path, typer.Argument(help="Path to the input video file.")],
+    video: Annotated[
+        Path | None,
+        typer.Argument(
+            help="Input video. Optional with --from-json (taken from the plan, "
+            "or overridden here)."
+        ),
+    ] = None,
     start: Annotated[
-        str,
+        str | None,
         typer.Option(
             "--start",
             "-s",
-            help="Start timestamp (HH:MM:SS.mmm or seconds, e.g. '00:02:15.500' or '135.5').",
+            help="Start timestamp (HH:MM:SS.mmm or seconds). Single-segment mode.",
         ),
-    ],
+    ] = None,
     end: Annotated[
-        str,
+        str | None,
         typer.Option(
             "--end",
             "-e",
-            help="End timestamp (HH:MM:SS.mmm or seconds, must be > start).",
+            help="End timestamp (HH:MM:SS.mmm or seconds, must be > start). Single-segment mode.",
         ),
-    ],
+    ] = None,
     output: Annotated[
-        Path,
+        Path | None,
         typer.Option(
             "--output",
             "-o",
-            help="Output MP4 path. Parent directory is created if missing.",
+            help="Output MP4 path (single-segment mode). Parent dir created if missing.",
         ),
-    ],
+    ] = None,
+    from_json: Annotated[
+        Path | None,
+        typer.Option(
+            "--from-json",
+            help="Cut EVERY clip listed in this plan.json (produced by `autocut run`). "
+            "Timestamps already include any pre/post-roll, so the cut is 1:1.",
+        ),
+    ] = None,
+    output_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--output-dir",
+            help="Destination directory for --from-json clips (writes ./separate/*.mp4 + manifest.json).",
+        ),
+    ] = None,
+    min_score: Annotated[
+        int,
+        typer.Option(
+            "--min-score",
+            help="With --from-json, cut only clips whose final_score >= this (0 = all).",
+        ),
+    ] = 0,
     accurate: Annotated[
         bool,
         typer.Option(
@@ -538,16 +566,31 @@ def cut(
         ),
     ] = False,
 ) -> None:
-    """Cut a single segment ``[start, end]`` from VIDEO into OUTPUT via ffmpeg.
+    """Cut clips with ffmpeg. Deterministic, no VLM.
 
-    Deterministic, no VLM. Useful when the timestamps are already known
-    (e.g. from a previous ``autocut run`` manifest, or chosen by the user
-    directly).
+    Two modes:
+    - **--from-json PLAN --output-dir DIR**: cut every clip in a `plan.json` (from
+      `autocut run`), filtered by --min-score. The plan's timestamps already
+      include the pre/post-roll, so this trims 1:1. Handles 0..N clips.
+    - **single segment**: VIDEO --start --end --output — cut one `[start, end]`.
     """
-    # Imported lazily so callers that only use ``autocut keys``/``doctor``
-    # don't pay for video module imports.
+    if from_json is not None:
+        _cut_from_json(
+            from_json,
+            video_override=video,
+            output_dir=output_dir,
+            min_score=min_score,
+            accurate=accurate,
+        )
+        return
+
+    # Single-segment mode.
     from autocut.video import CutRequest, CutterError, cut_clip
 
+    if video is None or start is None or end is None or output is None:
+        raise typer.BadParameter(
+            "single-segment cut needs VIDEO --start --end --output (or use --from-json)"
+        )
     if not video.exists() or not video.is_file():
         err_console.print(f"input video not found: {video}")
         raise typer.Exit(code=1)
@@ -569,6 +612,49 @@ def cut(
         f"[green]OK[/] cut {duration_sec:.3f}s "
         f"({'accurate' if accurate else 'stream-copy'}) → {produced}"
     )
+
+
+def _cut_from_json(
+    plan_path: Path,
+    *,
+    video_override: Path | None,
+    output_dir: Path | None,
+    min_score: int,
+    accurate: bool,
+) -> None:
+    """Cut every clip in a plan.json into ``output_dir`` (reuses the separate writer)."""
+    from autocut.output import PlanReadError, dispatch_outputs, read_plan_json
+
+    if output_dir is None:
+        raise typer.BadParameter("--from-json requires --output-dir")
+    try:
+        plan_video, metadata, ranked = read_plan_json(plan_path, min_score=min_score)
+    except PlanReadError as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    video = (video_override or plan_video).resolve()
+    if not video.is_file():
+        err_console.print(f"input video not found: {video} (override with the VIDEO argument)")
+        raise typer.Exit(code=1)
+    if not ranked:
+        console.print(f"[yellow]no clips with final_score >= {min_score}; nothing to cut.[/]")
+        return
+
+    result = dispatch_outputs(
+        video,
+        ranked,
+        metadata,
+        output_dir.resolve(),
+        modes=["separate"],
+        accurate=accurate,
+        pre_roll_sec=0.0,  # the roll is already baked into the plan's timestamps
+        post_roll_sec=0.0,
+    )
+    n_written = sum(len(w) for w in result.by_mode.values())
+    console.print(f"[green]OK[/] cut {n_written} clip(s) → {output_dir.resolve()}")
+    if result.manifest_path:
+        console.print(f"[bold]Manifest[/]: {result.manifest_path}")
 
 
 @app.command()
@@ -1121,17 +1207,16 @@ def _render_analysis_summary(result: AnalysisResult) -> None:
         )
     console.print(table)
 
-    if result.dispatch:
-        console.print("\n[bold]Outputs written[/]:")
-        for mode, written in result.dispatch.by_mode.items():
-            console.print(f"  [cyan]{mode}[/]: {len(written)} file(s)")
-            for w in written:
-                console.print(f"    - {w.path}")
-        if result.dispatch.manifest_path:
-            console.print(f"\n[bold]Manifest[/]: {result.dispatch.manifest_path}")
+    if result.plan_path:
+        console.print(f"\n[bold]Plan[/]: {result.plan_path}")
+        console.print(
+            "[dim]Review/edit the plan, then cut the clips with:[/]\n"
+            f"  autocut cut --from-json {result.plan_path} "
+            f"--video {result.metadata.path} --output-dir <DIR>"
+        )
     else:
         console.print(
-            "\n[dim]Dry run — no files were written. Re-run without --dry-run to produce clips.[/]"
+            "\n[dim]Dry run — no plan written. Re-run without --dry-run to produce plan.json.[/]"
         )
 
     console.print(

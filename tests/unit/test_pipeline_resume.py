@@ -185,7 +185,7 @@ def test_complete_from_plan_ranks_without_writing_when_write_outputs_false(
     assert len(result.ranked) == 2
     # Highest final_score first.
     assert result.ranked[0].clip.id == "c2"
-    assert result.dispatch is None  # write_outputs=False -> no dispatch
+    assert result.plan_path is None  # write_outputs=False -> no plan
     assert result.plan.clips == _plan().clips
 
 
@@ -336,4 +336,4 @@ def test_highlights_profile_allows_empty_output(tmp_path: Path) -> None:
         profile=HIGHLIGHTS_PROFILE,
     )
     assert result.ranked == []
-    assert result.dispatch is None  # nothing cleared the bar -> no files written
+    assert result.plan_path is None  # nothing cleared the bar -> no plan written

@@ -241,4 +241,4 @@ async def test_free_provider_skips_cost_cap(
         write_outputs=False,
     )
     assert provider.analyze_called is True
-    assert result.dispatch is None  # write_outputs=False
+    assert result.plan_path is None  # write_outputs=False

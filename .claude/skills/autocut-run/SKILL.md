@@ -9,10 +9,16 @@ description: >-
 
 # autocut run
 
-`autocut run` analyses a video with a VLM and produces highlight clips in
-`./CLIPS/` (one MP4 per kept clip + a `manifest.json`). YOU, the orchestrating
-agent, pick the editing MODE and (optionally) a query up front — `run` itself
-does no content classification.
+`autocut run` analyses a video with a VLM and writes a **`plan.json`** (the ranked
+clips with their timestamps — pre/post-roll already baked in per the mode). It does
+**NOT** cut any MP4. YOU, the orchestrating agent, then review/edit `plan.json` and
+produce the clips deterministically with **`autocut cut --from-json plan.json
+--video VIDEO --output-dir DIR`** (optionally `--min-score N`). `run` itself does no
+content classification — you pick the editing MODE / query up front.
+
+Workflow: `run` → review/edit `plan.json` → `cut --from-json` → (optional) `merge
+--from-manifest`. Splitting analysis from cutting lets you adjust a boundary or drop
+a clip before committing to MP4s.
 
 ```
 autocut run VIDEO [--content-hint MODE] [--query "<moment>"] \
@@ -59,19 +65,27 @@ Rules of thumb:
 
 - `--vlm openrouter` (default if configured): sends the compressed video (or
   audio for talk) to the model; fully automatic, costs money (cost cap applies).
+  Writes `plan.json` when done — then cut it with `autocut cut --from-json`.
 - `--vlm host`: AutoCut writes `VLM_REQUEST.md` and pauses; YOU read it, write
-  `VLM_RESPONSE.json`, then run `autocut resume --work-dir DIR`. Add
-  `--host-video` only if you can actually watch a video file.
+  `VLM_RESPONSE.json`, then run `autocut resume --work-dir DIR` (which writes
+  `plan.json`). Then cut with `autocut cut --from-json`.
 
 ## Examples
 
 ```bash
-# Auto-highlights of a sparring video (may return nothing if it's all warm-up)
+# 1) Analyse (writes ./CLIPS/plan.json, no MP4s)
 autocut run match.mp4 --content-hint highlights
 
-# Find and cut one specific moment
-autocut run interview.mp4 --query "when the guest reveals why he quit"
+# 2) Review/edit ./CLIPS/plan.json if needed, then cut every clip
+autocut cut --from-json ./CLIPS/plan.json --video match.mp4 --output-dir ./CLIPS
 
-# Conservative pass on an unknown clip, no files written (inspect first)
+# 3) (optional) compose a reel from the cut clips
+autocut merge --from-manifest ./CLIPS/manifest.json --min-score 8 -o reel.mp4
+
+# Find one specific moment, then cut only the strong matches
+autocut run interview.mp4 --query "when the guest reveals why he quit"
+autocut cut --from-json ./CLIPS/plan.json --video interview.mp4 --output-dir ./CLIPS --min-score 7
+
+# Analysis only, inspect the plan first (no plan written on a dry run)
 autocut run mystery.mp4 --content-hint hybrid --dry-run
 ```

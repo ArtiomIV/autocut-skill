@@ -38,7 +38,7 @@ from autocut.models import (
     Keyframe,
     VideoMetadata,
 )
-from autocut.output import DispatchResult, dispatch_outputs
+from autocut.output import write_plan_json
 from autocut.scoring import RankedClip, rank_clips
 from autocut.video import (
     build_sampler,
@@ -143,7 +143,9 @@ class AnalysisResult:
     keyframes: list[Keyframe]
     plan: ClipPlan
     ranked: list[RankedClip]
-    dispatch: DispatchResult | None
+    # ``run`` no longer cuts: it writes plan.json (ranked clips with pre/post-roll
+    # baked into the timestamps) and the agent then calls ``cut --from-json``.
+    plan_path: Path | None
 
 
 async def run_analysis(
@@ -631,22 +633,24 @@ def complete_from_plan(
     ranked = rank_clips(plan, scoring)
     log.info("pipeline: %d clip(s) survived ranking (min_score=%d)", len(ranked), scoring.min_score)
 
+    # ``run`` is analysis-only now: it writes plan.json with the pre/post-roll
+    # (chosen by the active profile/hint) baked into the timestamps, and does NOT
+    # cut any MP4. The orchestrating agent reviews/edits the plan, then calls
+    # ``cut --from-json`` to trim the clips 1:1 (no further padding). ``accurate_cuts``
+    # is accepted for signature compatibility but unused here (cutting moved out).
     pre_roll = profile.pre_roll_sec if profile else 0.0
     post_roll = profile.post_roll_sec if profile else 0.0
 
-    dispatch: DispatchResult | None = None
+    plan_path: Path | None = None
     if write_outputs and ranked:
-        dispatch = dispatch_outputs(
-            video,
-            ranked,
-            metadata,
-            output_root,
-            modes=config.output.modes,
-            merge_order=config.output.merge_order,
-            accurate=accurate_cuts,
+        plan_path = write_plan_json(
+            output_dir=output_root,
+            video_path=video,
+            metadata=metadata,
+            ranked=ranked,
             pre_roll_sec=pre_roll,
             post_roll_sec=post_roll,
-            extra_manifest={
+            extra={
                 "vlm": {
                     "provider": plan.metadata.vlm_provider,
                     "model": plan.metadata.vlm_model,
@@ -667,7 +671,7 @@ def complete_from_plan(
         keyframes=keyframes or [],
         plan=plan,
         ranked=ranked,
-        dispatch=dispatch,
+        plan_path=plan_path,
     )
 
 
