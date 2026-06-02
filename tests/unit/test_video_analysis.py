@@ -257,11 +257,11 @@ async def test_two_pass_locates_then_refines(_stub_ffmpeg: None, tmp_path: Path)
     # One coarse locate call, then one fine call per candidate region (2).
     assert provider.coarse_calls == 1
     assert len(provider.fine_durations) == 2
-    # Final clips are re-based to absolute with ±20s padding: candidate 1 padded
-    # start = max(0, 30-20) = 10, plus the fine clip's 5s relative start -> 15s;
-    # candidate 2 -> max(0, 120-20) + 5 = 105s.
+    # Final clips are re-based to absolute with the stills fine pad ±10s:
+    # candidate 1 padded start = max(0, 30-10) = 20, plus the fine clip's 5s
+    # relative start -> 25s; candidate 2 -> max(0, 120-10) + 5 = 115s.
     starts = sorted(c.start.total_seconds() for c in plan.clips)
-    assert starts == [15.0, 105.0]
+    assert starts == [25.0, 115.0]
 
 
 class _CoarseThenEmptyProvider:
@@ -518,10 +518,12 @@ async def test_two_pass_fine_uses_dense_stills_not_video(
     assert provider.video_clip_calls == 1
     assert provider.coarse_calls == 1
     assert len(provider.fine_durations) == 2
-    # Each candidate is a 20s region padded ±20s -> a 60s window sampled at 0.5s
-    # -> ~120 frames (2 FPS). Allow a small off-by-edge tolerance.
-    for n, dur in zip(provider.fine_keyframe_counts, provider.fine_durations, strict=True):
-        assert n == pytest.approx(dur * 2, abs=2)
+    # Each candidate is a 20s region padded ±10s -> a 40s window. At 2 FPS that
+    # would be 80 frames, over the cap, so the interval widens and the frame count
+    # is clamped to _FINE_FRAME_MAX_FRAMES — the payload never blows up.
+    for n in provider.fine_keyframe_counts:
+        assert 0 < n <= video_analysis._FINE_FRAME_MAX_FRAMES
+    assert max(provider.fine_keyframe_counts) == video_analysis._FINE_FRAME_MAX_FRAMES
 
 
 class _ShortCoarseFineProvider:
@@ -530,6 +532,7 @@ class _ShortCoarseFineProvider:
     def __init__(self) -> None:
         self.coarse_calls = 0
         self.fine_calls = 0
+        self.fine_keyframe_counts: list[int] = []
 
     async def analyze_video_clip(
         self,
@@ -548,7 +551,7 @@ class _ShortCoarseFineProvider:
                 Clip(
                     id="r1",
                     start=timedelta(seconds=10),
-                    end=timedelta(seconds=25),
+                    end=timedelta(seconds=13),
                     category="highlight",
                     description="region 1",
                     score=8,
@@ -568,6 +571,7 @@ class _ShortCoarseFineProvider:
         timeout_sec: int = 300,
     ) -> ClipPlan:
         self.fine_calls += 1
+        self.fine_keyframe_counts.append(len(keyframes))
         return _tight_fine_plan(video_id, duration_sec)
 
 
@@ -590,3 +594,8 @@ async def test_force_two_pass_runs_on_short_video(_stub_ffmpeg: None, tmp_path: 
     assert provider.coarse_calls == 1
     assert provider.fine_calls == 1
     assert len(plan.clips) >= 1
+    # Small window (3s region padded ±10s -> ~23s) stays under the cap, so it keeps
+    # the full 2 FPS density (interval not widened): ~2 frames per second.
+    (n,) = provider.fine_keyframe_counts
+    assert n <= video_analysis._FINE_FRAME_MAX_FRAMES
+    assert n == pytest.approx(23 * 2, abs=2)

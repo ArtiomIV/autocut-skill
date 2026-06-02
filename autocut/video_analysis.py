@@ -93,8 +93,17 @@ _TWO_PASS_COST_FACTOR: float = 2.0
 # resolution AND carry exact timestamps in the prompt, so boundaries land ~±0.5s.
 # Small/downscaled frames keep the token cost low — for BOUNDARY detection we need
 # temporal density, not spatial resolution.
-_FINE_FRAME_INTERVAL_SEC: float = 0.5  # 2 FPS dense sampling of the candidate window
+_FINE_FRAME_INTERVAL_SEC: float = 0.5  # 2 FPS target sampling of the candidate window
 _FINE_FRAME_LONG_EDGE_PX: int = 256  # tiny frames: many cheap stills beat few big ones
+# Tighter padding for the stills fine pass than the classic ±20s video fine pass:
+# a smaller window keeps the frame count (and so the payload + cost) bounded.
+_FINE_FRAME_PAD_SEC: float = 10.0
+# HARD CAP on frames per candidate. An E2E showed ~120 frames (±20s window @2fps)
+# made the payload so large that the model returned an empty body and the retries
+# re-sent all the frames — a cost sink. ~67 stills were historically fine, so we
+# cap at 48: if 2 FPS over the window would exceed it, we widen the interval (drop
+# below 2 FPS) so the payload always stays in the proven-safe range.
+_FINE_FRAME_MAX_FRAMES: int = 48
 
 # A provider call for one prepared media segment: (segment, hints, duration) ->
 # clip-relative ClipPlan. Both passes use this; only the hints differ.
@@ -173,12 +182,16 @@ async def analyze_video(
         )
 
     async def _fine_frames(segment: Path, h: AnalysisHints, dur: float) -> ClipPlan:
-        # Sample the candidate window at 2 FPS and hand the model the frames +
-        # their (clip-relative) timestamps via the stills path, NOT a video clip
-        # the model would re-sample to ~1fps. Frames are written next to the
-        # candidate segment inside the run's scratch dir. ``provider.analyze``
-        # returns clip-relative timestamps, which ``_run_two_pass`` re-bases.
-        specs = sample_uniform(dur, interval_sec=_FINE_FRAME_INTERVAL_SEC)
+        # Sample the candidate window densely (2 FPS target) and hand the model the
+        # frames + their (clip-relative) timestamps via the stills path, NOT a
+        # video clip the model would re-sample to ~1fps. The frame count is capped
+        # (_FINE_FRAME_MAX_FRAMES): if 2 FPS would exceed it, widen the interval so
+        # the payload stays small and the model never gets an empty-body overload.
+        # Frames are written next to the candidate segment in the run's scratch
+        # dir. ``provider.analyze`` returns clip-relative timestamps, which
+        # ``_run_two_pass`` re-bases to absolute source time.
+        interval = max(_FINE_FRAME_INTERVAL_SEC, dur / _FINE_FRAME_MAX_FRAMES)
+        specs = sample_uniform(dur, interval_sec=interval)
         frames_dir = segment.parent / f"{segment.stem}_frames"
         keyframes = extract_keyframes(
             segment, specs, frames_dir, long_edge_px=_FINE_FRAME_LONG_EDGE_PX
@@ -199,6 +212,7 @@ async def analyze_video(
         segment_suffix=".mp4",
         analyze=_analyze,
         fine_analyze=_fine_frames,
+        fine_pad_sec=_FINE_FRAME_PAD_SEC,
         kind="video",
         two_pass=two_pass,
         force_two_pass=force_two_pass,
@@ -273,6 +287,7 @@ async def _run(
     two_pass: bool,
     force_two_pass: bool = False,
     fine_analyze: AnalyzeFn | None = None,
+    fine_pad_sec: float = _TWO_PASS_PAD_SEC,
 ) -> ClipPlan:
     """Dispatch to the two-pass pipeline (long source or forced) or single pass.
 
@@ -297,6 +312,7 @@ async def _run(
             segment_suffix=segment_suffix,
             analyze=analyze,
             fine_analyze=fine_analyze,
+            fine_pad_sec=fine_pad_sec,
             kind=kind,
         )
     return await _run_batched(
@@ -432,6 +448,7 @@ async def _run_two_pass(
     analyze: AnalyzeFn,
     kind: str,
     fine_analyze: AnalyzeFn | None = None,
+    fine_pad_sec: float = _TWO_PASS_PAD_SEC,
 ) -> ClipPlan:
     """Coarse locate (high recall) → per-candidate fine analyse (tight cut).
 
@@ -483,8 +500,8 @@ async def _run_two_pass(
         fine_plans: list[ClipPlan] = []
         fine_chunks: list[Chunk] = []
         for i, cand in enumerate(candidates):
-            lo = max(0.0, cand.start.total_seconds() - _TWO_PASS_PAD_SEC)
-            hi = min(duration_sec, cand.end.total_seconds() + _TWO_PASS_PAD_SEC)
+            lo = max(0.0, cand.start.total_seconds() - fine_pad_sec)
+            hi = min(duration_sec, cand.end.total_seconds() + fine_pad_sec)
             if hi - lo <= 0:
                 continue
             segment = scratch / f"cand_{i:03d}{segment_suffix}"
