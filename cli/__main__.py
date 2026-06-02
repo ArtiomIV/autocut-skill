@@ -231,6 +231,18 @@ def run(
             ),
         ),
     ] = True,
+    force_two_pass: Annotated[
+        bool,
+        typer.Option(
+            "--force-two-pass",
+            help=(
+                "Run the two-pass coarse→fine refinement even on short (<=60s) "
+                "openrouter video/audio sources, lifting the >60s gate. Implies "
+                "--two-pass. Useful to get tight, frame-accurate boundaries on a "
+                "short clip on demand. No effect on host/keyframe routes."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Run the analysis pipeline on a video and produce the highlight clips."""
     if not video.exists() or not video.is_file():
@@ -284,7 +296,8 @@ def run(
                 write_outputs=not dry_run,
                 accurate_cuts=accurate,
                 confirm_cost=_make_cost_confirm(yes=yes),
-                two_pass=two_pass,
+                two_pass=two_pass or force_two_pass,
+                force_two_pass=force_two_pass,
             )
         )
     except HostAgentPauseRequested as pause:

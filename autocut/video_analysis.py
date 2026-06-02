@@ -34,10 +34,12 @@ from pathlib import Path
 from typing import Protocol
 
 from autocut.chunking import Chunk, merge_plans, split_into_chunks
-from autocut.models import AnalysisHints, ClipPlan
+from autocut.models import AnalysisHints, ClipPlan, Keyframe
 from autocut.video.audio_extract import extract_audio_for_vlm
 from autocut.video.compress import compress_for_vlm
 from autocut.video.cutter import CutRequest, cut_clip
+from autocut.video.frame_sampler import sample_uniform
+from autocut.video.keyframes import extract_keyframes
 
 log = logging.getLogger(__name__)
 
@@ -82,13 +84,30 @@ _COARSE_MAX_DURATION_SEC: float = 60.0
 # re-analyses the padded candidates (<=~1x more). 2x is a safe upper bound.
 _TWO_PASS_COST_FACTOR: float = 2.0
 
+# Fine pass as DENSE LABELLED STILLS (the dev experiment). The coarse pass keeps
+# ingesting video (cheap, high recall over the whole timeline), but the fine pass
+# samples each candidate window at 2 FPS and sends the frames + their timestamps
+# to the model instead of a video clip. Rationale: the model re-samples a video to
+# ~1fps internally and never sees a sub-second impact, so a KO clip opened on the
+# referee count instead of the punch; explicit 2 FPS stills double the temporal
+# resolution AND carry exact timestamps in the prompt, so boundaries land ~±0.5s.
+# Small/downscaled frames keep the token cost low — for BOUNDARY detection we need
+# temporal density, not spatial resolution.
+_FINE_FRAME_INTERVAL_SEC: float = 0.5  # 2 FPS dense sampling of the candidate window
+_FINE_FRAME_LONG_EDGE_PX: int = 256  # tiny frames: many cheap stills beat few big ones
+
 # A provider call for one prepared media segment: (segment, hints, duration) ->
 # clip-relative ClipPlan. Both passes use this; only the hints differ.
 AnalyzeFn = Callable[[Path, AnalysisHints, float], Awaitable[ClipPlan]]
 
 
 class SupportsVideoAnalysis(Protocol):
-    """Structural type for any provider with ``analyze_video_clip``."""
+    """Structural type for a provider with both video and stills analysis.
+
+    The coarse pass uses ``analyze_video_clip`` (video payload); the two-pass
+    fine pass uses ``analyze`` (dense labelled stills). A single openrouter
+    provider implements both, so the video route requires both methods.
+    """
 
     async def analyze_video_clip(
         self,
@@ -97,6 +116,16 @@ class SupportsVideoAnalysis(Protocol):
         *,
         video_id: str,
         clip_duration_sec: float,
+        timeout_sec: int = 300,
+    ) -> ClipPlan: ...
+
+    async def analyze(
+        self,
+        keyframes: list[Keyframe],
+        hints: AnalysisHints,
+        *,
+        video_id: str,
+        duration_sec: float,
         timeout_sec: int = 300,
     ) -> ClipPlan: ...
 
@@ -126,19 +155,35 @@ async def analyze_video(
     confirm_cost: Callable[[float, float], bool] | None = None,
     work_dir: Path | None = None,
     two_pass: bool = False,
+    force_two_pass: bool = False,
 ) -> ClipPlan:
     """Analyse ``src`` as VIDEO and return a merged, absolute-time ``ClipPlan``.
 
     Compresses the source to analysis grade and sends it (batched at ~5 min when
     long) to ``provider.analyze_video_clip``. With ``two_pass`` and a long source
-    it runs the coarse→fine locate/analyze pipeline instead. See ``_run`` for the
-    cost gate / scratch-dir semantics.
+    (or any source when ``force_two_pass``) it runs the coarse→fine pipeline: the
+    coarse pass locates candidates from the video, the fine pass re-analyses each
+    candidate as DENSE 2-FPS labelled stills (``_fine_frames``) for sub-second
+    boundary precision. See ``_run`` for the cost gate / scratch-dir semantics.
     """
 
     async def _analyze(segment: Path, h: AnalysisHints, dur: float) -> ClipPlan:
         return await provider.analyze_video_clip(
             segment, h, video_id=video_id, clip_duration_sec=dur
         )
+
+    async def _fine_frames(segment: Path, h: AnalysisHints, dur: float) -> ClipPlan:
+        # Sample the candidate window at 2 FPS and hand the model the frames +
+        # their (clip-relative) timestamps via the stills path, NOT a video clip
+        # the model would re-sample to ~1fps. Frames are written next to the
+        # candidate segment inside the run's scratch dir. ``provider.analyze``
+        # returns clip-relative timestamps, which ``_run_two_pass`` re-bases.
+        specs = sample_uniform(dur, interval_sec=_FINE_FRAME_INTERVAL_SEC)
+        frames_dir = segment.parent / f"{segment.stem}_frames"
+        keyframes = extract_keyframes(
+            segment, specs, frames_dir, long_edge_px=_FINE_FRAME_LONG_EDGE_PX
+        )
+        return await provider.analyze(keyframes, h, video_id=video_id, duration_sec=dur)
 
     return await _run(
         src,
@@ -153,8 +198,10 @@ async def analyze_video(
         prepare=lambda s, scratch: compress_for_vlm(s, scratch / "compressed.mp4"),
         segment_suffix=".mp4",
         analyze=_analyze,
+        fine_analyze=_fine_frames,
         kind="video",
         two_pass=two_pass,
+        force_two_pass=force_two_pass,
     )
 
 
@@ -169,12 +216,14 @@ async def analyze_audio(
     confirm_cost: Callable[[float, float], bool] | None = None,
     work_dir: Path | None = None,
     two_pass: bool = False,
+    force_two_pass: bool = False,
 ) -> ClipPlan:
     """Analyse ``src``'s AUDIO and return a merged, absolute-time ``ClipPlan``.
 
     Extracts a small mono MP3 and sends it (batched at ~10 min when long) to
-    ``provider.analyze_audio_clip``. Mirrors ``analyze_video`` exactly except for
-    the prepare step and the provider method.
+    ``provider.analyze_audio_clip``. Mirrors ``analyze_video`` except that audio
+    has no frames, so its two-pass fine step stays the classic audio re-analysis
+    (no dense-stills ``fine_analyze``).
     """
 
     async def _analyze(segment: Path, h: AnalysisHints, dur: float) -> ClipPlan:
@@ -197,6 +246,7 @@ async def analyze_audio(
         analyze=_analyze,
         kind="audio",
         two_pass=two_pass,
+        force_two_pass=force_two_pass,
     )
 
 
@@ -221,11 +271,18 @@ async def _run(
     analyze: AnalyzeFn,
     kind: str,
     two_pass: bool,
+    force_two_pass: bool = False,
+    fine_analyze: AnalyzeFn | None = None,
 ) -> ClipPlan:
-    """Dispatch to the two-pass pipeline (long source + opt-in) or single pass."""
+    """Dispatch to the two-pass pipeline (long source or forced) or single pass.
+
+    Two-pass normally only fires on long sources (the model is already precise on
+    short ones); ``force_two_pass`` overrides the duration gate so a user can
+    request the coarse→fine refinement on a short clip too.
+    """
     if duration_sec <= 0:
         raise VideoAnalysisError("duration_sec must be > 0")
-    if two_pass and duration_sec > _TWO_PASS_MIN_DURATION_SEC:
+    if two_pass and (force_two_pass or duration_sec > _TWO_PASS_MIN_DURATION_SEC):
         return await _run_two_pass(
             src,
             hints,
@@ -239,6 +296,7 @@ async def _run(
             prepare=prepare,
             segment_suffix=segment_suffix,
             analyze=analyze,
+            fine_analyze=fine_analyze,
             kind=kind,
         )
     return await _run_batched(
@@ -373,15 +431,19 @@ async def _run_two_pass(
     segment_suffix: str,
     analyze: AnalyzeFn,
     kind: str,
+    fine_analyze: AnalyzeFn | None = None,
 ) -> ClipPlan:
     """Coarse locate (high recall) → per-candidate fine analyse (tight cut).
 
     Pass 1 reuses the batch engine with a COARSE prompt to find wide candidate
     regions over the whole timeline. Pass 2 cuts each candidate (± padding) from
-    the prepared copy and re-analyses it alone with the FINE prompt — the model
-    is precise on a short clip. Per-candidate plans are re-based to absolute time
-    and IoU-deduped via ``merge_plans``.
+    the prepared copy and re-analyses it alone — the model is precise on a short
+    segment. ``fine_analyze`` (when given) handles the fine pass differently from
+    the coarse ``analyze``; the video route passes the dense 2-FPS stills closure
+    so boundaries land on the sub-second event. Per-candidate plans are re-based
+    to absolute time and IoU-deduped via ``merge_plans``.
     """
+    fine = fine_analyze or analyze
     # Both passes are gated once, up front (pass 1 ~1x duration, pass 2 <=~1x).
     _gate_cost(duration_sec * _TWO_PASS_COST_FACTOR, cost_cap_usd, confirm_cost, usd_per_second)
 
@@ -443,7 +505,7 @@ async def _run_two_pass(
                 hi,
             )
             try:
-                plan = await analyze(segment, hints, hi - lo)
+                plan = await fine(segment, hints, hi - lo)
             except Exception as exc:
                 log.warning(
                     "%s two-pass: candidate %d/%d failed, skipping it: %s",

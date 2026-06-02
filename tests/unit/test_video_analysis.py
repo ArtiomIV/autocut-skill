@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from autocut import video_analysis
-from autocut.models import AnalysisHints, Clip, ClipPlan, ClipPlanMetadata
+from autocut.models import AnalysisHints, Clip, ClipPlan, ClipPlanMetadata, Keyframe
 from autocut.video_analysis import VideoAnalysisError, analyze_video
 
 
@@ -60,6 +60,16 @@ def _stub_ffmpeg(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         video_analysis, "cut_clip", lambda video, request, **kw: request.output_path
     )
+
+    def _fake_extract(video: Path, specs: list, out_dir: Path, **kw: object) -> list[Keyframe]:
+        # Mirror the requested specs as Keyframe records without touching ffmpeg,
+        # so the fine-frames pass yields one keyframe per sampled timestamp.
+        return [
+            Keyframe(scene_index=None, timestamp=s.timestamp, path=Path(out_dir) / f"f{i}.jpg")
+            for i, s in enumerate(specs)
+        ]
+
+    monkeypatch.setattr(video_analysis, "extract_keyframes", _fake_extract)
 
 
 @pytest.mark.asyncio
@@ -139,16 +149,40 @@ async def test_cost_cap_aborts_without_confirmation(_stub_ffmpeg: None, tmp_path
 # ---------------------------------------------------------------------------
 
 
-class _CoarseThenFineProvider:
-    """Pass 1 returns 2 wide regions; pass 2 returns one tight clip per segment.
+def _tight_fine_plan(video_id: str, duration: float) -> ClipPlan:
+    """One tight clip 5-12s into a (fine) candidate segment."""
+    return ClipPlan(
+        video_id=video_id,
+        duration_sec=duration,
+        clips=[
+            Clip(
+                id="f",
+                start=timedelta(seconds=5),
+                end=timedelta(seconds=12),
+                category="highlight",
+                description="tight",
+                score=9,
+                rationale="fine",
+            )
+        ],
+        metadata=ClipPlanMetadata(vlm_provider="openrouter", vlm_model="m"),
+    )
 
-    Distinguishes the passes by ``hints.prompt_template`` so the test can assert
-    the locate→analyse flow without a real model.
+
+class _CoarseThenFineProvider:
+    """Coarse (video) returns 2 wide regions; the fine STILLS pass tightens each.
+
+    The coarse pass goes through ``analyze_video_clip`` (video payload); the
+    two-pass fine pass goes through ``analyze`` (dense labelled stills), so the
+    test can assert the locate→refine flow AND that the fine pass uses frames,
+    not a video clip, without a real model.
     """
 
     def __init__(self) -> None:
         self.coarse_calls = 0
+        self.video_clip_calls = 0
         self.fine_durations: list[float] = []
+        self.fine_keyframe_counts: list[int] = []
 
     async def analyze_video_clip(
         self,
@@ -159,6 +193,7 @@ class _CoarseThenFineProvider:
         clip_duration_sec: float,
         timeout_sec: int = 300,
     ) -> ClipPlan:
+        self.video_clip_calls += 1
         if hints.prompt_template == "coarse":
             self.coarse_calls += 1
             # Two coarse candidate regions, clip-relative to the whole source.
@@ -187,24 +222,22 @@ class _CoarseThenFineProvider:
                 ],
                 metadata=ClipPlanMetadata(vlm_provider="openrouter", vlm_model="m"),
             )
-        # Fine pass: one tight clip 5s into the padded candidate segment.
-        self.fine_durations.append(clip_duration_sec)
-        return ClipPlan(
-            video_id=video_id,
-            duration_sec=clip_duration_sec,
-            clips=[
-                Clip(
-                    id="f",
-                    start=timedelta(seconds=5),
-                    end=timedelta(seconds=12),
-                    category="highlight",
-                    description="tight",
-                    score=9,
-                    rationale="fine",
-                )
-            ],
-            metadata=ClipPlanMetadata(vlm_provider="openrouter", vlm_model="m"),
-        )
+        # Single-pass fallback (no two-pass): one neutral clip.
+        return _one_clip_plan(video_id, clip_duration_sec)
+
+    async def analyze(
+        self,
+        keyframes: list[Keyframe],
+        hints: AnalysisHints,
+        *,
+        video_id: str,
+        duration_sec: float,
+        timeout_sec: int = 300,
+    ) -> ClipPlan:
+        # The fine pass: dense stills + their timestamps.
+        self.fine_durations.append(duration_sec)
+        self.fine_keyframe_counts.append(len(keyframes))
+        return _tight_fine_plan(video_id, duration_sec)
 
 
 @pytest.mark.asyncio
@@ -250,28 +283,37 @@ class _CoarseThenEmptyProvider:
         clip_duration_sec: float,
         timeout_sec: int = 300,
     ) -> ClipPlan:
-        if hints.prompt_template == "coarse":
-            return ClipPlan(
-                video_id=video_id,
-                duration_sec=clip_duration_sec,
-                clips=[
-                    Clip(
-                        id="r1",
-                        start=timedelta(seconds=40),
-                        end=timedelta(seconds=60),
-                        category="highlight",
-                        description="maybe something",
-                        score=6,
-                        rationale="coarse over-include",
-                    )
-                ],
-                metadata=ClipPlanMetadata(vlm_provider="openrouter", vlm_model="m"),
-            )
+        return ClipPlan(
+            video_id=video_id,
+            duration_sec=clip_duration_sec,
+            clips=[
+                Clip(
+                    id="r1",
+                    start=timedelta(seconds=40),
+                    end=timedelta(seconds=60),
+                    category="highlight",
+                    description="maybe something",
+                    score=6,
+                    rationale="coarse over-include",
+                )
+            ],
+            metadata=ClipPlanMetadata(vlm_provider="openrouter", vlm_model="m"),
+        )
+
+    async def analyze(
+        self,
+        keyframes: list[Keyframe],
+        hints: AnalysisHints,
+        *,
+        video_id: str,
+        duration_sec: float,
+        timeout_sec: int = 300,
+    ) -> ClipPlan:
         # Fine pass: nothing valid here -> empty.
         self.fine_calls += 1
         return ClipPlan(
             video_id=video_id,
-            duration_sec=clip_duration_sec,
+            duration_sec=duration_sec,
             clips=[],
             metadata=ClipPlanMetadata(vlm_provider="openrouter", vlm_model="m"),
         )
@@ -313,28 +355,37 @@ class _CoarseThenFlakyProvider:
         clip_duration_sec: float,
         timeout_sec: int = 300,
     ) -> ClipPlan:
-        if hints.prompt_template == "coarse":
-            return ClipPlan(
-                video_id=video_id,
-                duration_sec=clip_duration_sec,
-                clips=[
-                    Clip(
-                        id=f"r{i}",
-                        start=timedelta(seconds=30 + i * 60),
-                        end=timedelta(seconds=45 + i * 60),
-                        category="highlight",
-                        description=f"region {i}",
-                        score=8,
-                        rationale="coarse",
-                    )
-                    for i in range(2)
-                ],
-                metadata=ClipPlanMetadata(vlm_provider="openrouter", vlm_model="m"),
-            )
+        return ClipPlan(
+            video_id=video_id,
+            duration_sec=clip_duration_sec,
+            clips=[
+                Clip(
+                    id=f"r{i}",
+                    start=timedelta(seconds=30 + i * 60),
+                    end=timedelta(seconds=45 + i * 60),
+                    category="highlight",
+                    description=f"region {i}",
+                    score=8,
+                    rationale="coarse",
+                )
+                for i in range(2)
+            ],
+            metadata=ClipPlanMetadata(vlm_provider="openrouter", vlm_model="m"),
+        )
+
+    async def analyze(
+        self,
+        keyframes: list[Keyframe],
+        hints: AnalysisHints,
+        *,
+        video_id: str,
+        duration_sec: float,
+        timeout_sec: int = 300,
+    ) -> ClipPlan:
         self.fine_calls += 1
         if self.fine_calls == 1:
             raise TimeoutError("simulated provider timeout on candidate 1")
-        return _one_clip_plan(video_id, clip_duration_sec)
+        return _one_clip_plan(video_id, duration_sec)
 
 
 @pytest.mark.asyncio
@@ -443,3 +494,99 @@ async def test_two_pass_skipped_for_short_video(_stub_ffmpeg: None, tmp_path: Pa
         two_pass=True,
     )
     assert provider.coarse_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_two_pass_fine_uses_dense_stills_not_video(
+    _stub_ffmpeg: None, tmp_path: Path
+) -> None:
+    # The fine pass must go through the STILLS path (provider.analyze), NOT a
+    # second video clip, and feed ~2 FPS frames over each padded candidate window.
+    provider = _CoarseThenFineProvider()
+    hints = AnalysisHints(min_duration_sec=3, max_duration_sec=20)
+    await analyze_video(
+        tmp_path / "src.mp4",
+        hints,
+        provider,
+        video_id="vid",
+        duration_sec=200.0,
+        cost_cap_usd=1.0,
+        work_dir=tmp_path,
+        two_pass=True,
+    )
+    # Only the coarse locate touched the video payload; both fine passes used stills.
+    assert provider.video_clip_calls == 1
+    assert provider.coarse_calls == 1
+    assert len(provider.fine_durations) == 2
+    # Each candidate is a 20s region padded ±20s -> a 60s window sampled at 0.5s
+    # -> ~120 frames (2 FPS). Allow a small off-by-edge tolerance.
+    for n, dur in zip(provider.fine_keyframe_counts, provider.fine_durations, strict=True):
+        assert n == pytest.approx(dur * 2, abs=2)
+
+
+class _ShortCoarseFineProvider:
+    """One in-bounds coarse region (video) + a stills fine pass, for short clips."""
+
+    def __init__(self) -> None:
+        self.coarse_calls = 0
+        self.fine_calls = 0
+
+    async def analyze_video_clip(
+        self,
+        clip_path: Path,
+        hints: AnalysisHints,
+        *,
+        video_id: str,
+        clip_duration_sec: float,
+        timeout_sec: int = 300,
+    ) -> ClipPlan:
+        self.coarse_calls += 1
+        return ClipPlan(
+            video_id=video_id,
+            duration_sec=clip_duration_sec,
+            clips=[
+                Clip(
+                    id="r1",
+                    start=timedelta(seconds=10),
+                    end=timedelta(seconds=25),
+                    category="highlight",
+                    description="region 1",
+                    score=8,
+                    rationale="coarse",
+                )
+            ],
+            metadata=ClipPlanMetadata(vlm_provider="openrouter", vlm_model="m"),
+        )
+
+    async def analyze(
+        self,
+        keyframes: list[Keyframe],
+        hints: AnalysisHints,
+        *,
+        video_id: str,
+        duration_sec: float,
+        timeout_sec: int = 300,
+    ) -> ClipPlan:
+        self.fine_calls += 1
+        return _tight_fine_plan(video_id, duration_sec)
+
+
+@pytest.mark.asyncio
+async def test_force_two_pass_runs_on_short_video(_stub_ffmpeg: None, tmp_path: Path) -> None:
+    # force_two_pass lifts the >60s gate -> two-pass runs on a 40s clip too.
+    provider = _ShortCoarseFineProvider()
+    hints = AnalysisHints(min_duration_sec=3, max_duration_sec=20)
+    plan = await analyze_video(
+        tmp_path / "src.mp4",
+        hints,
+        provider,
+        video_id="vid",
+        duration_sec=40.0,
+        cost_cap_usd=1.0,
+        work_dir=tmp_path,
+        two_pass=True,
+        force_two_pass=True,
+    )
+    assert provider.coarse_calls == 1
+    assert provider.fine_calls == 1
+    assert len(plan.clips) >= 1

@@ -158,12 +158,14 @@ async def run_analysis(
     accurate_cuts: bool = False,
     confirm_cost: ConfirmHook | None = None,
     two_pass: bool = False,
+    force_two_pass: bool = False,
 ) -> AnalysisResult:
     """Run the full pipeline. Returns a populated ``AnalysisResult``.
 
     ``two_pass`` enables the coarse→fine locate/analyse pipeline on the direct
     openrouter media routes for long sources (a no-op on the host and keyframe
-    routes, which stay single-pass).
+    routes, which stay single-pass). ``force_two_pass`` additionally lifts the
+    >60s duration gate so the refinement also runs on short sources on request.
     """
     video = Path(video_path)
     root = (output_root or config.output.base_dir).resolve()
@@ -230,6 +232,7 @@ async def run_analysis(
             confirm_cost=confirm_cost,
             kind="video",
             two_pass=two_pass,
+            force_two_pass=force_two_pass,
         )
     if route is Route.openrouter_audio:
         return await _run_media_analysis(
@@ -245,6 +248,7 @@ async def run_analysis(
             confirm_cost=confirm_cost,
             kind="audio",
             two_pass=two_pass,
+            force_two_pass=force_two_pass,
         )
     if route is Route.host_video:
         return await _run_host_video_analysis(
@@ -396,6 +400,7 @@ async def _run_media_analysis(
     confirm_cost: ConfirmHook | None,
     kind: str,
     two_pass: bool = False,
+    force_two_pass: bool = False,
 ) -> AnalysisResult:
     """Direct-payload path (openrouter): prepare + autonomous batch loop via L2.
 
@@ -440,6 +445,7 @@ async def _run_media_analysis(
             cost_cap_usd=config.security.cost_cap_usd,
             confirm_cost=_confirm,
             two_pass=two_pass,
+            force_two_pass=force_two_pass,
         )
     else:
         plan = await analyze_video(
@@ -451,6 +457,7 @@ async def _run_media_analysis(
             cost_cap_usd=config.security.cost_cap_usd,
             confirm_cost=_confirm,
             two_pass=two_pass,
+            force_two_pass=force_two_pass,
         )
     log.info(
         "pipeline: %s analysis returned %d clip(s), real cost %s USD",

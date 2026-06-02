@@ -232,8 +232,14 @@ class OpenRouterProvider(VLMProvider):
             {"role": "user", "content": content},
         ]
 
-        def _parse(raw: str, _completion: Any, elapsed: float) -> ClipPlan:
-            return _parse_response(raw, provider=self.name, model=self.model, elapsed_sec=elapsed)
+        def _parse(raw: str, completion: Any, elapsed: float) -> ClipPlan:
+            return _parse_response(
+                raw,
+                provider=self.name,
+                model=self.model,
+                elapsed_sec=elapsed,
+                cost_usd=_usage_cost(completion),
+            )
 
         plan = await self._complete_and_parse(
             base_messages=base_messages,
@@ -241,6 +247,9 @@ class OpenRouterProvider(VLMProvider):
             max_tokens=16384,
             timeout_sec=timeout_sec,
             label="analyse",
+            # Surface the real billed cost so the two-pass fine (stills) pass and
+            # the keyframe route report cost like the video route does.
+            extra_body={"usage": {"include": True}},
         )
         log.info(
             "openrouter analyse complete: model=%s clips=%d elapsed=%.2fs",
