@@ -505,7 +505,15 @@ def cut(
         Path | None,
         typer.Argument(
             help="Input video. Optional with --from-json (taken from the plan, "
-            "or overridden here)."
+            "or overridden here / via --video)."
+        ),
+    ] = None,
+    video_opt: Annotated[
+        Path | None,
+        typer.Option(
+            "--video",
+            help="Input video (same as the positional VIDEO; from-json override or "
+            "single-segment input).",
         ),
     ] = None,
     start: Annotated[
@@ -574,6 +582,8 @@ def cut(
       include the pre/post-roll, so this trims 1:1. Handles 0..N clips.
     - **single segment**: VIDEO --start --end --output — cut one `[start, end]`.
     """
+    video = video or video_opt  # accept the video as a positional or as --video
+
     if from_json is not None:
         _cut_from_json(
             from_json,
