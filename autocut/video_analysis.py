@@ -42,6 +42,14 @@ from autocut.video.cutter import CutRequest, cut_clip
 
 log = logging.getLogger(__name__)
 
+# Spending-limit master switch. DISABLED 2026-06-03 (Artiom): no spending cap for
+# now — every run proceeds, the upfront estimate is only LOGGED and recorded in
+# plan.json, and the real billed cost is reported as usual. Flip this to ``True``
+# to re-enable the upfront cap gate (``config.security.cost_cap_usd`` + the CLI
+# confirm prompt); the gate machinery below is kept intact, just dormant.
+# ``pipeline.py`` imports this so both the cloud and the keyframe gate share it.
+COST_CAP_ENABLED: bool = False
+
 
 class VideoAnalysisError(RuntimeError):
     """Raised when the media-analysis engine cannot complete (incl. cost cap)."""
@@ -364,10 +372,10 @@ async def _run_batched(
     estimate exceeds ``cost_cap_usd``; ``False``/``None`` aborts with
     ``VideoAnalysisError``.
     """
-    _gate_cost(duration_sec, cost_cap_usd, confirm_cost, usd_per_second)
+    estimate = _gate_cost(duration_sec, cost_cap_usd, confirm_cost, usd_per_second)
     with _scratch_dir(work_dir) as scratch:
         prepared = prepare(src, scratch)
-        return await _batch_over_prepared(
+        merged = await _batch_over_prepared(
             prepared,
             hints,
             video_id=video_id,
@@ -378,6 +386,7 @@ async def _run_batched(
             analyze=analyze,
             kind=kind,
         )
+    return _with_estimate(merged, estimate)
 
 
 async def _batch_over_prepared(
@@ -470,7 +479,9 @@ async def _run_two_pass(
     """
     fine = fine_analyze or analyze
     # Both passes are gated once, up front (pass 1 ~1x duration, pass 2 <=~1x).
-    _gate_cost(duration_sec * _TWO_PASS_COST_FACTOR, cost_cap_usd, confirm_cost, usd_per_second)
+    estimate = _gate_cost(
+        duration_sec * _TWO_PASS_COST_FACTOR, cost_cap_usd, confirm_cost, usd_per_second
+    )
 
     coarse_hints = hints.model_copy(
         update={
@@ -507,7 +518,7 @@ async def _run_two_pass(
             _TWO_PASS_CANDIDATE_MIN_SCORE,
         )
         if not candidates:
-            return coarse_plan
+            return _with_estimate(coarse_plan, estimate)
 
         # PASS 2 — re-analyse each padded candidate in isolation, tight + precise.
         fine_plans: list[ClipPlan] = []
@@ -549,10 +560,11 @@ async def _run_two_pass(
             fine_chunks.append(Chunk(index=i, start_sec=lo, end_sec=hi))
 
     if not fine_plans:
-        return coarse_plan
+        return _with_estimate(coarse_plan, estimate)
 
     merged = merge_plans(fine_plans, fine_chunks, video_id=video_id, duration_sec=duration_sec)
     merged = _add_cost(merged, coarse_plan.metadata.cost_usd)
+    merged = _with_estimate(merged, estimate)
     log.info(
         "%s two-pass: %d candidate(s) -> %d final clip(s)", kind, len(fine_plans), len(merged.clips)
     )
@@ -567,6 +579,12 @@ def _add_cost(plan: ClipPlan, extra_usd: float | None) -> ClipPlan:
     return plan.model_copy(update={"metadata": new_meta})
 
 
+def _with_estimate(plan: ClipPlan, estimate_usd: float) -> ClipPlan:
+    """Record the upfront cost estimate on the plan so it reaches plan.json."""
+    new_meta = plan.metadata.model_copy(update={"upfront_cost_estimate_usd": estimate_usd})
+    return plan.model_copy(update={"metadata": new_meta})
+
+
 # ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------
@@ -577,17 +595,28 @@ def _gate_cost(
     cost_cap_usd: float,
     confirm_cost: Callable[[float, float], bool] | None,
     usd_per_second: float,
-) -> None:
-    """One upfront cost check; raise unless under cap or explicitly confirmed."""
+) -> float:
+    """Compute + log the upfront cost estimate and RETURN it (for plan.json).
+
+    The cap is enforced only when ``COST_CAP_ENABLED`` (disabled for now — no
+    spending limit): then an estimate over ``cost_cap_usd`` raises unless the
+    confirm hook approves it. Disabled, every run proceeds and this only logs.
+    """
     estimated = duration_sec * usd_per_second
-    if estimated <= cost_cap_usd:
-        return
-    approved = confirm_cost(estimated, cost_cap_usd) if confirm_cost else False
-    if not approved:
-        raise VideoAnalysisError(
-            f"estimated cost {estimated:.4f} USD exceeds cap {cost_cap_usd:.2f} USD; "
-            f"raise the cap or accept the prompt"
-        )
+    log.info(
+        "media analysis: upfront cost estimate %.4f USD (cap %.2f, enforced=%s)",
+        estimated,
+        cost_cap_usd,
+        COST_CAP_ENABLED,
+    )
+    if COST_CAP_ENABLED and estimated > cost_cap_usd:
+        approved = confirm_cost(estimated, cost_cap_usd) if confirm_cost else False
+        if not approved:
+            raise VideoAnalysisError(
+                f"estimated cost {estimated:.4f} USD exceeds cap {cost_cap_usd:.2f} USD; "
+                f"raise the cap or accept the prompt"
+            )
+    return estimated
 
 
 def _segment_for(

@@ -124,7 +124,30 @@ async def test_real_cost_is_summed_across_batches(_stub_ffmpeg: None, tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_cost_cap_aborts_without_confirmation(_stub_ffmpeg: None, tmp_path: Path) -> None:
+async def test_cost_cap_disabled_by_default_proceeds(_stub_ffmpeg: None, tmp_path: Path) -> None:
+    # No spending limit by default (COST_CAP_ENABLED is False): even a huge
+    # estimate proceeds, and the upfront estimate is recorded on the plan.
+    provider = _StubProvider()
+    hints = AnalysisHints(min_duration_sec=3, max_duration_sec=20)
+    plan = await analyze_video(
+        tmp_path / "src.mp4",
+        hints,
+        provider,
+        video_id="vid",
+        duration_sec=10_000.0,  # would be ~$2.5 estimate, way over any cap
+        cost_cap_usd=1.0,
+        confirm_cost=None,
+    )
+    assert provider.call_durations != []  # the gate did NOT abort the call
+    assert plan.metadata.upfront_cost_estimate_usd == pytest.approx(2.5)
+
+
+@pytest.mark.asyncio
+async def test_cost_cap_aborts_when_re_enabled(
+    _stub_ffmpeg: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Flipping the master switch back on must restore the dormant gate.
+    monkeypatch.setattr("autocut.video_analysis.COST_CAP_ENABLED", True)
     provider = _StubProvider()
     hints = AnalysisHints(min_duration_sec=3, max_duration_sec=20)
     with pytest.raises(VideoAnalysisError, match="exceeds cap"):
@@ -133,7 +156,7 @@ async def test_cost_cap_aborts_without_confirmation(_stub_ffmpeg: None, tmp_path
             hints,
             provider,
             video_id="vid",
-            duration_sec=10_000.0,  # ~$5 estimate, over the $1 cap
+            duration_sec=10_000.0,  # ~$2.5 estimate, over the $1 cap
             cost_cap_usd=1.0,
             confirm_cost=None,
         )
@@ -454,12 +477,11 @@ async def test_two_pass_off_by_default_uses_single_pass(_stub_ffmpeg: None, tmp_
 
 
 @pytest.mark.asyncio
-async def test_two_pass_long_video_stays_under_default_cap(
+async def test_two_pass_records_upfront_estimate_for_both_passes(
     _stub_ffmpeg: None, tmp_path: Path
 ) -> None:
-    # Regression: the cost estimate must be calibrated so a normal long (20-min)
-    # two-pass run does NOT spuriously trip the default $1 cap now that two-pass
-    # is the default for long videos. 1200s * 0.00025 * 2 = $0.60 < $1.
+    # A normal long (20-min) two-pass run records the upfront estimate covering
+    # BOTH passes on the plan: 1200s * 0.00025 * 2 (coarse+fine factor) = $0.60.
     provider = _CoarseThenFineProvider()
     hints = AnalysisHints(min_duration_sec=3, max_duration_sec=20)
     plan = await analyze_video(
@@ -469,12 +491,13 @@ async def test_two_pass_long_video_stays_under_default_cap(
         video_id="vid",
         duration_sec=1200.0,
         cost_cap_usd=1.0,
-        confirm_cost=None,  # would abort if the gate tripped
+        confirm_cost=None,
         work_dir=tmp_path,
         two_pass=True,
     )
     assert provider.coarse_calls >= 1
     assert len(plan.clips) >= 1
+    assert plan.metadata.upfront_cost_estimate_usd == pytest.approx(0.60)
 
 
 @pytest.mark.asyncio

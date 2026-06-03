@@ -157,10 +157,34 @@ def _stub_video_stack(monkeypatch: pytest.MonkeyPatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_cost_cap_raises_when_estimate_exceeds_cap_and_no_confirm_hook(
+async def test_cost_cap_disabled_by_default_proceeds(
     _stub_video_stack: None,
     tmp_path: Path,
 ) -> None:
+    # No spending limit by default (COST_CAP_ENABLED is False): a huge estimate
+    # over a tiny cap proceeds anyway, with no confirm hook needed.
+    config = AutoCutConfig()
+    config.security.cost_cap_usd = 0.10
+    provider = _StubProvider(cost_usd=5.0)
+
+    result = await run_analysis(
+        Path("/fake/video.mp4"),
+        provider,
+        config=config,
+        output_root=tmp_path / "CLIPS",
+        write_outputs=False,
+    )
+    assert provider.analyze_called is True
+    assert len(result.plan.clips) == 1
+
+
+async def test_cost_cap_aborts_when_re_enabled_and_no_confirm_hook(
+    _stub_video_stack: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Flipping the master switch back on restores the dormant gate.
+    monkeypatch.setattr("autocut.pipeline.COST_CAP_ENABLED", True)
     config = AutoCutConfig()
     config.security.cost_cap_usd = 0.10
     provider = _StubProvider(cost_usd=5.0)
@@ -176,10 +200,12 @@ async def test_cost_cap_raises_when_estimate_exceeds_cap_and_no_confirm_hook(
     assert provider.analyze_called is False
 
 
-async def test_cost_cap_raises_when_confirm_hook_denies(
+async def test_cost_cap_confirm_hook_denies_when_re_enabled(
     _stub_video_stack: None,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("autocut.pipeline.COST_CAP_ENABLED", True)
     config = AutoCutConfig()
     config.security.cost_cap_usd = 0.10
     provider = _StubProvider(cost_usd=5.0)
@@ -203,10 +229,12 @@ async def test_cost_cap_raises_when_confirm_hook_denies(
     assert provider.analyze_called is False
 
 
-async def test_cost_cap_proceeds_when_confirm_hook_accepts(
+async def test_cost_cap_confirm_hook_accepts_when_re_enabled(
     _stub_video_stack: None,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr("autocut.pipeline.COST_CAP_ENABLED", True)
     config = AutoCutConfig()
     config.security.cost_cap_usd = 0.10
     provider = _StubProvider(cost_usd=5.0)
@@ -223,12 +251,11 @@ async def test_cost_cap_proceeds_when_confirm_hook_accepts(
     assert len(result.plan.clips) == 1
 
 
-async def test_free_provider_skips_cost_cap(
+async def test_free_provider_proceeds(
     _stub_video_stack: None,
     tmp_path: Path,
 ) -> None:
-    # cost_usd=0 means is_free=True; the cap branch must be bypassed even when
-    # the cap is set absurdly low.
+    # A free provider always proceeds regardless of the cap switch.
     config = AutoCutConfig()
     config.security.cost_cap_usd = 0.0
     provider = _StubProvider(cost_usd=0.0)

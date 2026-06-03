@@ -58,7 +58,7 @@ from autocut.video import (
     probe_video,
 )
 from autocut.video.refine import refine_start_to_impact
-from autocut.video_analysis import analyze_audio, analyze_video
+from autocut.video_analysis import COST_CAP_ENABLED, analyze_audio, analyze_video
 from autocut.vlm import CostEstimate, VLMError, VLMProvider
 from autocut.vlm.host_agent import HostAgentProvider
 from autocut.vlm.prompts import PROMPT_VERSION
@@ -334,17 +334,20 @@ async def run_analysis(
         long_edge_px=config.advanced.keyframe_resolution,
     )
 
-    # Cost cap check happens BEFORE the API call, when we know exactly how
-    # many images we're about to send.
+    # Upfront cost estimate, computed BEFORE the API call when we know exactly how
+    # many images we're about to send. The cap is enforced only when
+    # ``COST_CAP_ENABLED`` (disabled for now — no spending limit); otherwise this
+    # only logs the estimate, which is also recorded in plan.json below.
     estimate = provider.estimate_cost(len(keyframes))
     cap = config.security.cost_cap_usd
     log.info(
-        "pipeline: cost estimate %.4f USD (cap %.2f, free=%s)",
+        "pipeline: cost estimate %.4f USD (cap %.2f, free=%s, enforced=%s)",
         estimate.estimated_total_usd,
         cap,
         estimate.is_free,
+        COST_CAP_ENABLED,
     )
-    if not estimate.is_free and estimate.estimated_total_usd > cap:
+    if COST_CAP_ENABLED and not estimate.is_free and estimate.estimated_total_usd > cap:
         proceed = confirm_cost(estimate, cap) if confirm_cost else False
         if not proceed:
             raise CostCapExceeded(
@@ -393,6 +396,7 @@ async def run_analysis(
         accurate_cuts=accurate_cuts,
         write_outputs=write_outputs,
         cost_estimate_usd=estimate.estimated_total_usd,
+        upfront_cost_estimate_usd=estimate.estimated_total_usd,
         keyframes=keyframes,
         profile=profile,
     )
@@ -494,6 +498,8 @@ async def _run_media_analysis(
         write_outputs=write_outputs,
         # real billed cost from usage.include (summed across batches), not an estimate
         cost_estimate_usd=plan.metadata.cost_usd or 0.0,
+        # rough upfront estimate (both passes) attached by the analysis engine
+        upfront_cost_estimate_usd=plan.metadata.upfront_cost_estimate_usd,
         keyframes=None,
         profile=profile,
     )
@@ -765,6 +771,7 @@ def complete_from_plan(
     accurate_cuts: bool,
     write_outputs: bool,
     cost_estimate_usd: float = 0.0,
+    upfront_cost_estimate_usd: float | None = None,
     keyframes: list[Keyframe] | None = None,
     profile: ContentProfile | None = None,
 ) -> AnalysisResult:
@@ -809,6 +816,7 @@ def complete_from_plan(
                     "prompt_version": plan.metadata.prompt_version,
                     "analysis_time_sec": plan.metadata.analysis_time_sec,
                     "cost_estimate_usd": cost_estimate_usd,
+                    "cost_upfront_estimate_usd": upfront_cost_estimate_usd,
                 },
                 "sampling": {
                     "strategy": sampling_strategy,

@@ -1,10 +1,14 @@
 ---
 name: autocut-run
 description: >-
-  Extract highlight clips from a video with AutoCut. Use when the user wants to
-  auto-cut the best/viral moments of a video, or to find and cut a SPECIFIC
-  described moment (a query). Needs a VLM provider (host or openrouter). For
-  deterministic trimming use autocut-cut; for concatenation use autocut-merge.
+  Extract highlight clips from a video with AutoCut. Use this whenever the user
+  wants the best / viral / funniest moments, highlights, the top moments worth
+  sharing, or the best few seconds of a match, stream, podcast or interview —
+  even if they don't say the word "highlight". Also use it to find and cut a
+  SPECIFIC described moment (a query), e.g. "the moment he admits he lied". This
+  is the ANALYSIS step: it watches the video with a VLM (host or openrouter) and
+  writes a plan.json. If a plan.json ALREADY exists, use autocut-cut instead (no
+  analysis needed); for plain concatenation of existing clips use autocut-merge.
 ---
 
 # autocut run
@@ -64,8 +68,10 @@ Rules of thumb:
 ## Provider
 
 - `--vlm openrouter` (default if configured): sends the compressed video (or
-  audio for talk) to the model; fully automatic, costs money (cost cap applies).
-  Writes `plan.json` when done — then cut it with `autocut cut --from-json`.
+  audio for talk) to the model; fully automatic, costs money (no spending cap is
+  enforced for now; the run records both the upfront cost estimate and the real
+  billed cost in `plan.json`). Writes `plan.json` when done — then cut it with
+  `autocut cut --from-json`.
 - `--vlm host`: image-only, zero-cost. AutoCut renders the video as timestamped
   contact sheets and pauses (writes `VLM_REQUEST.md` + the sheets + a
   `VLM_SHEET_INDEX.json` index→time map); YOU read the sheets, write the

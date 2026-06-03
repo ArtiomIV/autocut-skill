@@ -170,6 +170,11 @@ class ClipPlanMetadata(BaseModel):
     # summed across batches. ``None`` when the provider does not report it
     # (e.g. host agent, or the keyframe path which uses a pre-call estimate).
     cost_usd: float | None = None
+    # Rough cost ESTIMATE computed up front (before the call), kept for visibility
+    # next to the real ``cost_usd`` so a run can compare estimate vs billed. For
+    # the two-pass cloud route this covers both passes (coarse + fine). ``None``
+    # when not computed (host route).
+    upfront_cost_estimate_usd: float | None = None
 
 
 class ClipPlan(BaseModel):
