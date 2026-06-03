@@ -36,6 +36,20 @@ def test_build_filter_has_all_stages() -> None:
     assert "tile=6x8" in vf
 
 
+def test_build_filter_index_offset_shifts_burned_index() -> None:
+    # With an offset the cell burns ``n + offset`` (continuous across batches).
+    vf = _build_filter(fps=2.0, cell_px=192, cols=6, rows=8, font="/f.ttf", index_offset=48)
+    assert r"%{eif\:n+48\:d}" in vf
+    assert r"%{n}'" not in vf  # the plain form is replaced when offset is set
+
+
+def test_build_contact_sheets_rejects_negative_offset(tmp_path: Path) -> None:
+    seg = tmp_path / "seg.mp4"
+    seg.write_bytes(b"fake")
+    with pytest.raises(ContactSheetError, match="index_offset must be >= 0"):
+        build_contact_sheets(seg, tmp_path / "out", index_offset=-1)
+
+
 def test_resolve_font_explicit_ok(tmp_path: Path) -> None:
     font = tmp_path / "f.ttf"
     font.write_bytes(b"not a real font")

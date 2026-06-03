@@ -518,11 +518,10 @@ async def test_two_pass_fine_uses_contact_sheets_not_video(
     assert provider.video_clip_calls == 1
     assert provider.coarse_calls == 1
     assert len(provider.fine_durations) == 2
-    # Each candidate is a 20s region padded ±20s -> a 60s window. At 2 FPS that is
-    # 120 frames (= the cap), so 2 FPS is preserved while the count stays bounded.
-    for n in provider.fine_n_frames:
-        assert 0 < n <= video_analysis._FINE_FRAME_MAX_FRAMES
-    assert max(provider.fine_n_frames) == video_analysis._FINE_FRAME_MAX_FRAMES
+    # Each fine window is sampled at a fixed 2 FPS with NO frame cap, so the count
+    # is exactly int(duration / 0.5) for every candidate window.
+    for dur, n in zip(provider.fine_durations, provider.fine_n_frames, strict=True):
+        assert n == max(1, int(dur / video_analysis._FINE_FRAME_INTERVAL_SEC))
 
 
 class _ShortCoarseFineProvider:
@@ -595,7 +594,6 @@ async def test_force_two_pass_runs_on_short_video(_stub_ffmpeg: None, tmp_path: 
     assert provider.fine_calls == 1
     assert len(plan.clips) >= 1
     # Small window (3s region padded ±20s, clamped to the 40s source -> ~33s)
-    # stays under the cap, so it keeps the full 2 FPS density: ~2 frames per second.
+    # sampled at the fixed 2 FPS (no cap): ~2 frames per second.
     (n,) = provider.fine_n_frames
-    assert n <= video_analysis._FINE_FRAME_MAX_FRAMES
     assert n == pytest.approx(33 * 2, abs=2)

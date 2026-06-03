@@ -41,9 +41,9 @@ class VLMConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     provider: VLMProvider = "openrouter"
-    model: str = "google/gemini-2.5-flash"
+    model: str = "google/gemini-3.5-flash"
     fallback: VLMProvider | None = "openrouter"
-    fallback_model: str | None = "google/gemini-2.5-flash"
+    fallback_model: str | None = "google/gemini-3.5-flash"
 
 
 def _default_output_modes() -> list[OutputMode]:

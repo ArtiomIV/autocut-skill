@@ -17,18 +17,16 @@ def _route(
 
 
 # ---------------------------------------------------------------------------
-# Host transport: video or stills only (cannot hear audio yet)
+# Host transport: image-only contact-sheet two-pass, whatever the content
 # ---------------------------------------------------------------------------
 
 
-def test_host_without_video_takes_keyframe() -> None:
-    assert _route("host", ContentHint.highlights, video=False) is Route.keyframe
-    # Even talk content stays on keyframes for the host — no audio path yet.
-    assert _route("host", ContentHint.talk, video=False, audio=True) is Route.keyframe
-
-
-def test_host_with_video_takes_host_video() -> None:
-    assert _route("host", ContentHint.highlights, video=True) is Route.host_video
+def test_host_always_takes_image_route() -> None:
+    # The host is image-only now: every content type routes to the contact-sheet
+    # two-pass, regardless of declared video/audio capability.
+    assert _route("host", ContentHint.highlights, video=False) is Route.host_image
+    assert _route("host", ContentHint.highlights, video=True) is Route.host_image
+    assert _route("host", ContentHint.talk, video=False, audio=True) is Route.host_image
 
 
 # ---------------------------------------------------------------------------

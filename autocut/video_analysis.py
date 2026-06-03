@@ -75,7 +75,14 @@ _TWO_PASS_MIN_DURATION_SEC: float = 60.0
 # pass to see the moment's lead-in and follow-through, but not so wide that
 # neighbouring candidates' windows overlap heavily and yield duplicate clips.
 _TWO_PASS_PAD_SEC: float = 20.0
-_TWO_PASS_MAX_CANDIDATES: int = 12
+# Keep EVERY coarse region the model judged plausibly worth keeping (score >=
+# this), instead of a fixed top-N: a long, dense source can legitimately have many
+# strong regions, and a hard top-12 dropped the ones ranked just outside it before
+# the fine pass ever looked. A generous hard ceiling still guards against a
+# pathological coarse response; on the cloud the upfront cost gate is the real
+# backstop against runaway fine calls.
+_TWO_PASS_CANDIDATE_MIN_SCORE: int = 5
+_TWO_PASS_CANDIDATE_CEILING: int = 40
 # Coarse candidate regions may be wider than a final clip (they bracket the
 # moment; pass 2 trims it), so the locate pass uses a looser max duration.
 _COARSE_MAX_DURATION_SEC: float = 60.0
@@ -100,11 +107,6 @@ _FINE_CELL_PX: int = 192  # per-cell long edge: small cells keep the pixel-area 
 # (which often comes after a referee count, ~10-15s later); ±10/±15 windows cut
 # the replay off. Paired with a higher frame cap so the wider window keeps ~2 FPS.
 _FINE_FRAME_PAD_SEC: float = 20.0
-# HARD CAP on frames per candidate. Bounds cost (it scales with total pixel area)
-# and the number of sheets. 120 keeps ~2 FPS over a ±20s-padded window (a ~60s
-# window -> 120 frames = three 6x8 sheets); if 2 FPS would exceed it, we widen the
-# interval (drop below 2 FPS) so the count stays put.
-_FINE_FRAME_MAX_FRAMES: int = 120
 
 # A provider call for one prepared media segment: (segment, hints, duration) ->
 # clip-relative ClipPlan. Both passes use this; only the hints differ.
@@ -184,13 +186,14 @@ async def analyze_video(
         )
 
     async def _fine_sheets(segment: Path, h: AnalysisHints, dur: float) -> ClipPlan:
-        # Render the candidate window as timestamped contact sheet(s) at ~2 FPS
-        # and hand the model the grid image(s), NOT a video clip it would
-        # re-sample to ~1fps. The frame count is capped (_FINE_FRAME_MAX_FRAMES):
-        # if 2 FPS would exceed it, widen the interval (lower fps) so the sheet
-        # count and cost stay bounded. The burned-in timestamps are clip-relative;
-        # ``_run_two_pass`` re-bases the returned boundaries to absolute time.
-        interval = max(_FINE_FRAME_INTERVAL_SEC, dur / _FINE_FRAME_MAX_FRAMES)
+        # Render the candidate window as timestamped contact sheet(s) at a fixed
+        # 2 FPS and hand the model the grid image(s), NOT a video clip it would
+        # re-sample to ~1fps. NO frame cap: diluting a long window (the old cap)
+        # made fast impacts fall between frames. The candidate window is bounded by
+        # the coarse max duration + padding, so 2 FPS stays reasonable. The
+        # burned-in timestamps are clip-relative; ``_run_two_pass`` re-bases the
+        # returned boundaries to absolute time.
+        interval = _FINE_FRAME_INTERVAL_SEC
         fps = 1.0 / interval
         n_frames = max(1, int(dur / interval))
         # Each cell shows its 0-based index; the model looks the index up in this
@@ -491,12 +494,17 @@ async def _run_two_pass(
             analyze=analyze,
             kind=f"{kind}-coarse",
         )
-        candidates = sorted(coarse_plan.clips, key=lambda c: -c.score)[:_TWO_PASS_MAX_CANDIDATES]
+        candidates = [
+            c
+            for c in sorted(coarse_plan.clips, key=lambda c: -c.score)
+            if c.score >= _TWO_PASS_CANDIDATE_MIN_SCORE
+        ][:_TWO_PASS_CANDIDATE_CEILING]
         log.info(
-            "%s two-pass: %d candidate region(s) located (analysing top %d)",
+            "%s two-pass: %d candidate region(s) located (refining %d with score >= %d)",
             kind,
             len(coarse_plan.clips),
             len(candidates),
+            _TWO_PASS_CANDIDATE_MIN_SCORE,
         )
         if not candidates:
             return coarse_plan

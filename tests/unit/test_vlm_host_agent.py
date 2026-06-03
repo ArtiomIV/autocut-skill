@@ -117,46 +117,56 @@ def test_estimate_cost_is_zero() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Video capability + video-input pause (host+video path)
+# Image-only: contact-sheet pause (host two-pass) — no video capability
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_supports_video_defaults_false_and_opts_in(tmp_path: Path) -> None:
+async def test_supports_video_always_false(tmp_path: Path) -> None:
+    # The host is image-only now; there is no video opt-in.
     assert await HostAgentProvider(work_dir=tmp_path).supports_video() is False
-    assert await HostAgentProvider(work_dir=tmp_path, supports_video=True).supports_video() is True
 
 
 @pytest.mark.asyncio
-async def test_analyze_video_clip_writes_video_request_and_pauses(tmp_path: Path) -> None:
-    clip = tmp_path / "compressed.mp4"
-    clip.write_bytes(b"\x00\x00\x00")  # presence is enough; content is not read
-    provider = HostAgentProvider(work_dir=tmp_path, supports_video=True, agent_hint="claude")
+async def test_analyze_contact_sheets_writes_request_and_pauses(tmp_path: Path) -> None:
+    sheets = [tmp_path / "sheet_000.jpg", tmp_path / "sheet_001.jpg"]
+    for s in sheets:
+        s.write_bytes(b"\xff\xd8\xff")  # presence is enough; bytes are not read
+    provider = HostAgentProvider(work_dir=tmp_path, agent_hint="claude")
 
     with pytest.raises(HostAgentPauseRequested) as caught:
-        await provider.analyze_video_clip(
-            clip,
+        await provider.analyze_contact_sheets(
+            sheets,
             AnalysisHints(),
             video_id="video_001",
-            clip_duration_sec=44.0,
+            duration_sec=44.0,
+            frame_times=[0.0, 0.5, 1.0],
         )
 
     assert caught.value.request_path == tmp_path / "VLM_REQUEST.md"
     assert caught.value.response_path == tmp_path / "VLM_RESPONSE.json"
     written = caught.value.request_path.read_text(encoding="utf-8")
-    assert "compressed.mp4" in written  # references the MP4 by path
-    assert "VIDEO" in written  # video-variant brief
+    assert "sheet_000.jpg" in written  # references each sheet by path
+    assert "sheet_001.jpg" in written
+    assert "CONTACT SHEETS" in written
     assert "video_001" in written
-    assert "--host-video" in written  # fallback guidance for a non-video agent
+    # The index -> absolute time sidecar is written and referenced.
+    index_path = tmp_path / "VLM_SHEET_INDEX.json"
+    assert index_path.is_file()
+    assert "VLM_SHEET_INDEX.json" in written
+    index_map = json.loads(index_path.read_text(encoding="utf-8"))
+    assert index_map["0"] == "00:00:00.000"
+    assert index_map["1"] == "00:00:00.500"
 
 
 @pytest.mark.asyncio
-async def test_analyze_video_clip_errors_when_clip_missing(tmp_path: Path) -> None:
-    provider = HostAgentProvider(work_dir=tmp_path, supports_video=True)
-    with pytest.raises(VLMError, match="not found"):
-        await provider.analyze_video_clip(
-            tmp_path / "missing.mp4",
+async def test_analyze_contact_sheets_rejects_empty(tmp_path: Path) -> None:
+    provider = HostAgentProvider(work_dir=tmp_path)
+    with pytest.raises(VLMError, match="no sheets"):
+        await provider.analyze_contact_sheets(
+            [],
             AnalysisHints(),
             video_id="x",
-            clip_duration_sec=10.0,
+            duration_sec=10.0,
+            frame_times=[],
         )

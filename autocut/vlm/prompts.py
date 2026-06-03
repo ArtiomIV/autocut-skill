@@ -413,6 +413,48 @@ prompt version, timing) are filled in by the caller.
 """
 
 
+# Used by the HOST image-only two-pass (both the coarse locate pass and the fine
+# pass). Unlike the cloud contact-sheet prompt, the index -> time map here is in
+# ABSOLUTE source time, and the timeline may JUMP between cells (the fine pass
+# concatenates several candidate windows into one continuous index space). So the
+# model must ALWAYS read a cell's time from the map and never assume neighbouring
+# cells are adjacent in time. Returned timestamps are already absolute — the host
+# pipeline does NOT re-base them.
+_HOST_SHEET_USER_TEMPLATE: Final[str] = """\
+Video metadata: content type = {content_hint}, language = {language},
+goal = {goal}, source duration = {duration_sec:.2f}s.
+
+You are given {n_sheets} contact-sheet image(s). Each sheet is a GRID of frames
+in chronological reading order: left to right, then top to bottom. Every frame
+has a short INTEGER INDEX printed in its TOP-LEFT corner (yellow number). The
+index is CONTINUOUS across all the sheets (the first sheet holds the lowest
+indices, each following sheet continues immediately after the previous one).
+
+IMPORTANT: the frames are NOT evenly spaced in time, and the timeline can JUMP
+between consecutive cells (these grids may stitch together several separate
+regions of the source). NEVER assume two neighbouring cells are adjacent in time
+and NEVER estimate a time by counting cells. To get a frame's EXACT time, look
+its corner index up in this map (index -> ABSOLUTE source ``HH:MM:SS.mmm``):
+{index_map}
+
+Find the frame where an action starts/ends, read its corner index, look up its
+mapped absolute time, and use THAT as the boundary. The timestamps you return in
+``start``/``end`` are ABSOLUTE source times taken from this map (do NOT make them
+relative to the clip).
+
+Identify the segments worth keeping and report each ``start``/``end`` using those
+mapped, absolute timestamps.
+
+Return JSON matching this schema (do not output the schema itself, output
+your analysis):
+{schema}
+
+Fill ``video_id`` with {video_id!r} and ``duration_sec`` with {duration_sec}.
+Leave ``metadata`` as an empty object — provenance fields (provider, model,
+prompt version, timing) are filled in by the caller.
+"""
+
+
 # Used by the audio-input path: the model LISTENS to the clip (no keyframes,
 # no visual cues). The signal is the spoken content, so the whole framing
 # differs from the keyframe/video prompts — judge what is SAID.
@@ -782,6 +824,38 @@ def build_contact_sheet_user_prompt(
         f"  {i} -> {format_timestamp(timedelta(seconds=t))}" for i, t in enumerate(frame_times)
     )
     return _CONTACT_SHEET_USER_TEMPLATE.format(
+        content_hint=hints.content_hint.value,
+        language=hints.language,
+        goal=hints.goal,
+        duration_sec=duration_sec,
+        n_sheets=n_sheets,
+        index_map=index_map,
+        schema=clip_plan_schema(),
+        video_id=video_id,
+    )
+
+
+def build_host_sheet_user_prompt(
+    *,
+    video_id: str,
+    duration_sec: float,
+    hints: AnalysisHints,
+    n_sheets: int,
+    frame_times: list[float],
+) -> str:
+    """User message for the HOST image-only two-pass (coarse + fine).
+
+    ``frame_times[i]`` is the ABSOLUTE source time (seconds) of the cell burning
+    index ``i``. The map is rendered as ``index -> HH:MM:SS.mmm`` and the model is
+    told the timeline may jump between cells — so it reads boundaries straight off
+    the map and returns ABSOLUTE timestamps that the host pipeline keeps as-is (no
+    re-basing). Used by both the coarse locate pass and the fine pass; the system
+    prompt (coarse vs fine) decides the selection behaviour.
+    """
+    index_map = "\n".join(
+        f"  {i} -> {format_timestamp(timedelta(seconds=t))}" for i, t in enumerate(frame_times)
+    )
+    return _HOST_SHEET_USER_TEMPLATE.format(
         content_hint=hints.content_hint.value,
         language=hints.language,
         goal=hints.goal,

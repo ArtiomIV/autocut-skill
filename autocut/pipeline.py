@@ -31,6 +31,14 @@ from pathlib import Path
 
 from autocut.config import AutoCutConfig
 from autocut.content import ContentProfile, profile_for
+from autocut.host_analysis import (
+    HOST_TWO_PASS_MIN_DURATION_SEC,
+    build_coarse_sheets,
+    build_fine_sheets,
+    dedup_plan,
+    empty_plan,
+    select_fine_windows,
+)
 from autocut.models import (
     AnalysisHints,
     ClipPlan,
@@ -49,24 +57,28 @@ from autocut.video import (
     find_hot_windows,
     probe_video,
 )
-from autocut.video.compress import compress_for_vlm
 from autocut.video.refine import refine_start_to_impact
 from autocut.video_analysis import analyze_audio, analyze_video
 from autocut.vlm import CostEstimate, VLMError, VLMProvider
+from autocut.vlm.host_agent import HostAgentProvider
+from autocut.vlm.prompts import PROMPT_VERSION
 
 log = logging.getLogger(__name__)
 
 DEFAULT_KEYFRAME_SUBDIR = "keyframes"
 RESUME_STATE_FILENAME = ".autocut_resume.json"
 
+# Sub-dirs the host image two-pass renders its contact sheets into (under the
+# work dir, so they persist across the pause/resume).
+HOST_COARSE_SHEETS_SUBDIR = "coarse_sheets"
+HOST_FINE_SHEETS_SUBDIR = "fine_sheets"
+# Coarse candidate regions bracket a moment (the fine pass trims it), so the
+# locate pass uses a looser max duration than a final clip.
+_HOST_COARSE_MAX_DURATION_SEC: float = 60.0
+
 # A confirm hook: returns True to proceed, False to abort. The CLI passes
 # its interactive prompt; tests pass a constant.
 ConfirmHook = Callable[[CostEstimate, float], bool]
-
-# Name of the compressed analysis copy the host-video path leaves in the work
-# dir for the agent to watch (persisted across the pause/resume, unlike the
-# L2 engine's self-cleaning temp dir).
-HOST_VIDEO_FILENAME = "compressed.mp4"
 
 
 class Route(Enum):
@@ -78,10 +90,10 @@ class Route(Enum):
     thin runner — the orchestrator does not grow an ad-hoc tree of ``if``s.
     """
 
-    keyframe = "keyframe"  # stills path — host pause/resume OR openrouter images
+    keyframe = "keyframe"  # stills path — openrouter images fallback
     openrouter_video = "openrouter_video"  # L2 autonomous batch loop (base64 video)
     openrouter_audio = "openrouter_audio"  # L2 autonomous batch loop (audio, talk)
-    host_video = "host_video"  # single-pass compressed MP4 via host pause/resume
+    host_image = "host_image"  # image-only contact-sheet two-pass via host pause/resume
 
 
 # Content types whose signal is the spoken word — routed to audio when the model
@@ -115,8 +127,8 @@ def _select_route(
     falls back to keyframes.
     """
     if provider_name == "host":
-        # Host has no audio path yet (cannot listen); video or stills only.
-        return Route.host_video if supports_video else Route.keyframe
+        # Host is image-only: the contact-sheet two-pass, never video or audio.
+        return Route.host_image
     if content_hint in _TALK_HINTS and supports_audio:
         return Route.openrouter_audio
     if supports_video:
@@ -252,8 +264,8 @@ async def run_analysis(
             two_pass=two_pass,
             force_two_pass=force_two_pass,
         )
-    if route is Route.host_video:
-        return await _run_host_video_analysis(
+    if route is Route.host_image:
+        return await _run_host_image_analysis(
             video,
             provider,
             metadata=metadata,
@@ -530,7 +542,7 @@ def _refine_action_boundaries(plan: ClipPlan, *, video: Path, duration_sec: floa
     return plan.model_copy(update={"clips": refined})
 
 
-async def _run_host_video_analysis(
+async def _run_host_image_analysis(
     video: Path,
     provider: VLMProvider,
     *,
@@ -542,62 +554,202 @@ async def _run_host_video_analysis(
     accurate_cuts: bool,
     write_outputs: bool,
 ) -> AnalysisResult:
-    """Host video-input path: compress once, hand the MP4 to the agent, pause.
+    """Host image-only two-pass — render contact sheets, hand them over, pause.
 
-    Single-pass by design. Unlike the OpenRouter path there is no base64 size
-    ceiling (the agent reads the file from disk), so the whole compressed video
-    is sent in one pause/resume — no batch loop, no L2 engine. The host's
-    ``analyze_video_clip`` writes ``VLM_REQUEST.md`` and raises
-    ``HostAgentPauseRequested``; the resume state written here lets
-    ``autocut resume`` finish via ``complete_from_plan`` after the agent fills
-    in ``VLM_RESPONSE.json``. Cutting still uses the ORIGINAL video, never the
-    compressed analysis copy.
+    No video, no audio, no DSP: the whole analysis is timestamped contact sheets
+    the agent reads from disk. For sources over 60s this is the COARSE pass
+    (sparse 1f/3s grids over the whole timeline → wide candidate regions); the
+    fine pass follows on ``autocut resume``. For short sources it goes straight to
+    a single FINE pass (dense 2-FPS grids of the whole clip). Either way the
+    provider raises ``HostAgentPauseRequested`` and the resume sidecar (with the
+    phase) lets ``autocut resume`` continue. Cutting always uses the ORIGINAL
+    video later, via ``cut --from-json``.
     """
-    log.info("pipeline: host video path — compressing %s for the agent", video)
-    compressed = compress_for_vlm(video, root / HOST_VIDEO_FILENAME)
+    del config, profile  # ranking config/profile are applied on resume, not on the pausing pass
+    video_id = video.stem or "video"
+    duration = metadata.duration_sec
+    long_source = duration > HOST_TWO_PASS_MIN_DURATION_SEC
 
-    # Persist before the pause so resume can complete (strategy="video",
-    # zero keyframes — the agent watched the clip, not stills).
+    if long_source:
+        log.info("pipeline: host image two-pass — building COARSE sheets for %s", video)
+        sheets, frame_times = build_coarse_sheets(video, root / HOST_COARSE_SHEETS_SUBDIR, duration)
+        pass_hints = effective_hints.model_copy(
+            update={
+                "prompt_template": "coarse",
+                "max_duration_sec": min(_HOST_COARSE_MAX_DURATION_SEC, duration),
+            }
+        )
+        phase = "coarse"
+    else:
+        log.info("pipeline: host image single FINE pass (short source) for %s", video)
+        sheets, frame_times = build_fine_sheets(
+            video, root / HOST_FINE_SHEETS_SUBDIR, [(0.0, duration)]
+        )
+        pass_hints = effective_hints
+        phase = "fine"
+
     _write_resume_state(
         root,
         video=video,
         metadata=metadata,
         n_scenes=0,
-        n_keyframes=0,
-        sampling_strategy="video",
+        n_keyframes=len(frame_times),
+        sampling_strategy="host-image",
         accurate_cuts=accurate_cuts,
         write_outputs=write_outputs,
         content_hint=effective_hints.content_hint,
+        phase=phase,
+        query=effective_hints.query,
+        goal=effective_hints.goal,
+        language=effective_hints.language,
     )
 
-    video_id = video.stem or "video"
-    # Raises HostAgentPauseRequested (propagates to the CLI). The whole video is
-    # one clip, so clip-relative timestamps equal absolute source time. The
-    # return path below is unreachable for today's pausing host but kept so a
-    # future non-pausing host implementation completes cleanly.
-    plan = await provider.analyze_video_clip(
-        compressed,
-        effective_hints,
-        video_id=video_id,
-        clip_duration_sec=metadata.duration_sec,
+    # Raises HostAgentPauseRequested (propagates to the CLI), which resumes via
+    # ``resume_host_analysis``. The line below is unreachable for the pausing
+    # host but kept defensive for a future non-pausing implementation.
+    await provider.analyze_contact_sheets(
+        sheets, pass_hints, video_id=video_id, duration_sec=duration, frame_times=frame_times
     )
+    raise VLMError("host image pass did not pause as expected")  # pragma: no cover
+
+
+def resume_host_analysis(base: Path, config: AutoCutConfig) -> AnalysisResult:
+    """Continue a paused host image two-pass after the agent wrote the response.
+
+    Reads the resume sidecar to learn which phase paused:
+
+    * ``coarse`` → parse the candidate regions, build the dense FINE sheets for
+      them, rewrite the sidecar as ``fine`` and PAUSE AGAIN (raises
+      ``HostAgentPauseRequested`` for the CLI to surface).
+    * ``fine`` → parse the absolute-time clips, dedup, rank and write plan.json.
+
+    Synchronous: the second-pause provider call is driven via ``asyncio.run`` so
+    the pause exception propagates out to the CLI like the first pause did.
+    """
+    import asyncio
+
+    state = load_resume_state(base)
+    phase = str(state.get("phase", "fine"))
+    provider = HostAgentProvider(work_dir=base, agent_hint=config.vlm.model)
+    plan = provider.resume_from_disk()
+
+    video = Path(str(state["video_path"]))
+    metadata = VideoMetadata.model_validate(state["video_metadata"])
+    try:
+        hint = ContentHint(str(state.get("content_hint", ContentHint.hybrid.value)))
+    except ValueError:
+        hint = ContentHint.hybrid
+    profile = profile_for(hint)
+    duration = metadata.duration_sec
+
+    if phase == "coarse":
+        windows = select_fine_windows(plan, duration)
+        log.info("pipeline: host resume (coarse) -> %d candidate region(s)", len(plan.clips))
+        if not windows:
+            # Coarse found nothing worth refining — finish with an empty plan
+            # (a valid, honest outcome) rather than pausing again.
+            return _complete_host(
+                empty_plan(
+                    video.stem or "video",
+                    duration,
+                    agent_hint=config.vlm.model,
+                    prompt_version=PROMPT_VERSION,
+                ),
+                base,
+                video=video,
+                metadata=metadata,
+                config=config,
+                state=state,
+                profile=profile,
+            )
+        sheets, frame_times = build_fine_sheets(video, base / HOST_FINE_SHEETS_SUBDIR, windows)
+        fine_hints = _apply_profile_to_hints(
+            AnalysisHints(
+                content_hint=hint,
+                goal=str(state.get("goal", "")),
+                language=str(state.get("language", "en")),
+                query=_state_query(state),
+            ),
+            profile,
+        )
+        _write_resume_state(
+            base,
+            video=video,
+            metadata=metadata,
+            n_scenes=0,
+            n_keyframes=len(frame_times),
+            sampling_strategy="host-image",
+            accurate_cuts=bool(state.get("accurate_cuts", False)),
+            write_outputs=bool(state.get("write_outputs", True)),
+            content_hint=hint,
+            phase="fine",
+            query=_state_query(state),
+            goal=str(state.get("goal", "")),
+            language=str(state.get("language", "en")),
+        )
+        # Raises HostAgentPauseRequested → propagates out of asyncio.run to the CLI.
+        asyncio.run(
+            provider.analyze_contact_sheets(
+                sheets,
+                fine_hints,
+                video_id=video.stem or "video",
+                duration_sec=duration,
+                frame_times=frame_times,
+            )
+        )
+        raise VLMError("host fine pass did not pause as expected")  # pragma: no cover
+
+    # phase == "fine": the agent returned absolute-time clips; dedup + complete.
+    return _complete_host(
+        dedup_plan(plan),
+        base,
+        video=video,
+        metadata=metadata,
+        config=config,
+        state=state,
+        profile=profile,
+    )
+
+
+def _complete_host(
+    plan: ClipPlan,
+    base: Path,
+    *,
+    video: Path,
+    metadata: VideoMetadata,
+    config: AutoCutConfig,
+    state: dict[str, object],
+    profile: ContentProfile,
+) -> AnalysisResult:
+    """Rank + write plan.json for a finished host run, then clear the sidecar."""
     result = complete_from_plan(
         plan,
         video=video,
         metadata=metadata,
         config=config,
-        output_root=root,
+        output_root=base,
         n_scenes=0,
-        n_keyframes=0,
-        sampling_strategy="video",
-        accurate_cuts=accurate_cuts,
-        write_outputs=write_outputs,
-        cost_estimate_usd=plan.metadata.cost_usd or 0.0,
+        n_keyframes=_state_int(state, "n_keyframes"),
+        sampling_strategy=str(state.get("sampling_strategy", "host-image")),
+        accurate_cuts=bool(state.get("accurate_cuts", False)),
+        write_outputs=bool(state.get("write_outputs", True)),
         keyframes=None,
         profile=profile,
     )
-    _clear_resume_state(root)
+    _clear_resume_state(base)
     return result
+
+
+def _state_int(state: dict[str, object], key: str) -> int:
+    """Read an int counter from the resume-state dict, defaulting to 0."""
+    value = state.get(key, 0)
+    return int(value) if isinstance(value, int | float) else 0
+
+
+def _state_query(state: dict[str, object]) -> str | None:
+    """Read the persisted query (None when absent/empty)."""
+    q = state.get("query")
+    return q if isinstance(q, str) and q.strip() else None
 
 
 def complete_from_plan(
@@ -691,13 +843,19 @@ def _write_resume_state(
     accurate_cuts: bool,
     write_outputs: bool,
     content_hint: ContentHint,
+    phase: str = "fine",
+    query: str | None = None,
+    goal: str = "",
+    language: str = "en",
 ) -> Path:
-    """Persist the parameters ``complete_from_plan`` needs to finish later.
+    """Persist the parameters needed to finish (or advance) a paused run later.
 
     ``content_hint`` is persisted so the resumed analysis rebuilds the same
     profile and applies the same per-mode keep threshold (e.g. highlights=7)
-    that the live path would have — without it a resumed host run would
-    silently fall back to the global default.
+    that the live path would have. ``phase`` (``coarse``/``fine``) drives the
+    host image two-pass resume: a ``coarse`` resume builds the fine sheets and
+    pauses again, a ``fine`` resume completes. ``query``/``goal``/``language``
+    are persisted so the fine pass rebuilds the same prompt as the coarse one.
     """
     output_root.mkdir(parents=True, exist_ok=True)
     state = {
@@ -710,6 +868,10 @@ def _write_resume_state(
         "n_scenes": n_scenes,
         "n_keyframes": n_keyframes,
         "content_hint": content_hint.value,
+        "phase": phase,
+        "query": query,
+        "goal": goal,
+        "language": language,
     }
     path = output_root / RESUME_STATE_FILENAME
     path.write_text(json.dumps(state, indent=2), encoding="utf-8")

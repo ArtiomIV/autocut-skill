@@ -13,19 +13,17 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
-from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
 
 from autocut import __version__
 from autocut.config import AutoCutConfig, AutoCutSettings, config_path
-from autocut.models import AnalysisHints, ContentHint, VideoMetadata
+from autocut.models import AnalysisHints, ContentHint
 from autocut.pipeline import (
     AnalysisResult,
     CostCapExceeded,
     ResumeStateError,
-    complete_from_plan,
-    load_resume_state,
+    resume_host_analysis,
     run_analysis,
 )
 from autocut.security import (
@@ -41,7 +39,6 @@ from autocut.security import (
 from autocut.vlm import (
     CostEstimate,
     HostAgentPauseRequested,
-    HostAgentProvider,
     UnavailableProviderError,
     VLMError,
     list_openrouter_models,
@@ -144,18 +141,6 @@ def run(
         str | None,
         typer.Option("--vlm-model", help="VLM model id override (provider-specific)."),
     ] = None,
-    host_video: Annotated[
-        bool,
-        typer.Option(
-            "--host-video",
-            help=(
-                "Only with --vlm host: declare the host agent video-capable so "
-                "AutoCut sends the compressed MP4 (one pause/resume) instead of "
-                "keyframes. Use only if the agent can watch a video file; "
-                "otherwise it falls back to keyframes."
-            ),
-        ),
-    ] = False,
     sampling: Annotated[
         str,
         typer.Option(
@@ -264,16 +249,11 @@ def run(
     out_root = (output_dir or cfg.output.base_dir).resolve()
     work_dir = out_root  # host-agent provider writes request/response files here
 
-    if host_video and provider_name.strip().lower() != "host":
-        err_console.print("--host-video only applies to --vlm host; ignoring it.")
-        host_video = False
-
     try:
         provider = make_provider(
             provider_name,
             model=model,
             work_dir=work_dir,
-            host_supports_video=host_video,
         )
     except UnavailableProviderError as exc:
         err_console.print(str(exc))
@@ -323,14 +303,14 @@ def resume(
         ),
     ] = None,
 ) -> None:
-    """Resume a paused host-agent run.
+    """Resume a paused host-agent run (the image-only two-pass).
 
-    The host agent pauses once, at the analysis step: ``run`` writes
-    ``VLM_REQUEST.md`` and a ``.autocut_resume.json`` sidecar. This loads
-    the agent's ``VLM_RESPONSE.json``, ranks clips, runs the output
-    writers, and writes the manifest. (Content classification is no longer
-    a pause — the orchestrating agent picks the mode up front, or calls the
-    standalone ``autocut detect`` subcommand.)
+    The host pauses once or twice: ``run`` writes ``VLM_REQUEST.md`` +
+    contact sheets + a ``.autocut_resume.json`` sidecar recording the phase.
+    On a COARSE resume this reads the candidate regions, builds the dense FINE
+    sheets and pauses AGAIN (run ``autocut resume`` once more). On a FINE resume
+    it parses the absolute-time clips, dedups, ranks, and writes ``plan.json``
+    (then cut with ``autocut cut --from-json``).
     """
     settings = AutoCutSettings.load()
     cfg = settings.config
@@ -340,62 +320,20 @@ def resume(
 
 
 def _resume_analysis_phase(base: Path, cfg: AutoCutConfig) -> None:
-    """Handle the standard host-agent analysis resume (pre-Phase-E flow)."""
+    """Drive one host image two-pass resume step (coarse→fine pause, or finish)."""
     try:
-        state = load_resume_state(base)
+        result = resume_host_analysis(base, cfg)
+    except HostAgentPauseRequested as pause:
+        # Coarse resume built the fine sheets and paused again for the fine pass.
+        console.print("[green]OK[/] Coarse candidates loaded; built the fine contact sheets.")
+        _print_pause_message(pause)
+        raise typer.Exit(code=0) from None
     except ResumeStateError as exc:
         err_console.print(str(exc))
         raise typer.Exit(code=1) from exc
-
-    provider = HostAgentProvider(work_dir=base, agent_hint=cfg.vlm.model)
-    try:
-        plan = provider.resume_from_disk()
     except VLMError as exc:
         err_console.print(str(exc))
         raise typer.Exit(code=1) from exc
-
-    console.print(f"[green]OK[/] Loaded ClipPlan with {len(plan.clips)} clip(s).")
-
-    video = Path(str(state["video_path"]))
-    if not video.is_file():
-        err_console.print(
-            f"original video no longer at {video}; cannot cut clips. "
-            f"Move the file back or re-run `autocut run` from scratch."
-        )
-        raise typer.Exit(code=1)
-
-    try:
-        metadata = VideoMetadata.model_validate(state["video_metadata"])
-    except ValidationError as exc:
-        err_console.print(f"resume state video_metadata is invalid: {exc}")
-        raise typer.Exit(code=1) from exc
-
-    # Rebuild the profile from the persisted mode so the resumed ranking
-    # applies the same per-mode keep threshold the live path would have.
-    from autocut.content import profile_for
-
-    try:
-        resumed_hint = ContentHint(str(state.get("content_hint", ContentHint.hybrid.value)))
-    except ValueError:
-        resumed_hint = ContentHint.hybrid
-    profile = profile_for(resumed_hint)
-
-    result = complete_from_plan(
-        plan,
-        video=video,
-        metadata=metadata,
-        config=cfg,
-        output_root=base,
-        n_scenes=_state_int(state, "n_scenes"),
-        n_keyframes=_state_int(state, "n_keyframes"),
-        sampling_strategy=str(state.get("sampling_strategy", "hybrid")),
-        accurate_cuts=bool(state.get("accurate_cuts", False)),
-        write_outputs=bool(state.get("write_outputs", True)),
-        profile=profile,
-    )
-    # Resume succeeded end-to-end; the sidecar has served its purpose.
-    with contextlib.suppress(OSError):
-        (base / ".autocut_resume.json").unlink(missing_ok=True)
 
     _render_analysis_summary(result)
 
@@ -1092,14 +1030,6 @@ def _print_pause_message(pause: HostAgentPauseRequested) -> None:
         "Read the request, write the ClipPlan JSON to the response path,\n"
         "then run [bold]autocut resume[/bold] to continue.\n"
     )
-
-
-def _state_int(state: dict[str, object], key: str) -> int:
-    """Read an int counter from the resume-state dict, defaulting to 0."""
-    value = state.get(key, 0)
-    if isinstance(value, int | float):
-        return int(value)
-    return 0
 
 
 def _build_hints_from_cli(

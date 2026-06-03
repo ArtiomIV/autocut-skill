@@ -37,15 +37,19 @@ from autocut.vlm.base import (
 )
 from autocut.vlm.prompts import (
     PROMPT_VERSION,
+    build_host_sheet_user_prompt,
     build_system_prompt,
     build_user_prompt,
-    build_video_user_prompt,
 )
 
 log = logging.getLogger(__name__)
 
 REQUEST_FILENAME = "VLM_REQUEST.md"
 RESPONSE_FILENAME = "VLM_RESPONSE.json"
+# Machine-readable companion to the contact-sheet request: the index -> absolute
+# time map the agent uses to read precise boundaries off the burned-in cell
+# indices. Written next to VLM_REQUEST.md for both host two-pass phases.
+SHEET_INDEX_FILENAME = "VLM_SHEET_INDEX.json"
 
 # Phase E (host-agent detection) request/response filenames. Distinct from
 # the analysis ones so both phases can leave artefacts in the same work
@@ -64,19 +68,16 @@ class HostAgentProvider(VLMProvider):
         work_dir: str | Path,
         *,
         agent_hint: str = "host-agent",
-        supports_video: bool = False,
     ) -> None:
         """Create a host-agent provider that uses ``work_dir`` for the handoff files.
 
-        ``supports_video`` declares whether the surrounding AI agent can ingest
-        a video file directly. There is no live capability endpoint for the
-        host (unlike OpenRouter's ``/models``), so this is opt-in: the user
-        sets it via ``autocut run --host-video`` only when they know the agent
-        can watch an MP4. Default ``False`` keeps the keyframe (stills) path.
+        The host is IMAGE-ONLY: it analyses contact sheets the pipeline renders to
+        disk (the two-pass coarse/fine flow), never a video or audio payload. So
+        there is no video-capability flag — ``supports_video`` always reports
+        ``False`` and the pipeline routes the host to its dedicated image flow.
         """
         self._work_dir = Path(work_dir)
         self._agent_hint = agent_hint
-        self._supports_video = supports_video
 
     # ------------------------------------------------------------------
     # VLMProvider interface
@@ -122,51 +123,60 @@ class HostAgentProvider(VLMProvider):
         raise HostAgentPauseRequested(request_path=request_path, response_path=response_path)
 
     async def supports_video(self) -> bool:
-        """Whether the surrounding agent was declared video-capable (opt-in flag)."""
-        return self._supports_video
+        """The host is image-only (contact sheets); it never ingests video."""
+        return False
 
-    async def analyze_video_clip(
+    async def analyze_contact_sheets(
         self,
-        clip_path: Path,
+        sheets: list[Path],
         hints: AnalysisHints,
         *,
         video_id: str,
-        clip_duration_sec: float,
+        duration_sec: float,
+        frame_times: list[float],
         timeout_sec: int = 300,
     ) -> ClipPlan:
-        """Write a VIDEO request and pause; the agent watches the MP4 directly.
+        """Write a CONTACT-SHEET request and pause; the agent reads the grids.
 
-        The host transport has no base64 size ceiling (the agent reads the file
-        from disk, not an inline payload), so this is a single-pass handoff: the
-        whole compressed clip is referenced by path and the agent returns one
-        ``ClipPlan`` with timestamps relative to the clip — which, for the
-        whole-video single pass the pipeline uses today, equal absolute source
-        time. ``resume_from_disk`` (shared with the keyframe path) parses the
-        response. Raises ``HostAgentPauseRequested`` exactly like ``analyze``.
+        Used for BOTH host two-pass phases — the coarse locate pass (sparse grids
+        over the whole timeline) and the fine pass (dense grids of the candidate
+        windows). ``hints.prompt_template`` (``coarse`` vs the per-mode template)
+        selects the behaviour; ``frame_times[i]`` is the ABSOLUTE source time of
+        the cell burning index ``i``. The map is written both inline in the brief
+        and as a machine-readable ``VLM_SHEET_INDEX.json`` sidecar. The agent
+        returns absolute timestamps, parsed by ``resume_from_disk``. Raises
+        ``HostAgentPauseRequested`` like ``analyze``.
         """
         del timeout_sec  # the host pause has no network timeout
-        if not clip_path.is_file():
-            raise VLMError(f"host_agent.analyze_video_clip: video clip not found: {clip_path}")
+        if not sheets:
+            raise VLMError("host_agent.analyze_contact_sheets called with no sheets")
 
         self._work_dir.mkdir(parents=True, exist_ok=True)
         request_path = self._work_dir / REQUEST_FILENAME
         response_path = self._work_dir / RESPONSE_FILENAME
+        index_path = self._work_dir / SHEET_INDEX_FILENAME
 
-        markdown = _render_video_request_markdown(
+        _write_sheet_index(index_path, frame_times)
+        markdown = _render_sheet_request_markdown(
             system_prompt=build_system_prompt(hints),
-            user_prompt=build_video_user_prompt(
+            user_prompt=build_host_sheet_user_prompt(
                 video_id=video_id,
-                duration_sec=clip_duration_sec,
+                duration_sec=duration_sec,
                 hints=hints,
+                n_sheets=len(sheets),
+                frame_times=frame_times,
             ),
-            clip_path=clip_path,
+            sheets=sheets,
+            index_path=index_path,
             response_path=response_path,
+            phase="coarse" if hints.prompt_template == "coarse" else "fine",
         )
         request_path.write_text(markdown, encoding="utf-8")
         log.info(
-            "host_agent paused (video): wrote %s referencing %s, waiting for %s",
+            "host_agent paused (%s sheets): wrote %s referencing %d sheet(s), waiting for %s",
+            "coarse" if hints.prompt_template == "coarse" else "fine",
             request_path,
-            clip_path,
+            len(sheets),
             response_path,
         )
         raise HostAgentPauseRequested(request_path=request_path, response_path=response_path)
@@ -407,30 +417,32 @@ def _render_request_markdown(
     )
 
 
-_VIDEO_REQUEST_TEMPLATE = """\
-# AutoCut — host-agent VLM request (VIDEO)
+_SHEET_REQUEST_TEMPLATE = """\
+# AutoCut — host-agent VLM request (CONTACT SHEETS — {phase} pass)
 
-The AutoCut pipeline is paused. You (the AI agent running this conversation)
-are being asked to do the vision analysis step on the agent subscription
-instead of calling an external API.
+The AutoCut pipeline is paused at the **{phase}** pass of the image-only
+two-pass. You (the AI agent running this conversation) do the vision analysis on
+the agent subscription instead of calling an external API.
 
 ## What to do
 
-1. Watch the video clip with your video/file tool:
+1. Open EVERY contact-sheet image listed below with your image tool, in order.
+   Each sheet is a grid of frames; every cell has a small yellow INTEGER INDEX
+   in its top-left corner. The indices are CONTINUOUS across all the sheets.
 
-   `{clip_path}`
+2. To get a cell's exact source time, look its index up in the index map. The
+   map is reproduced inline in the user prompt below AND written as JSON to:
 
-   If you CANNOT open or analyse a video file, do NOT guess from a single
-   frame. Stop and tell the user to re-run `autocut run` WITHOUT the
-   `--host-video` flag so AutoCut falls back to the keyframe (stills) path.
+   `{index_path}`
 
-2. Decide which segments are worth keeping as highlight clips, applying the
-   constraints in the system prompt and the schema in the user prompt (both
-   reproduced below). Timestamps are RELATIVE to this clip — its first frame
-   is 00:00:00.000.
+   The timeline can JUMP between consecutive cells (the grids may stitch several
+   regions together) — ALWAYS use the map, never count cells or assume two
+   neighbouring cells are adjacent in time. The mapped times are ABSOLUTE source
+   times; the ``start``/``end`` you return must be those absolute times.
 
-3. Write the result as a single JSON object matching the ``ClipPlan`` schema
-   to:
+3. Apply the constraints in the system prompt and the schema in the user prompt
+   (both reproduced below). Write the result as a single JSON object matching the
+   ``ClipPlan`` schema to:
 
    `{response_path}`
 
@@ -438,13 +450,17 @@ instead of calling an external API.
 
 Do not output anything else. The response file must contain only the JSON.
 
+## Contact sheets (in order)
+
+{sheet_listing}
+
 ## System prompt (verbatim)
 
 ```
 {system_prompt}
 ```
 
-## User prompt (verbatim — includes the JSON schema you must match)
+## User prompt (verbatim — includes the index map and the JSON schema)
 
 ```
 {user_prompt}
@@ -452,19 +468,30 @@ Do not output anything else. The response file must contain only the JSON.
 """
 
 
-def _render_video_request_markdown(
+def _render_sheet_request_markdown(
     *,
     system_prompt: str,
     user_prompt: str,
-    clip_path: Path,
+    sheets: list[Path],
+    index_path: Path,
     response_path: Path,
+    phase: str,
 ) -> str:
-    return _VIDEO_REQUEST_TEMPLATE.format(
-        clip_path=clip_path,
+    listing = "\n".join(f"{i}. `{p}`" for i, p in enumerate(sheets, start=1))
+    return _SHEET_REQUEST_TEMPLATE.format(
+        phase=phase,
+        sheet_listing=listing,
+        index_path=index_path,
         response_path=response_path,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
     )
+
+
+def _write_sheet_index(index_path: Path, frame_times: list[float]) -> None:
+    """Write the index -> absolute ``HH:MM:SS.mmm`` map as a JSON sidecar."""
+    index_map = {str(i): _format_ts(t) for i, t in enumerate(frame_times)}
+    index_path.write_text(json.dumps(index_map, indent=2), encoding="utf-8")
 
 
 _DETECTION_REQUEST_TEMPLATE = """\

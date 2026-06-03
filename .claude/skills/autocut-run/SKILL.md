@@ -66,9 +66,14 @@ Rules of thumb:
 - `--vlm openrouter` (default if configured): sends the compressed video (or
   audio for talk) to the model; fully automatic, costs money (cost cap applies).
   Writes `plan.json` when done — then cut it with `autocut cut --from-json`.
-- `--vlm host`: AutoCut writes `VLM_REQUEST.md` and pauses; YOU read it, write
-  `VLM_RESPONSE.json`, then run `autocut resume --work-dir DIR` (which writes
-  `plan.json`). Then cut with `autocut cut --from-json`.
+- `--vlm host`: image-only, zero-cost. AutoCut renders the video as timestamped
+  contact sheets and pauses (writes `VLM_REQUEST.md` + the sheets + a
+  `VLM_SHEET_INDEX.json` index→time map); YOU read the sheets, write the
+  `ClipPlan` JSON to `VLM_RESPONSE.json`, then run `autocut resume --work-dir
+  DIR`. For sources >60s this is a **two-pass**: the first resume loads your
+  coarse candidate regions, builds the dense fine sheets and **pauses again** —
+  read them and resume once more. The final resume writes `plan.json`. Then cut
+  with `autocut cut --from-json`. (Host has no audio path — it sees frames only.)
 
 ## Examples
 
