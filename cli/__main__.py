@@ -574,6 +574,26 @@ def probe(
 
 
 @app.command()
+def guidance(
+    mode: Annotated[
+        str,
+        typer.Argument(help="Editing mode: highlights | talk | hybrid."),
+    ] = "highlights",
+) -> None:
+    """Print the clip-selection rules for a HOST run. Deterministic, no VLM.
+
+    These are the SAME editorial rules the cloud model receives in its prompt
+    (anchor on the event not its aftermath; a count/standing-eight implies a strong
+    moment; score on intensity; KO always kept; exclude ceremony/dead time; keep
+    slow-mo replays). On the host path, read this BEFORE judging the contact sheets
+    so host and cloud pick clips identically.
+    """
+    from autocut.vlm.prompts import guidance_for
+
+    console.print(guidance_for(mode))
+
+
+@app.command()
 def sheet(
     video: Annotated[
         Path, typer.Argument(help="Input video to sample into timestamped contact sheets.")

@@ -61,6 +61,12 @@ You drive the deterministic tools. A contact **sheet** is a grid image: each cel
 is one frame with its integer index burned in; `index.json` maps every index to
 its exact second. You read the grid, pick moments, cut them.
 
+**Legibility (adapt to resolution):** the cells must be readable. For low-resolution
+sources (from `probe`, width ≤ ~640 / height ≤ ~480) the default 6×8 grid packs the
+cells too small — pass **bigger cells and fewer per sheet**, e.g. `--cell-px 320
+--cols 4 --rows 5`. For HD sources the 256px / 6×8 default is fine. The fine pass
+should always be legible (`--cell-px 320` is a safe default).
+
 ### Short / medium video (≤ ~15 min) — single dense pass
 
 ```bash
@@ -137,13 +143,28 @@ Pick the MODE/intent from the request crossed with the kind of video:
 (On cloud these map to `--content-hint highlights|talk|hybrid` / `--query`; on host
 they just guide YOUR selection.)
 
-Rules of thumb:
-- **highlights is strict**: keep only genuinely strong moments. Returning **zero
-  clips** is a valid, honest outcome — never force a best-of-nothing.
-- **query ≠ highlights**: one described moment is a query; elaborate the user's
-  words into a specific description and find exactly that.
-- Score on **intensity**, not just clean outcomes: a near-KO / staggering blow /
-  heated exchange counts even without a knockdown. Exclude pre-action and ceremony
-  (entrances, walk-ins, anthems, podiums) and dead time (between-round rest,
-  timeouts) — staging is not action.
-- Cut tight: include the wind-up and the follow-through of the moment, nothing more.
+### On HOST: load the SAME rules the cloud uses
+
+Before picking clips from the sheets, run and FOLLOW:
+
+```bash
+autocut guidance highlights     # or: talk | hybrid
+```
+
+This prints the exact editorial rules the cloud model gets in its prompt — there is
+ONE source, so host and cloud judge clips identically. Apply them. The rules that
+matter most (and the ones agents most often get wrong):
+
+- **ANCHOR ON THE EVENT, NOT ITS AFTERMATH.** A referee's count, a fighter on the
+  canvas, a celebration is PROOF an event happened just before — find that event
+  and start there. **A count (even a standing-eight without a knockdown) means a
+  strong moment occurred: KEEP it, never skip it because the outcome looks
+  ambiguous.** This is the #1 mistake — do not dismiss a near-KO.
+- **A KNOCKDOWN/KO is ALWAYS kept, score 9-10, never omitted.** Score on INTENSITY:
+  a near-KO / staggering blow / heated exchange counts even without a clean outcome.
+- **Keep slow-motion REPLAYS** (they're prime viral footage), score them high.
+- **OMIT** dead time, circling, clinching, no-clean-strike "exchanges", and all
+  pre-action/ceremony (entrances, anthems, podiums) and breaks (between-round rest).
+- **highlights is strict**: zero clips is a valid outcome — never force best-of-nothing.
+- **query ≠ highlights**: one described moment; elaborate it and find exactly that.
+- Cut tight: wind-up + follow-through of the moment, nothing more.

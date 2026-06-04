@@ -253,6 +253,54 @@ Content guidance — mixed / unknown content:
 """
 
 
+# Editorial preamble for the HOST path: the universal anchor-on-event +
+# low-frame-rate rules, phrased for an agent reading contact-sheet grids (vs the
+# cloud prompt's "keyframes"). Pairs with the mode guidance above so a host run
+# applies the SAME judgement the cloud system prompt would.
+_HOST_JUDGEMENT_PREAMBLE: Final[str] = """\
+You are selecting standalone highlight clips from a video you view as timestamped
+contact-sheet grids (each cell is one frame labelled with its index; index.json
+maps each index to its exact second).
+
+Universal rules (every mode):
+- ANCHOR ON THE EVENT, NEVER ON ITS AFTERMATH. A decisive event (a landing punch,
+  a goal, a fall) is often shorter than the gap between cells, so you may never see
+  the event cell itself — you see only its AFTERMATH: a referee's count, a fighter
+  down, a celebration, applause, players resetting, a result on screen. That
+  aftermath is PROOF an event happened in the seconds just before it. The instant
+  you recognise an aftermath you have ALSO concluded an event preceded it — set the
+  clip START where that event began, NEVER on the aftermath. A standing-eight
+  count, a hurt or staggered fighter, or any official intervention all imply a
+  strong moment just before: FIND it and include it — do not skip it because the
+  outcome looks ambiguous (a count is proof, even a standing-eight without a
+  knockdown is a near-KO worth keeping).
+- YOUR FRAMES ARE LOW FRAME-RATE: a fast impact lands 2-5s BEFORE the cell where
+  you first see its effect. For any impact, set START 3-5s earlier than where you
+  think it happened, so the real strike is inside the clip.
+- Being shown a window does NOT oblige you to keep anything: if there is only dead
+  time (no event and no consequence of one), keep nothing — empty is correct.
+"""
+
+
+def guidance_for(mode: str) -> str:
+    """Return the human-readable clip-selection rules for a HOST run of ``mode``.
+
+    SINGLE SOURCE of the editorial judgement, shared with the cloud system prompt:
+    the host agent reads this (via ``autocut guidance``) and applies the SAME rules
+    it would receive inside the openrouter prompt, so host and cloud pick clips
+    identically. ``mode`` accepts the editing modes / content hints; unknown values
+    fall back to the hybrid guidance.
+    """
+    m = (mode or "hybrid").strip().lower()
+    if m in {"highlights", "sport", "boxing", "gameplay"}:
+        body = _HIGHLIGHTS_GUIDANCE
+    elif m in {"talk", "podcast", "interview"}:
+        body = _TALK_GUIDANCE
+    else:
+        body = _HYBRID_GUIDANCE
+    return _HOST_JUDGEMENT_PREAMBLE + body
+
+
 _SYSTEM_TEMPLATES: Final[dict[PromptTemplateId, str]] = {
     "highlights": _CORE_RULES + _HIGHLIGHTS_GUIDANCE,
     "talk": _CORE_RULES + _TALK_GUIDANCE,

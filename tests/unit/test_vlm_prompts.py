@@ -13,6 +13,7 @@ from autocut.vlm.prompts import (
     build_user_prompt,
     clip_plan_schema,
     format_timestamp,
+    guidance_for,
 )
 
 
@@ -21,6 +22,38 @@ def test_schema_is_valid_json() -> None:
     assert isinstance(schema, dict)
     assert "properties" in schema
     assert "clips" in schema["properties"]
+
+
+# ---------------------------------------------------------------------------
+# guidance_for — host-path editorial rules (single source shared with cloud)
+# ---------------------------------------------------------------------------
+
+
+def test_guidance_highlights_carries_the_anchor_and_ko_rules() -> None:
+    text = guidance_for("highlights")
+    # The universal anchor-on-aftermath rule (the #1 host mistake) must be present.
+    assert "AFTERMATH" in text
+    assert "standing-eight" in text
+    # And the highlights-specific KO-always + replay rules.
+    assert "KNOCKDOWN" in text or "KNOCKOUT" in text
+    assert "REPLAY" in text
+
+
+def test_guidance_talk_uses_talk_body() -> None:
+    text = guidance_for("talk")
+    assert "podcast" in text or "interview" in text
+    # The shared preamble is always included.
+    assert "AFTERMATH" in text
+
+
+def test_guidance_unknown_mode_falls_back_to_hybrid() -> None:
+    text = guidance_for("totally-unknown")
+    assert "mixed / unknown content" in text
+
+
+def test_guidance_aliases_map_to_highlights() -> None:
+    # Content-hint aliases (boxing/sport) resolve to the highlights body.
+    assert guidance_for("boxing") == guidance_for("highlights")
 
 
 def test_schema_includes_extra_forbid_for_clip() -> None:
