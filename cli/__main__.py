@@ -22,8 +22,6 @@ from autocut.models import AnalysisHints, ContentHint
 from autocut.pipeline import (
     AnalysisResult,
     CostCapExceeded,
-    ResumeStateError,
-    resume_host_analysis,
     run_analysis,
 )
 from autocut.security import (
@@ -38,7 +36,6 @@ from autocut.security import (
 )
 from autocut.vlm import (
     CostEstimate,
-    HostAgentPauseRequested,
     UnavailableProviderError,
     VLMError,
     list_openrouter_models,
@@ -235,10 +232,9 @@ def run(
 
     settings = AutoCutSettings.load()
     cfg = settings.config
-    # ``run`` always produces per-clip separate outputs. Composing a single
-    # reel is the job of the deterministic ``autocut merge`` subcommand, so the
-    # pipeline never mutates the output mode at runtime — that keeps the
-    # resume sidecar trivially consistent (no output mode to persist).
+    # ``run`` always produces a per-clip plan.json. Composing a single reel is the
+    # job of the deterministic ``autocut merge`` subcommand, so the pipeline never
+    # mutates the output mode at runtime.
     cfg.output.modes = ["separate"]
 
     hints_override = _build_hints_from_cli(content_hint, query, cfg)
@@ -246,14 +242,9 @@ def run(
     provider_name = vlm or cfg.vlm.provider
     model = vlm_model or cfg.vlm.model
     out_root = (output_dir or cfg.output.base_dir).resolve()
-    work_dir = out_root  # host-agent provider writes request/response files here
 
     try:
-        provider = make_provider(
-            provider_name,
-            model=model,
-            work_dir=work_dir,
-        )
+        provider = make_provider(provider_name, model=model)
     except UnavailableProviderError as exc:
         err_console.print(str(exc))
         raise typer.Exit(code=2) from exc
@@ -279,59 +270,11 @@ def run(
                 force_two_pass=force_two_pass,
             )
         )
-    except HostAgentPauseRequested as pause:
-        _print_pause_message(pause)
-        raise typer.Exit(code=0) from None
     except CostCapExceeded as exc:
         err_console.print(str(exc))
         raise typer.Exit(code=1) from exc
     except VLMError as exc:
         err_console.print(f"VLM error: {exc}")
-        raise typer.Exit(code=1) from exc
-
-    _render_analysis_summary(result)
-
-
-@app.command()
-def resume(
-    work_dir: Annotated[
-        Path | None,
-        typer.Option(
-            "--work-dir",
-            help="Directory containing DETECTION_RESPONSE.json / VLM_RESPONSE.json (default: ./CLIPS).",
-        ),
-    ] = None,
-) -> None:
-    """Resume a paused host-agent run (the image-only two-pass).
-
-    The host pauses once or twice: ``run`` writes ``VLM_REQUEST.md`` +
-    contact sheets + a ``.autocut_resume.json`` sidecar recording the phase.
-    On a COARSE resume this reads the candidate regions, builds the dense FINE
-    sheets and pauses AGAIN (run ``autocut resume`` once more). On a FINE resume
-    it parses the absolute-time clips, dedups, ranks, and writes ``plan.json``
-    (then cut with ``autocut cut --from-json``).
-    """
-    settings = AutoCutSettings.load()
-    cfg = settings.config
-    base = (work_dir or cfg.output.base_dir).resolve()
-
-    _resume_analysis_phase(base, cfg)
-
-
-def _resume_analysis_phase(base: Path, cfg: AutoCutConfig) -> None:
-    """Drive one host image two-pass resume step (coarse→fine pause, or finish)."""
-    try:
-        result = resume_host_analysis(base, cfg)
-    except HostAgentPauseRequested as pause:
-        # Coarse resume built the fine sheets and paused again for the fine pass.
-        console.print("[green]OK[/] Coarse candidates loaded; built the fine contact sheets.")
-        _print_pause_message(pause)
-        raise typer.Exit(code=0) from None
-    except ResumeStateError as exc:
-        err_console.print(str(exc))
-        raise typer.Exit(code=1) from exc
-    except VLMError as exc:
-        err_console.print(str(exc))
         raise typer.Exit(code=1) from exc
 
     _render_analysis_summary(result)
@@ -390,7 +333,7 @@ def detect(
     out_root = (output_dir or cfg.output.base_dir).resolve()
 
     try:
-        provider = make_provider(provider_name, model=model, work_dir=out_root)
+        provider = make_provider(provider_name, model=model)
     except UnavailableProviderError as exc:
         err_console.print(str(exc))
         raise typer.Exit(code=2) from exc
@@ -411,16 +354,6 @@ def detect(
                 n_keyframes=n_keyframes,
             )
         )
-    except HostAgentPauseRequested as exc:
-        # Standalone detection is synchronous (openrouter). The host agent
-        # is itself the orchestrator and should classify the video directly
-        # instead of going through a paused two-phase detection cycle.
-        err_console.print(
-            "autocut detect needs a synchronous (cloud) provider, e.g. "
-            "--vlm openrouter. The host agent should pick the editing mode "
-            "directly and pass it to `autocut run --content-hint <mode>`."
-        )
-        raise typer.Exit(code=2) from exc
     except VLMError as exc:
         err_console.print(f"detect failed: {exc}")
         raise typer.Exit(code=1) from exc
@@ -602,6 +535,42 @@ def _cut_from_json(
     console.print(f"[green]OK[/] cut {n_written} clip(s) → {output_dir.resolve()}")
     if result.manifest_path:
         console.print(f"[bold]Manifest[/]: {result.manifest_path}")
+
+
+@app.command()
+def probe(
+    video: Annotated[Path, typer.Argument(help="Input video to inspect.")],
+) -> None:
+    """Print video metadata as JSON. Deterministic, no VLM.
+
+    Duration / fps / resolution / codec. The orchestrating agent reads this up
+    front to choose host vs cloud and the ``sheet`` sampling density.
+    """
+    from autocut.video import FFprobeError, probe_video
+
+    if not video.exists() or not video.is_file():
+        err_console.print(f"input video not found: {video}")
+        raise typer.Exit(code=1)
+    try:
+        meta = probe_video(video)
+    except FFprobeError as exc:
+        err_console.print(f"probe failed: {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print_json(
+        json.dumps(
+            {
+                "path": str(video.resolve()),
+                "duration_sec": round(meta.duration_sec, 3),
+                "fps": meta.fps,
+                "width": meta.width,
+                "height": meta.height,
+                "video_codec": meta.video_codec,
+                "audio_codec": meta.audio_codec,
+                "container": meta.container,
+                "size_bytes": meta.size_bytes,
+            }
+        )
+    )
 
 
 @app.command()
@@ -1143,16 +1112,6 @@ def _format_context(value: int | None) -> str:
 
 def _format_price(value: float | None) -> str:
     return "—" if value is None else f"${value:.4f}"
-
-
-def _print_pause_message(pause: HostAgentPauseRequested) -> None:
-    console.print(
-        "\n[bold yellow]Pipeline paused (host-agent provider).[/]\n"
-        f"  request:  [cyan]{pause.request_path}[/]\n"
-        f"  response: [cyan]{pause.response_path}[/]\n"
-        "Read the request, write the ClipPlan JSON to the response path,\n"
-        "then run [bold]autocut resume[/bold] to continue.\n"
-    )
 
 
 def _build_hints_from_cli(

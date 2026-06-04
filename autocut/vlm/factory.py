@@ -3,12 +3,13 @@
 This is the single dispatch point between the layered config (provider name
 + model + optional API key) and the concrete provider classes. Keeping it
 in one place means the rest of the pipeline never imports ``OpenRouterProvider``
-or ``HostAgentProvider`` directly.
+directly.
 
-In v0.1.0 only ``host`` and ``openrouter`` are wired up. Asking for any
-other provider raises ``UnavailableProviderError`` with a friendly message
-that points the user to the OpenRouter alternative (e.g.
-``anthropic/claude-opus-4-6``).
+``run`` is cloud-only: the only wired provider is ``openrouter``. The local/host
+path is no longer a provider — the orchestrating agent drives the deterministic
+``probe``/``sheet``/``cut``/``merge`` subcommands itself (see the ``autocut-run``
+skill), so ``--vlm host`` points the user there. Any other provider raises
+``UnavailableProviderError`` suggesting the OpenRouter equivalent.
 """
 
 from __future__ import annotations
@@ -19,7 +20,6 @@ from typing import Final
 
 from autocut.security import KeyringError, SupportedProvider, get_key
 from autocut.vlm.base import VLMError, VLMProvider
-from autocut.vlm.host_agent import HostAgentProvider
 from autocut.vlm.openrouter import OpenRouterProvider
 
 log = logging.getLogger(__name__)
@@ -48,19 +48,22 @@ def make_provider(
 ) -> VLMProvider:
     """Return a ready-to-use ``VLMProvider`` for ``provider_name``.
 
-    ``model`` is required even for ``host`` (it becomes the agent hint).
-    ``work_dir`` is required for ``host`` — it is where ``VLM_REQUEST.md``
-    and ``VLM_RESPONSE.json`` live during the pause/resume handshake.
-    ``api_key`` is optional: if omitted we read it from the OS keyring. The host
-    is image-only (the contact-sheet two-pass), so there is no video-capability
-    flag; non-host providers discover video support from their model catalogue.
+    Only ``openrouter`` is wired: ``run`` is the cloud-only analysis pipeline.
+    ``api_key`` is optional — if omitted we read it from the OS keyring. The host
+    path is not a provider: ``--vlm host`` raises with a pointer to the agent-driven
+    ``sheet``/``cut`` recipe (the ``autocut-run`` skill). ``work_dir`` is accepted
+    for signature stability but unused.
     """
+    del work_dir  # host pause/resume removed; kept for call-site compatibility
     name = provider_name.strip().lower()
 
     if name == "host":
-        if work_dir is None:
-            raise VLMError("host provider requires work_dir for the request/response files")
-        return HostAgentProvider(work_dir=work_dir, agent_hint=model)
+        raise UnavailableProviderError(
+            "`--vlm host` is no longer a pipeline provider. On a capable agent, run "
+            "the local recipe instead: `autocut probe` + `autocut sheet` (read the "
+            "grids) + `autocut cut`/`autocut merge` — no API, no cost. For an "
+            "autonomous cloud run use `--vlm openrouter`."
+        )
 
     if name == "openrouter":
         key = api_key or _resolve_keyring("openrouter")
@@ -86,7 +89,8 @@ def make_provider(
         )
 
     raise UnavailableProviderError(
-        f"unknown provider {name!r}. Available in v0.1.0: host, openrouter."
+        f"unknown provider {name!r}. The only pipeline provider is openrouter "
+        "(the local/host path runs as an agent recipe, not via --vlm)."
     )
 
 

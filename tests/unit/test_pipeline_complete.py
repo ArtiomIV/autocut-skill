@@ -1,23 +1,14 @@
-"""Unit tests for the resume-state sidecar and ``complete_from_plan`` reuse path.
+"""Unit tests for ``complete_from_plan`` — ranking + per-mode keep threshold.
 
-The end-to-end host-agent resume flow is tested at integration level (it needs
-ffmpeg for the dispatch step). This file focuses on the deterministic glue:
-
-- ``_write_resume_state`` writes a parseable JSON sidecar with all required keys.
-- ``load_resume_state`` round-trips the sidecar and complains about every
-  failure mode (missing file, malformed JSON, wrong top-level shape, missing
-  required keys).
-- ``complete_from_plan`` produces an ``AnalysisResult`` with ranked clips and
-  no dispatch when ``write_outputs=False`` — covering the dry-run / unit path.
+``complete_from_plan`` is the shared tail of every cloud route: it ranks the
+``ClipPlan`` and (when ``write_outputs``) writes plan.json. These tests pin the
+ranking/threshold behaviour without invoking ffmpeg or a provider.
 """
 
 from __future__ import annotations
 
-import json
 from datetime import timedelta
 from pathlib import Path
-
-import pytest
 
 from autocut.config import AutoCutConfig
 from autocut.content import HIGHLIGHTS_PROFILE
@@ -26,16 +17,9 @@ from autocut.models import (
     Clip,
     ClipPlan,
     ClipPlanMetadata,
-    ContentHint,
     VideoMetadata,
 )
-from autocut.pipeline import (
-    RESUME_STATE_FILENAME,
-    ResumeStateError,
-    _write_resume_state,
-    complete_from_plan,
-    load_resume_state,
-)
+from autocut.pipeline import complete_from_plan
 
 
 def _metadata() -> VideoMetadata:
@@ -78,91 +62,12 @@ def _plan() -> ClipPlan:
                 tags=["boxing", "finale"],
             ),
         ],
-        metadata=ClipPlanMetadata(vlm_provider="host", vlm_model="claude-opus-4-7"),
+        metadata=ClipPlanMetadata(vlm_provider="openrouter", vlm_model="google/gemini-3.5-flash"),
     )
 
 
 # ---------------------------------------------------------------------------
-# write + load round-trip
-# ---------------------------------------------------------------------------
-
-
-def test_write_resume_state_serialises_every_field(tmp_path: Path) -> None:
-    path = _write_resume_state(
-        tmp_path,
-        video=Path("/fake/video.mp4"),
-        metadata=_metadata(),
-        n_scenes=1,
-        n_keyframes=11,
-        sampling_strategy="hybrid",
-        accurate_cuts=True,
-        write_outputs=True,
-        content_hint=ContentHint.highlights,
-    )
-    assert path == tmp_path / RESUME_STATE_FILENAME
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    assert raw["video_path"].endswith("video.mp4")
-    assert raw["video_metadata"]["duration_sec"] == 42.0
-    assert raw["video_metadata"]["width"] == 1920
-    assert raw["sampling_strategy"] == "hybrid"
-    assert raw["accurate_cuts"] is True
-    assert raw["write_outputs"] is True
-    assert raw["n_scenes"] == 1
-    assert raw["n_keyframes"] == 11
-    assert raw["content_hint"] == "highlights"
-
-
-def test_load_resume_state_round_trips(tmp_path: Path) -> None:
-    _write_resume_state(
-        tmp_path,
-        video=Path("/fake/video.mp4"),
-        metadata=_metadata(),
-        n_scenes=2,
-        n_keyframes=8,
-        sampling_strategy="uniform",
-        accurate_cuts=False,
-        write_outputs=False,
-        content_hint=ContentHint.talk,
-    )
-    loaded = load_resume_state(tmp_path)
-    assert loaded["sampling_strategy"] == "uniform"
-    assert loaded["accurate_cuts"] is False
-    assert loaded["n_keyframes"] == 8
-    assert loaded["content_hint"] == "talk"
-
-
-# ---------------------------------------------------------------------------
-# load: failure modes
-# ---------------------------------------------------------------------------
-
-
-def test_load_missing_file_raises(tmp_path: Path) -> None:
-    with pytest.raises(ResumeStateError, match="not found"):
-        load_resume_state(tmp_path)
-
-
-def test_load_malformed_json_raises(tmp_path: Path) -> None:
-    (tmp_path / RESUME_STATE_FILENAME).write_text("{not valid json", encoding="utf-8")
-    with pytest.raises(ResumeStateError, match="failed to read"):
-        load_resume_state(tmp_path)
-
-
-def test_load_top_level_array_raises(tmp_path: Path) -> None:
-    (tmp_path / RESUME_STATE_FILENAME).write_text("[1, 2, 3]", encoding="utf-8")
-    with pytest.raises(ResumeStateError, match="not an object"):
-        load_resume_state(tmp_path)
-
-
-def test_load_missing_required_keys_raises(tmp_path: Path) -> None:
-    (tmp_path / RESUME_STATE_FILENAME).write_text(
-        json.dumps({"video_path": "/x"}), encoding="utf-8"
-    )
-    with pytest.raises(ResumeStateError, match="missing required keys"):
-        load_resume_state(tmp_path)
-
-
-# ---------------------------------------------------------------------------
-# complete_from_plan: ranking + (no) dispatch
+# complete_from_plan: ranking + (no) plan.json
 # ---------------------------------------------------------------------------
 
 
@@ -214,7 +119,7 @@ def test_complete_from_plan_drops_clips_below_min_score(tmp_path: Path) -> None:
                 rationale="placeholder",
             ),
         ],
-        metadata=ClipPlanMetadata(vlm_provider="host", vlm_model="m"),
+        metadata=ClipPlanMetadata(vlm_provider="openrouter", vlm_model="m"),
     )
     result = complete_from_plan(
         plan,
@@ -272,7 +177,7 @@ def _weak_mid_strong_plan() -> ClipPlan:
                 rationale="placeholder",
             ),
         ],
-        metadata=ClipPlanMetadata(vlm_provider="host", vlm_model="m"),
+        metadata=ClipPlanMetadata(vlm_provider="openrouter", vlm_model="m"),
     )
 
 
@@ -320,7 +225,7 @@ def test_highlights_profile_allows_empty_output(tmp_path: Path) -> None:
                 rationale="placeholder",
             ),
         ],
-        metadata=ClipPlanMetadata(vlm_provider="host", vlm_model="m"),
+        metadata=ClipPlanMetadata(vlm_provider="openrouter", vlm_model="m"),
     )
     result = complete_from_plan(
         plan,

@@ -1,18 +1,17 @@
 """Shared VLM types: the provider interface and the exceptions it can raise.
 
-Every concrete provider (``openrouter``, ``host_agent``, future
+Every concrete provider (``openrouter``, future
 ``anthropic``/``openai``/``gemini``/``ollama``/``lmstudio``) implements
 ``VLMProvider`` so the pipeline can stay provider-agnostic.
 
-Three return shapes are possible from ``analyze()``:
+Two return shapes are possible from ``analyze()``:
 
 1. A validated ``ClipPlan`` (the happy path).
 2. ``VLMError`` for anything that goes wrong with a cloud call.
-3. ``HostAgentPauseRequested`` for the host-agent flow: the analyze call
-   writes a request file to disk, raises this sentinel, and the CLI shows
-   the user instructions. The host agent (Claude Code / Cowork) reads the
-   request, writes ``VLM_RESPONSE.json``, and the user runs ``autocut
-   resume`` to continue.
+
+The local/host path no longer runs through a provider: the orchestrating agent
+drives the deterministic ``probe``/``sheet``/``cut``/``merge`` subcommands itself
+(see the ``autocut-run`` skill), so there is no pause/resume sentinel here.
 """
 
 from __future__ import annotations
@@ -28,24 +27,6 @@ from autocut.models import AnalysisHints, ClipPlan, DetectionResult, Keyframe
 
 class VLMError(RuntimeError):
     """Raised when a cloud VLM call fails (network, auth, schema, timeout)."""
-
-
-class HostAgentPauseRequested(Exception):  # noqa: N818
-    # Intentional control-flow signal, not an error condition; the "Error"
-    # suffix N818 wants would mislead readers.
-    """Raised by the host-agent provider to pause the pipeline.
-
-    Carries the path of the request file the host agent must read, plus the
-    path where the response JSON is expected.
-    """
-
-    def __init__(self, request_path: Path, response_path: Path) -> None:
-        super().__init__(
-            f"host-agent provider paused: write the result to {response_path} "
-            f"then run `autocut resume`"
-        )
-        self.request_path = request_path
-        self.response_path = response_path
 
 
 class CostEstimate(BaseModel):
@@ -93,8 +74,7 @@ class VLMProvider(ABC):
         ``ClipPlan``. ``duration_sec`` is the full source-video length, so
         the model can place timestamps in absolute terms.
 
-        Implementations must raise ``VLMError`` for cloud failures and
-        ``HostAgentPauseRequested`` for the deferred host-agent flow.
+        Implementations must raise ``VLMError`` for cloud failures.
         """
 
     @abstractmethod
@@ -122,11 +102,8 @@ class VLMProvider(ABC):
         ignore them; the signature is forward-compatible so callers do not
         need to change when the audio/video paths land.
 
-        Implementations must:
-        - raise ``VLMError`` for cloud failures or schema violations
-        - raise ``HostAgentPauseRequested`` if a host-agent pause is needed
-          for the detection step itself (v0.1.0 host-agent returns a stub
-          low-confidence result and never pauses).
+        Implementations must raise ``VLMError`` for cloud failures or schema
+        violations.
         """
 
     async def supports_video(self) -> bool:
