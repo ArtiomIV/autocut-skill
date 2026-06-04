@@ -174,6 +174,49 @@ def build_contact_sheets(
     return sheets
 
 
+def build_timestamped_sheets(
+    video: Path,
+    out_dir: Path,
+    *,
+    fps: float = _DEFAULT_FPS,
+    start_sec: float = 0.0,
+    end_sec: float,
+    cell_px: int = _DEFAULT_CELL_PX,
+    cols: int = _DEFAULT_COLS,
+    rows: int = _DEFAULT_ROWS,
+    font_path: str | None = None,
+    ffmpeg_path: str | None = None,
+) -> tuple[list[Path], list[float]]:
+    """Render ``[start_sec, end_sec]`` as sheets and return ``(sheets, frame_times)``.
+
+    ``frame_times[i]`` is the ABSOLUTE source time (seconds) of the cell burning
+    index ``i``. The window is trimmed to an exact multiple of the frame interval
+    (``1/fps``) so the produced cell count matches ``len(frame_times)`` and burned
+    index ``i`` sits exactly at ``start_sec + i / fps``. This pairs each grid cell's
+    OCR-friendly integer with its precise time — the map the caller persists.
+    """
+    if fps <= 0:
+        raise ContactSheetError("fps must be > 0")
+    if end_sec <= start_sec:
+        raise ContactSheetError("end_sec must be greater than start_sec")
+    interval = 1.0 / fps
+    n_frames = max(1, int((end_sec - start_sec) / interval))
+    sheets = build_contact_sheets(
+        video,
+        out_dir,
+        fps=fps,
+        cell_px=cell_px,
+        cols=cols,
+        rows=rows,
+        font_path=font_path,
+        ffmpeg_path=ffmpeg_path,
+        start_sec=start_sec,
+        trim_sec=n_frames * interval,
+    )
+    frame_times = [start_sec + j * interval for j in range(n_frames)]
+    return sheets, frame_times
+
+
 # ---------------------------------------------------------------------------
 # Internals
 # ---------------------------------------------------------------------------

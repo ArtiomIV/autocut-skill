@@ -6,12 +6,14 @@ from pathlib import Path
 
 import pytest
 
+from autocut.video import contact_sheet
 from autocut.video.contact_sheet import (
     ContactSheetError,
     _build_filter,
     _escape_fontpath,
     _resolve_font,
     build_contact_sheets,
+    build_timestamped_sheets,
 )
 
 
@@ -71,3 +73,65 @@ def test_build_contact_sheets_rejects_bad_grid(tmp_path: Path) -> None:
     seg.write_bytes(b"fake")
     with pytest.raises(ContactSheetError, match="must all be > 0"):
         build_contact_sheets(seg, tmp_path / "out", cols=0)
+
+
+# ---------------------------------------------------------------------------
+# build_timestamped_sheets — frame-time math (ffmpeg stubbed out)
+# ---------------------------------------------------------------------------
+
+
+def _stub_build_contact_sheets(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
+    """Replace ``build_contact_sheets`` with a no-op recorder; return captured kwargs."""
+    captured: dict[str, object] = {}
+
+    def _fake(video: Path, out_dir: Path, **kwargs: object) -> list[Path]:
+        captured.update(kwargs)
+        return [out_dir / "sheet_001.jpg"]
+
+    monkeypatch.setattr(contact_sheet, "build_contact_sheets", _fake)
+    return captured
+
+
+def test_timestamped_sheets_frame_times_are_index_over_fps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured = _stub_build_contact_sheets(monkeypatch)
+    _, frame_times = build_timestamped_sheets(
+        tmp_path / "v.mp4", tmp_path / "out", fps=2.0, start_sec=0.0, end_sec=5.0
+    )
+    # 5s / 0.5s interval = 10 frames at 0.0, 0.5, ... 4.5.
+    assert frame_times == [j * 0.5 for j in range(10)]
+    # Window is trimmed to an EXACT multiple of the interval (10 * 0.5 = 5.0).
+    assert captured["trim_sec"] == pytest.approx(5.0)
+    assert captured["start_sec"] == pytest.approx(0.0)
+
+
+def test_timestamped_sheets_offsets_times_by_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_build_contact_sheets(monkeypatch)
+    _, frame_times = build_timestamped_sheets(
+        tmp_path / "v.mp4", tmp_path / "out", fps=1.0, start_sec=10.0, end_sec=13.0
+    )
+    # Absolute times start at the window start, not at zero.
+    assert frame_times == [10.0, 11.0, 12.0]
+
+
+def test_timestamped_sheets_rejects_inverted_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_build_contact_sheets(monkeypatch)
+    with pytest.raises(ContactSheetError, match="end_sec must be greater"):
+        build_timestamped_sheets(
+            tmp_path / "v.mp4", tmp_path / "out", fps=2.0, start_sec=5.0, end_sec=5.0
+        )
+
+
+def test_timestamped_sheets_rejects_bad_fps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _stub_build_contact_sheets(monkeypatch)
+    with pytest.raises(ContactSheetError, match="fps must be > 0"):
+        build_timestamped_sheets(
+            tmp_path / "v.mp4", tmp_path / "out", fps=0.0, start_sec=0.0, end_sec=5.0
+        )

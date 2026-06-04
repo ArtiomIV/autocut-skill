@@ -605,6 +605,130 @@ def _cut_from_json(
 
 
 @app.command()
+def sheet(
+    video: Annotated[
+        Path, typer.Argument(help="Input video to sample into timestamped contact sheets.")
+    ],
+    out: Annotated[
+        Path,
+        typer.Option("--out", "-o", help="Output directory for the sheets + index.json."),
+    ],
+    fps: Annotated[
+        float | None,
+        typer.Option(
+            "--fps",
+            help="Frames per second to sample (default 2.0 = dense). Mutually exclusive with --interval.",
+        ),
+    ] = None,
+    interval: Annotated[
+        float | None,
+        typer.Option(
+            "--interval",
+            help="Seconds between sampled frames (e.g. 3 = sparse coarse pass). Mutually exclusive with --fps.",
+        ),
+    ] = None,
+    from_ts: Annotated[
+        str | None,
+        typer.Option(
+            "--from", help="Window start (HH:MM:SS.mmm or seconds). Default: start of video."
+        ),
+    ] = None,
+    to_ts: Annotated[
+        str | None,
+        typer.Option("--to", help="Window end (HH:MM:SS.mmm or seconds). Default: end of video."),
+    ] = None,
+    cell_px: Annotated[
+        int,
+        typer.Option(
+            "--cell-px",
+            help="Pixel size of each grid cell (long edge). Larger = more legible index, more tokens.",
+        ),
+    ] = 256,
+    cols: Annotated[int, typer.Option("--cols", help="Grid columns per sheet.")] = 6,
+    rows: Annotated[int, typer.Option("--rows", help="Grid rows per sheet.")] = 8,
+) -> None:
+    """Render a video window into timestamped contact sheets. Deterministic, no VLM.
+
+    Samples ``[--from, --to]`` at ``--fps`` (or ``--interval``) into one or more
+    grid images (``sheet_000.jpg`` …), each cell's integer index burned in, plus
+    ``index.json`` mapping every index to its EXACT source time in seconds. The
+    orchestrating agent opens the sheets, reads each cell's number, looks the time
+    up in the map, then calls ``cut`` — no pause/resume, no API. Use a sparse
+    ``--interval 3`` to locate regions across a long video, then a dense ``--fps 2``
+    on the chosen window for sub-second boundaries.
+    """
+    from autocut.video import FFprobeError, probe_video
+    from autocut.video.contact_sheet import ContactSheetError, build_timestamped_sheets
+
+    if not video.exists() or not video.is_file():
+        err_console.print(f"input video not found: {video}")
+        raise typer.Exit(code=1)
+    if fps is not None and interval is not None:
+        raise typer.BadParameter("pass either --fps or --interval, not both")
+    if interval is not None and interval <= 0:
+        raise typer.BadParameter("--interval must be > 0")
+    resolved_fps = fps if fps is not None else (1.0 / interval if interval else 2.0)
+    if resolved_fps <= 0:
+        raise typer.BadParameter("--fps must be > 0")
+
+    try:
+        metadata = probe_video(video)
+    except FFprobeError as exc:
+        err_console.print(f"probe failed: {exc}")
+        raise typer.Exit(code=1) from exc
+    duration = metadata.duration_sec
+
+    start_sec = _parse_cli_timestamp(from_ts, field="--from").total_seconds() if from_ts else 0.0
+    end_sec = _parse_cli_timestamp(to_ts, field="--to").total_seconds() if to_ts else duration
+    end_sec = min(end_sec, duration)
+    if end_sec <= start_sec:
+        raise typer.BadParameter("--to must be greater than --from and within the video duration")
+
+    out_dir = out.resolve()
+    try:
+        sheets, frame_times = build_timestamped_sheets(
+            video,
+            out_dir,
+            fps=resolved_fps,
+            start_sec=start_sec,
+            end_sec=end_sec,
+            cell_px=cell_px,
+            cols=cols,
+            rows=rows,
+        )
+    except ContactSheetError as exc:
+        err_console.print(f"sheet failed: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    index_path = out_dir / "index.json"
+    index_path.write_text(
+        json.dumps(
+            {
+                "video": str(video.resolve()),
+                "fps": resolved_fps,
+                "from_sec": round(start_sec, 3),
+                "to_sec": round(end_sec, 3),
+                "cell_px": cell_px,
+                "grid": f"{cols}x{rows}",
+                "n_frames": len(frame_times),
+                "sheets": [s.name for s in sheets],
+                "index_to_sec": {str(i): round(t, 3) for i, t in enumerate(frame_times)},
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    console.print(
+        f"[green]OK[/] {len(sheets)} sheet(s), {len(frame_times)} frame(s) "
+        f"@ {resolved_fps:g} fps over [{start_sec:.1f}s, {end_sec:.1f}s] → {out_dir}"
+    )
+    console.print(
+        f"[bold]Index map[/]: {index_path} — open the sheets, read each cell's "
+        "number, look it up here for the exact second, then call `autocut cut`."
+    )
+
+
+@app.command()
 def merge(
     inputs: Annotated[
         list[Path] | None,
