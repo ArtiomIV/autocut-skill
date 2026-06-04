@@ -1,9 +1,8 @@
 """Unit tests for ``autocut.content.detector`` — Phase E.
 
-Covers the pure helpers (stratified random picker, audio-description
-renderer, DetectionResult schema). The async orchestrator
-``detect_content_hint`` is left to integration tests that stub the
-provider + filesystem.
+Covers the pure helpers (stratified random picker, DetectionResult
+schema). The async orchestrator ``detect_content_hint`` is left to
+integration tests that stub the provider + filesystem.
 """
 
 from __future__ import annotations
@@ -16,10 +15,8 @@ from autocut.content.detector import (
     DETECTION_KEYFRAME_COUNT,
     _file_hash_seed,
     _pick_stratified_timestamps,
-    describe_audio_profile,
 )
 from autocut.models import ContentHint, DetectionResult
-from autocut.video import AudioSample
 
 # ---------------------------------------------------------------------------
 # Stratified random timestamp picker
@@ -107,45 +104,6 @@ def test_file_hash_seed_is_zero_when_file_missing(tmp_path: Path) -> None:
     # No graceful return path is the goal here — we want zero, not an exception.
     seed = _file_hash_seed(tmp_path / "does_not_exist.mp4")
     assert seed == 0
-
-
-# ---------------------------------------------------------------------------
-# Audio description renderer
-# ---------------------------------------------------------------------------
-
-
-def test_audio_description_empty_samples_is_clear() -> None:
-    text = describe_audio_profile([], duration_sec=60.0)
-    assert "no audio stream" in text.lower()
-
-
-def test_audio_description_includes_required_sections() -> None:
-    # Synthetic talk-like profile: high voice activity, low onset rate.
-    samples = [
-        AudioSample(timestamp_sec=t * 0.1, rms=0.5 if t % 2 == 0 else 0.1, is_onset=(t == 50))
-        for t in range(100)
-    ]
-    text = describe_audio_profile(samples, duration_sec=10.0)
-    assert "Voice activity" in text
-    assert "Onset rate" in text
-    assert "dynamic range" in text.lower()
-    assert "Mean energy" in text or "energy" in text.lower()
-
-
-def test_audio_description_classifies_sport_like_profile() -> None:
-    # 60s of source, ~30 onsets → ~30 onsets/min → "high" label.
-    samples: list[AudioSample] = []
-    onset_indices = {i * 20 for i in range(30)}  # 30 evenly-spaced onsets
-    for t in range(600):  # 600 windows * 100 ms = 60 s
-        samples.append(
-            AudioSample(
-                timestamp_sec=t * 0.1,
-                rms=0.8 if t in onset_indices else 0.1,
-                is_onset=t in onset_indices,
-            )
-        )
-    text = describe_audio_profile(samples, duration_sec=60.0)
-    assert "high" in text.lower()  # the onset-label maps to "high"
 
 
 # ---------------------------------------------------------------------------

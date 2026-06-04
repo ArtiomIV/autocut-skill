@@ -25,7 +25,6 @@ import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import timedelta
 from enum import Enum
 from pathlib import Path
 
@@ -50,14 +49,10 @@ from autocut.output import write_plan_json
 from autocut.scoring import RankedClip, rank_clips
 from autocut.video import (
     build_sampler,
-    compute_audio_profile,
-    compute_motion_profile,
     detect_scenes,
     extract_keyframes,
-    find_hot_windows,
     probe_video,
 )
-from autocut.video.refine import refine_start_to_impact
 from autocut.video_analysis import COST_CAP_ENABLED, analyze_audio, analyze_video
 from autocut.vlm import CostEstimate, VLMError, VLMProvider
 from autocut.vlm.host_agent import HostAgentProvider
@@ -99,14 +94,6 @@ class Route(Enum):
 # Content types whose signal is the spoken word — routed to audio when the model
 # can hear and the transport is cloud (the host cannot listen to audio yet).
 _TALK_HINTS: frozenset[ContentHint] = frozenset({ContentHint.talk})
-
-# Two-stage impact-snap boundary refine (autocut.video.refine). DISABLED
-# 2026-05-30: the v1 heuristic (biggest peak + walk-back) snaps imperfectly and,
-# on short clips that the model already placed well, it nudges good boundaries
-# without a measurable gain — so it muddies the runs. Re-enable once the v2 tuning
-# lands (burst-start + silence guard, audio as co-driver) AND the manifest records
-# the pre-refine start so the move is auditable.
-_REFINE_BOUNDARIES_ENABLED: bool = False
 
 
 def _select_route(
@@ -206,17 +193,6 @@ async def run_analysis(
         sampling_strategy if sampling_strategy != "hybrid" else profile.sampling_strategy
     )
 
-    # A custom query hunts a SPECIFIC described moment, which may sit in a calm,
-    # low-motion stretch (e.g. "when the ring girl enters"). The motion sampler
-    # bakes in "interesting == high motion/sound" and would discard such a target
-    # before the model ever sees it. So when a query is present we drop the
-    # motion pre-filter and show the model the whole timeline (uniform-dense on
-    # the keyframe path); the query itself is the smart filter. Transport routing
-    # (video/audio/keyframe) is unchanged — it stays capability-driven.
-    if effective_hints.query and effective_sampling_strategy == "motion":
-        log.info("pipeline: query present — disabling motion pre-filter (uniform sampling)")
-        effective_sampling_strategy = "uniform"
-
     # Capability gate: pick the payload x transport route once, then dispatch to
     # a thin runner. Video/audio-capable providers skip keyframe sampling —
     # openrouter via the L2 autonomous batch loop (video, or audio for talk), the
@@ -280,33 +256,6 @@ async def run_analysis(
     log.info("pipeline: scene detect (threshold=%s)", config.advanced.scene_threshold)
     scenes = detect_scenes(video, threshold=config.advanced.scene_threshold)
 
-    hot_windows = None
-    if effective_sampling_strategy == "motion":
-        log.info("pipeline: computing motion + audio profiles for motion sampler")
-        motion_profile = compute_motion_profile(video)
-        audio_profile = compute_audio_profile(video)
-        hot_windows = find_hot_windows(
-            motion_profile,
-            audio_profile,
-            video_duration_sec=metadata.duration_sec,
-        )
-        log.info(
-            "pipeline: motion sampler found %d hot window(s) from %d motion + %d audio samples",
-            len(hot_windows),
-            len(motion_profile),
-            len(audio_profile),
-        )
-        # Reaching here means the keyframe (stills) path: the video branch
-        # returned earlier. A stills VLM cannot perceive motion, so surface the
-        # hot windows in the prompt to tell it where to look — for the host
-        # agent and for any openrouter keyframe fallback alike.
-        if hot_windows:
-            effective_hints = effective_hints.model_copy(
-                update={
-                    "motion_windows_sec": [(w.start_sec, w.end_sec) for w in hot_windows],
-                }
-            )
-
     log.info(
         "pipeline: sampling (strategy=%s, profile=%s, %d scenes)",
         effective_sampling_strategy,
@@ -319,7 +268,6 @@ async def run_analysis(
         metadata.duration_sec,
         per_scene=config.advanced.keyframes_per_scene,
         min_keyframes=profile.min_keyframes,
-        hot_windows=hot_windows,
     )
     if not specs:
         raise ValueError(
@@ -483,8 +431,6 @@ async def _run_media_analysis(
         len(plan.clips),
         plan.metadata.cost_usd,
     )
-    if _REFINE_BOUNDARIES_ENABLED and _should_refine_boundaries(kind, profile):
-        plan = _refine_action_boundaries(plan, video=video, duration_sec=metadata.duration_sec)
     result = complete_from_plan(
         plan,
         video=video,
@@ -505,47 +451,6 @@ async def _run_media_analysis(
     )
     _clear_resume_state(root)
     return result
-
-
-def _should_refine_boundaries(kind: str, profile: ContentProfile) -> bool:
-    """Refine clip starts only for the sport/action profile on the video route.
-
-    Sport moments are physical impacts (a punch, a knockdown) whose precise
-    instant the ~1fps video model misses. The refiner is self-gating, so even
-    here a non-impact clip (a ring entrance) is left untouched — but we only
-    *attempt* it for sport, where impacts are expected. Talk/audio has no impact
-    signal (word-boundary refine via Whisper is a separate, future path).
-    """
-    return kind == "video" and profile.name == "highlights"
-
-
-def _refine_action_boundaries(plan: ClipPlan, *, video: Path, duration_sec: float) -> ClipPlan:
-    """Return ``plan`` with each clip's START snapped to the real impact instant.
-
-    Best-effort and self-gating: a clip whose window has no dominant impact
-    spike is returned unchanged. Only the ``start`` moves (always earlier);
-    ``end`` and every other field are preserved.
-    """
-    refined = []
-    moved = 0
-    for clip in plan.clips:
-        result = refine_start_to_impact(
-            video,
-            clip.start.total_seconds(),
-            clip.end.total_seconds(),
-            duration_sec,
-        )
-        if result.moved:
-            moved += 1
-            refined.append(
-                clip.model_copy(update={"start": timedelta(seconds=result.refined_start_sec)})
-            )
-        else:
-            refined.append(clip)
-    log.info(
-        "pipeline: boundary refine snapped %d/%d clip start(s) to impact", moved, len(plan.clips)
-    )
-    return plan.model_copy(update={"clips": refined})
 
 
 async def _run_host_image_analysis(

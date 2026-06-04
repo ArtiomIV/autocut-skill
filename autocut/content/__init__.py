@@ -4,7 +4,6 @@ from autocut.content.detector import (
     DETECTION_KEYFRAME_COUNT,
     DETECTION_KEYFRAME_SUBDIR,
     DetectionContext,
-    describe_audio_profile,
     detect_content_hint,
 )
 from autocut.content.profiles import (
@@ -23,7 +22,6 @@ __all__ = [
     "TALK_PROFILE",
     "ContentProfile",
     "DetectionContext",
-    "describe_audio_profile",
     "detect_content_hint",
     "profile_for",
 ]

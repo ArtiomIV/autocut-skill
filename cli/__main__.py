@@ -146,9 +146,9 @@ def run(
         typer.Option(
             "--sampling",
             help=(
-                "Keyframe sampling strategy: scene | uniform | hybrid | motion. "
-                "'motion' runs optical flow + audio onset analysis to sample "
-                "densely only where the action is (Phase D)."
+                "Keyframe sampling strategy: scene | uniform | hybrid. Only used "
+                "on the keyframe fallback route (image-only openrouter models); "
+                "the video/audio/host routes ignore it."
             ),
         ),
     ] = "hybrid",
@@ -171,8 +171,7 @@ def run(
             help=(
                 "Find a SPECIFIC described moment instead of auto-highlights "
                 '(e.g. "the knockdown in round 3", "when they mention prices"). '
-                "Disables the motion pre-filter so low-motion targets are not "
-                "sampled away — the model filters via the query instead."
+                "The model filters the timeline via the query."
             ),
         ),
     ] = None,

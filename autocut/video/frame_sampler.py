@@ -13,12 +13,6 @@ the realistic content types:
   missed entirely.
 - ``hybrid``: scene-based, but any scene longer than ``max_gap_sec`` gets
   topped up with additional uniform samples so no action is missed.
-- ``motion``: when hot windows fire, sample ONLY inside those ``HotWindow``
-  intervals (one frame per second by default) and skip the dead time
-  entirely — a stills VLM judges the action better when the key moments are
-  not diluted by idle frames. With no hot window detected, fall back to a
-  sparse uniform baseline so the caller never gets an empty list. Best when
-  the pipeline has precomputed motion + audio profiles for the video.
 
 Output is a list of ``FrameSpec`` records with the timestamp and the
 originating scene index (for traceability). The list is sorted by
@@ -32,9 +26,8 @@ from datetime import timedelta
 from typing import Literal
 
 from autocut.models import Scene
-from autocut.video.hot_windows import HotWindow
 
-SamplingStrategy = Literal["scene", "uniform", "hybrid", "motion"]
+SamplingStrategy = Literal["scene", "uniform", "hybrid"]
 
 _DEFAULT_PER_SCENE = 2
 _DEFAULT_UNIFORM_INTERVAL_SEC = 2.0
@@ -51,12 +44,6 @@ _SHORT_VIDEO_INTERVAL_SEC = 1.5
 # Final safety net: regardless of strategy, we always feed the VLM at least
 # this many keyframes. Below the floor, we densify with uniform sampling.
 _DEFAULT_MIN_KEYFRAMES = 3
-
-# Defaults for the ``motion`` strategy. Tunable per-call so the pipeline can
-# pass tighter values for sport-style profiles.
-_DEFAULT_MOTION_BASE_INTERVAL_SEC = 4.0  # uniform fallback when NO hot window fires
-_DEFAULT_MOTION_DENSE_INTERVAL_SEC = 1.0  # one frame per second inside hot windows
-_DEFAULT_MOTION_HOT_PADDING_SEC = 1.0  # widen each hot window by this on both sides
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,54 +135,6 @@ def sample_hybrid(
     return _dedupe_and_sort(base + supplemental)
 
 
-def sample_motion(
-    hot_windows: list[HotWindow],
-    duration_sec: float,
-    *,
-    base_interval_sec: float = _DEFAULT_MOTION_BASE_INTERVAL_SEC,
-    dense_interval_sec: float = _DEFAULT_MOTION_DENSE_INTERVAL_SEC,
-    hot_padding_sec: float = _DEFAULT_MOTION_HOT_PADDING_SEC,
-) -> list[FrameSpec]:
-    """Dense sampling ONLY inside ``hot_windows`` — no all-video baseline.
-
-    When at least one hot window fires we sample exclusively inside the
-    (padded) windows at ``dense_interval_sec`` and skip every dead second:
-    feeding a stills VLM only the key moments stops the decisive action from
-    being diluted by idle frames (the failure mode that made a flat 67-frame
-    batch miss the climax).
-
-    Empty ``hot_windows`` falls back to uniform sampling at
-    ``base_interval_sec`` so the caller never gets an empty list when
-    the video has duration but no detected motion.
-    """
-    if duration_sec <= 0:
-        raise ValueError("duration_sec must be > 0")
-    if base_interval_sec <= 0 or dense_interval_sec <= 0:
-        raise ValueError("intervals must be > 0")
-    if hot_padding_sec < 0:
-        raise ValueError("hot_padding_sec must be >= 0")
-
-    if not hot_windows:
-        # No detected action: a sparse uniform pass keeps the VLM from getting
-        # an empty list while staying cheap.
-        return _dedupe_and_sort(sample_uniform(duration_sec, interval_sec=base_interval_sec))
-
-    specs: list[FrameSpec] = []
-    for window in hot_windows:
-        # Pad the window on both sides so we catch the lead-in to the action
-        # and the immediate aftermath; clamp to the source bounds.
-        start = max(0.0, window.start_sec - hot_padding_sec)
-        end = min(duration_sec, window.end_sec + hot_padding_sec)
-        # Sample inside this padded window at dense_interval, midpoint-aligned
-        # like sample_uniform so the first sample sits comfortably inside.
-        t = start + dense_interval_sec / 2.0
-        while t < end:
-            specs.append(FrameSpec(timestamp=timedelta(seconds=t), scene_index=-1))
-            t += dense_interval_sec
-
-    return _dedupe_and_sort(specs)
-
-
 def build_sampler(
     strategy: SamplingStrategy,
     scenes: list[Scene],
@@ -205,10 +144,6 @@ def build_sampler(
     interval_sec: float = _DEFAULT_UNIFORM_INTERVAL_SEC,
     max_gap_sec: float = _DEFAULT_HYBRID_MAX_GAP_SEC,
     min_keyframes: int = _DEFAULT_MIN_KEYFRAMES,
-    hot_windows: list[HotWindow] | None = None,
-    motion_base_interval_sec: float = _DEFAULT_MOTION_BASE_INTERVAL_SEC,
-    motion_dense_interval_sec: float = _DEFAULT_MOTION_DENSE_INTERVAL_SEC,
-    motion_hot_padding_sec: float = _DEFAULT_MOTION_HOT_PADDING_SEC,
 ) -> list[FrameSpec]:
     """Single entry point used by the pipeline. Dispatches on strategy.
 
@@ -217,26 +152,8 @@ def build_sampler(
        rerouted to dense uniform sampling — scene logic would underproduce.
     2. If the final spec count is below ``min_keyframes``, we densify with
        uniform sampling so the VLM always has enough frames to judge.
-
-    ``motion`` strategy additionally requires the caller to pass
-    ``hot_windows`` precomputed via
-    ``autocut.video.hot_windows.find_hot_windows`` from motion + audio
-    profiles. Passing an empty list is fine — sample_motion will fall
-    back to baseline-only uniform sampling.
     """
-    if strategy == "motion":
-        if hot_windows is None:
-            raise ValueError(
-                "strategy='motion' requires hot_windows (compute via hot_windows.find_hot_windows)"
-            )
-        specs = sample_motion(
-            hot_windows,
-            duration_sec,
-            base_interval_sec=motion_base_interval_sec,
-            dense_interval_sec=motion_dense_interval_sec,
-            hot_padding_sec=motion_hot_padding_sec,
-        )
-    elif strategy == "hybrid" and duration_sec < _SHORT_VIDEO_THRESHOLD_SEC:
+    if strategy == "hybrid" and duration_sec < _SHORT_VIDEO_THRESHOLD_SEC:
         specs = _dedupe_and_sort(
             sample_uniform(duration_sec, interval_sec=_SHORT_VIDEO_INTERVAL_SEC)
         )

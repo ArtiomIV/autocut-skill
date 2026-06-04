@@ -15,12 +15,12 @@ Design choices for v0.1.0:
   guarantees coverage (no clusters); the file-derived seed guarantees
   determinism (same input → same timestamps) without exposing a
   ``--seed`` knob to the user.
-- **Audio signal**: passed to the VLM as a *text description* derived
-  from ``compute_audio_profile`` (Phase D). The model does not hear the
-  raw audio. This works on every provider (host-agent, openrouter,
-  Gemini, GPT-4o, Claude) without forking the code path. When v0.2.0
-  ships Whisper-light + Gemini ``input_audio``, the signatures here
-  already accept the forward-compat parameters.
+- **Vision-only**: classification is purely visual (the stratified
+  keyframes). The audio waveform is no longer summarised — sport vs talk
+  vs gameplay is obvious from a handful of frames, and dropping the audio
+  DSP keeps the detector dependency-light. When v0.2.0 ships Whisper-light
+  + Gemini ``input_audio``, audio can re-enter via the forward-compat
+  ``DetectionContext`` fields.
 - **Confidence threshold**: defined at the call site (pipeline). Below
   threshold → ``ContentHint.other`` → ``HYBRID_PROFILE``. Defensive.
 
@@ -33,16 +33,13 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import math
 import random
-import statistics
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 
 from autocut.models import DetectionResult, VideoMetadata
-from autocut.video import AudioSample, compute_audio_profile, extract_keyframes
-from autocut.video.audio_peaks import AudioAnalysisError
+from autocut.video import extract_keyframes
 from autocut.video.frame_sampler import FrameSpec
 from autocut.vlm.base import VLMProvider
 
@@ -58,12 +55,6 @@ log = logging.getLogger(__name__)
 # usually obvious by 3-4 frames; 9 is generous for ambiguous content.
 DETECTION_KEYFRAME_COUNT: int = 9
 
-# Voice-activity threshold: an RMS window is "voice-active" when it is in
-# the top 50% of the per-clip distribution. Adaptive rather than fixed so
-# very quiet sources (interviews in low-noise studios) don't all read as
-# silent.
-_VOICE_ACTIVITY_QUANTILE: float = 0.5
-
 # Pad inside each segment by this fraction so a frame never lands right
 # at the boundary (avoids black/transition frames common at scene cuts).
 _STRATIFIED_SEGMENT_PAD_RATIO: float = 0.1
@@ -73,6 +64,10 @@ _STRATIFIED_SEGMENT_PAD_RATIO: float = 0.1
 _SEED_BYTES_FROM_FILE: int = 1 << 20  # 1 MiB
 
 DETECTION_KEYFRAME_SUBDIR: str = "detection_keyframes"
+
+# Placeholder passed in the (kept) ``audio_description`` slot now that the
+# detector is vision-only. Tells the model not to expect an audio summary.
+_VISION_ONLY_AUDIO_NOTE: str = "Audio analysis: not provided (vision-only classification)."
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,12 +139,12 @@ async def detect_content_hint(
         long_edge_px=long_edge_px,
     )
 
-    audio_description = _try_describe_audio(video, duration_sec=metadata.duration_sec)
-    log.debug("detector: audio description ready (%d chars)", len(audio_description))
-
+    # Vision-only classification: no audio waveform summary is sent. The kept
+    # ``audio_description`` parameter on ``detect_content`` stays for forward
+    # compatibility (Whisper / native audio in v0.2.0) but is empty here.
     result = await provider.detect_content(
         keyframes,
-        audio_description,
+        _VISION_ONLY_AUDIO_NOTE,
         video_id=video.stem or "video",
         duration_sec=metadata.duration_sec,
     )
@@ -229,99 +224,3 @@ def _file_hash_seed(video_path: Path) -> int:
         log.warning("detector: failed to hash %s for seed: %s", video_path, exc)
         return 0
     return int.from_bytes(h.digest()[:8], "big", signed=False)
-
-
-# ---------------------------------------------------------------------------
-# Audio description renderer (pure, testable)
-# ---------------------------------------------------------------------------
-
-
-def _try_describe_audio(video: Path, *, duration_sec: float) -> str:
-    """Compute the audio profile and render the textual description.
-
-    Audio failures are converted to a clear "no audio" description so the
-    detector still gets a usable text block. Detection works visually on
-    silent footage (gameplay screen recordings, music videos with the
-    audio stripped) — losing audio is degraded mode, not a fatal error.
-    """
-    try:
-        samples = compute_audio_profile(video)
-    except AudioAnalysisError as exc:
-        log.info("detector: audio profile unavailable (%s); falling back to vision-only", exc)
-        return "Audio analysis: source has no usable audio stream (vision-only classification)."
-    return describe_audio_profile(samples, duration_sec=duration_sec)
-
-
-def describe_audio_profile(samples: list[AudioSample], *, duration_sec: float) -> str:
-    """Render a ``compute_audio_profile`` output as a short text block for the VLM.
-
-    Public so tests can pin formatting and so future callers (CLI debug
-    output) can render the same description without re-running ffmpeg.
-    """
-    if not samples:
-        return "Audio analysis: source has no audio stream (vision-only classification)."
-
-    rms_values = [s.rms for s in samples]
-    onset_count = sum(1 for s in samples if s.is_onset)
-    onset_rate_per_min = onset_count / max(duration_sec, 1e-6) * 60.0
-
-    # Voice-activity ratio: fraction of windows above the median RMS,
-    # weighted to suppress tiny background noise. Adaptive so quiet
-    # recordings still show non-zero activity if there's any signal.
-    if rms_values:
-        threshold = statistics.quantiles(rms_values, n=4)[1] if len(rms_values) >= 4 else 0.0
-        threshold = max(threshold, _VOICE_ACTIVITY_QUANTILE * max(rms_values))
-        voice_active = sum(1 for r in rms_values if r > threshold)
-        voice_ratio = voice_active / len(rms_values)
-    else:
-        voice_ratio = 0.0
-
-    mean_rms = statistics.fmean(rms_values) if rms_values else 0.0
-    max_rms = max(rms_values) if rms_values else 0.0
-    min_rms_positive = min((r for r in rms_values if r > 0), default=0.0)
-    if max_rms > 0 and min_rms_positive > 0:
-        dynamic_range_db = 20.0 * math.log10(max_rms / min_rms_positive)
-    else:
-        dynamic_range_db = 0.0
-
-    # Interpret the metrics into human-readable adjectives so the VLM
-    # gets a strong textual signal even when the raw numbers look dry.
-    onset_label = _classify_onset_rate(onset_rate_per_min)
-    voice_label = _classify_voice_ratio(voice_ratio)
-
-    return (
-        "Audio analysis (waveform statistics, not transcribed):\n"
-        f"- Voice activity: {voice_label} (ratio {voice_ratio:.2f})\n"
-        f"- Onset rate: {onset_label} ({onset_rate_per_min:.1f} events/min, "
-        f"{onset_count} total)\n"
-        f"- RMS dynamic range: {dynamic_range_db:.1f} dB\n"
-        f"- Mean energy: {mean_rms:.4f}, peak energy: {max_rms:.4f}"
-    )
-
-
-def _classify_onset_rate(rate_per_min: float) -> str:
-    """Map an onset-per-minute rate to a human label.
-
-    Tuned on real videos in Phase D: boxing match shows ~25-40 onsets/min
-    (impacts + crowd reactions + commentator), a podcast shows ~5-8
-    onsets/min (turn-taking pauses + laughter), a monologue ~2-4
-    onsets/min.
-    """
-    if rate_per_min >= 20.0:
-        return "high (impact-heavy or applause-rich)"
-    if rate_per_min >= 8.0:
-        return "moderate (conversational with reactions)"
-    if rate_per_min >= 2.0:
-        return "low (sparse, monologue-like)"
-    return "very low (near-silent or sustained tone)"
-
-
-def _classify_voice_ratio(ratio: float) -> str:
-    """Map the voice-activity ratio to a human label."""
-    if ratio >= 0.7:
-        return "dominant (sustained speech/audio across most of the timeline)"
-    if ratio >= 0.4:
-        return "frequent (alternating speech and pauses)"
-    if ratio >= 0.15:
-        return "intermittent (bursts of activity)"
-    return "sparse (mostly quiet)"

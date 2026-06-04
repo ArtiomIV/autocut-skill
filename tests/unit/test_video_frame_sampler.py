@@ -11,11 +11,9 @@ from autocut.video.frame_sampler import (
     FrameSpec,
     build_sampler,
     sample_hybrid,
-    sample_motion,
     sample_scene_based,
     sample_uniform,
 )
-from autocut.video.hot_windows import HotWindow
 
 
 def _scene(idx: int, start: float, end: float) -> Scene:
@@ -169,76 +167,6 @@ def test_build_sampler_min_keyframes_does_not_override_when_already_dense() -> N
     scenes = [_scene(0, 0, 41)]
     specs = build_sampler("hybrid", scenes, duration_sec=41.0, min_keyframes=3)
     assert len(specs) > 10
-
-
-# ---------------------------------------------------------------------------
-# sample_motion / motion strategy (D.4)
-# ---------------------------------------------------------------------------
-
-
-def test_sample_motion_baseline_only_when_no_hot_windows() -> None:
-    # No hot windows → falls back to pure baseline uniform sampling.
-    specs = sample_motion([], duration_sec=20.0, base_interval_sec=4.0, dense_interval_sec=0.5)
-    # 20 s / 4 s = 5 samples at 2, 6, 10, 14, 18.
-    assert len(specs) == 5
-    assert all(s.scene_index == -1 for s in specs)
-
-
-def test_sample_motion_samples_only_inside_hot_window() -> None:
-    # Hot window from 4-6 s with 1 s padding → dense range 3-7 s.
-    hot = [HotWindow(start_sec=4.0, end_sec=6.0, score=1.0)]
-    specs = sample_motion(
-        hot,
-        duration_sec=20.0,
-        base_interval_sec=4.0,
-        dense_interval_sec=0.5,
-        hot_padding_sec=1.0,
-    )
-    # No all-video baseline: every sample must sit inside the padded window
-    # [3,7). The dead time (7-20s, 0-3s) is skipped entirely.
-    times = [s.timestamp.total_seconds() for s in specs]
-    assert times, "expected dense samples inside the window"
-    assert all(3.0 <= t < 7.0 for t in times)
-    # ~8 dense samples in [3,7) at 0.5 stride (dedup may drop boundary dupes).
-    assert len(specs) >= 5
-
-
-def test_sample_motion_padding_is_clamped_at_video_bounds() -> None:
-    hot = [HotWindow(start_sec=0.0, end_sec=2.0, score=1.0)]
-    specs = sample_motion(
-        hot,
-        duration_sec=10.0,
-        base_interval_sec=4.0,
-        dense_interval_sec=0.5,
-        hot_padding_sec=5.0,  # would overshoot to -5, but should clamp at 0
-    )
-    # Nothing should be at negative time.
-    assert all(s.timestamp.total_seconds() >= 0 for s in specs)
-    # First sample should be at or after 0.
-    assert specs[0].timestamp.total_seconds() >= 0
-
-
-def test_sample_motion_rejects_invalid_intervals() -> None:
-    with pytest.raises(ValueError, match="intervals"):
-        sample_motion([], duration_sec=10.0, base_interval_sec=0)
-    with pytest.raises(ValueError, match="intervals"):
-        sample_motion([], duration_sec=10.0, dense_interval_sec=-1)
-    with pytest.raises(ValueError, match="hot_padding_sec"):
-        sample_motion([], duration_sec=10.0, hot_padding_sec=-0.1)
-    with pytest.raises(ValueError, match="duration_sec"):
-        sample_motion([], duration_sec=0)
-
-
-def test_build_sampler_motion_requires_hot_windows() -> None:
-    with pytest.raises(ValueError, match="hot_windows"):
-        build_sampler("motion", [], duration_sec=10.0)
-
-
-def test_build_sampler_motion_dispatches_correctly() -> None:
-    hot = [HotWindow(start_sec=2.0, end_sec=4.0, score=1.0)]
-    specs = build_sampler("motion", [], duration_sec=10.0, hot_windows=hot)
-    assert len(specs) >= 3
-    assert all(isinstance(s, FrameSpec) for s in specs)
 
 
 # ---------------------------------------------------------------------------
