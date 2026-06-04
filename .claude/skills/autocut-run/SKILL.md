@@ -5,98 +5,145 @@ description: >-
   wants the best / viral / funniest moments, highlights, the top moments worth
   sharing, or the best few seconds of a match, stream, podcast or interview —
   even if they don't say the word "highlight". Also use it to find and cut a
-  SPECIFIC described moment (a query), e.g. "the moment he admits he lied". This
-  is the ANALYSIS step: it watches the video with a VLM (host or openrouter) and
-  writes a plan.json. If a plan.json ALREADY exists, use autocut-cut instead (no
-  analysis needed); for plain concatenation of existing clips use autocut-merge.
+  SPECIFIC described moment (a query), e.g. "the moment he admits he lied". Two
+  ways to run: analyse the frames YOURSELF locally for free (host), or run the
+  autonomous cloud pipeline (openrouter, paid). For plain trimming of a known
+  segment use autocut-cut; to join existing clips into a reel use autocut-merge.
 ---
 
-# autocut run
+# autocut run — find and cut the highlights
 
-`autocut run` analyses a video with a VLM and writes a **`plan.json`** (the ranked
-clips with their timestamps — pre/post-roll already baked in per the mode). It does
-**NOT** cut any MP4. YOU, the orchestrating agent, then review/edit `plan.json` and
-produce the clips deterministically with **`autocut cut --from-json plan.json
---video VIDEO --output-dir DIR`** (optionally `--min-score N`). `run` itself does no
-content classification — you pick the editing MODE / query up front.
+AutoCut finds the best moments of a video and cuts them. There are **two ways**,
+and you offer the user the choice up front:
 
-Workflow: `run` → review/edit `plan.json` → `cut --from-json` → (optional) `merge
---from-manifest`. Splitting analysis from cutting lets you adjust a boundary or drop
-a clip before committing to MP4s.
+- **HOST (you analyse — free):** you, the agent, look at the frames yourself using
+  the deterministic `autocut` subcommands. Zero API cost, you can be steered. Best
+  for short/medium videos and for interviews. **No API key needed.**
+- **CLOUD (autonomous — paid):** `autocut run --vlm openrouter` sends the video to
+  a cloud model and writes a `plan.json` on its own. Best for long videos or
+  fire-and-forget. **Needs an OpenRouter API key.**
 
-```
-autocut run VIDEO [--content-hint MODE] [--query "<moment>"] \
-    [--vlm host|openrouter] [--vlm-model ID] [--output-dir DIR] \
-    [--accurate|--fast] [--single-pass] [--dry-run] [-y]
-```
+## Step 0 — make sure AutoCut is installed
 
-For long (>60s) openrouter video/audio runs, AutoCut uses a **two-pass**
-coarse→fine analysis by default: it locates candidate regions across the whole
-timeline, then re-analyses each one in isolation for tight, accurate cut
-boundaries (it starts a knockdown clip on the punch, not the referee count). It
-costs ~2x the model calls; pass `--single-pass` to disable. No effect on short
-videos or the host/keyframe routes.
-
-## Agent decision matrix — pick MODE × intent
-
-Read the user's request crossed with the kind of video, then choose:
-
-| User intent | Video kind | Use |
-|---|---|---|
-| "give me the best/viral moments", "make highlights" | action, sport, reactions, anything bursty | `--content-hint highlights` |
-| "find/cut WHEN <specific thing happens>" | any | `--query "<the moment, elaborated>"` |
-| "clip the interesting bits" of a talk/interview/podcast | speech-driven, talking head | `--content-hint talk` |
-| unclear / mixed / you're not sure | mixed, vlog, unknown | `--content-hint hybrid` (or omit — defaults to hybrid) |
-
-Rules of thumb:
-
-- **highlights is strict**: it keeps only clips scoring ≥ 7 and may legitimately
-  return **zero clips** if nothing clears the bar. That is a valid outcome — do
-  not retry with a lower bar to force output.
-- **`--query` is NOT highlights.** A request for one described moment ("the
-  knockdown in round 3", "when they mention the price") is a query. Elaborate the
-  user's words into a clear, specific description and pass it. A query disables
-  the motion pre-filter (so low-motion targets like "the ring girl entering" are
-  not sampled away) — the model filters via your query text instead.
-- You can combine a mode and a query (e.g. `--content-hint talk --query "the
-  moment she admits the mistake"`); the query drives selection, the mode tunes
-  clip length.
-- If you genuinely cannot tell the kind of video and have a cloud key, you may
-  call `autocut detect` (openrouter, synchronous) for a machine classification
-  first — but usually you can just decide and pass the mode.
-
-## Provider
-
-- `--vlm openrouter` (default if configured): sends the compressed video (or
-  audio for talk) to the model; fully automatic, costs money (no spending cap is
-  enforced for now; the run records both the upfront cost estimate and the real
-  billed cost in `plan.json`). Writes `plan.json` when done — then cut it with
-  `autocut cut --from-json`.
-- `--vlm host`: image-only, zero-cost. AutoCut renders the video as timestamped
-  contact sheets and pauses (writes `VLM_REQUEST.md` + the sheets + a
-  `VLM_SHEET_INDEX.json` index→time map); YOU read the sheets, write the
-  `ClipPlan` JSON to `VLM_RESPONSE.json`, then run `autocut resume --work-dir
-  DIR`. For sources >60s this is a **two-pass**: the first resume loads your
-  coarse candidate regions, builds the dense fine sheets and **pauses again** —
-  read them and resume once more. The final resume writes `plan.json`. Then cut
-  with `autocut cut --from-json`. (Host has no audio path — it sees frames only.)
-
-## Examples
+If `autocut --version` fails (command not found), install it once:
 
 ```bash
-# 1) Analyse (writes ./CLIPS/plan.json, no MP4s)
-autocut run match.mp4 --content-hint highlights
-
-# 2) Review/edit ./CLIPS/plan.json if needed, then cut every clip
-autocut cut --from-json ./CLIPS/plan.json --video match.mp4 --output-dir ./CLIPS
-
-# 3) (optional) compose a reel from the cut clips
-autocut merge --from-manifest ./CLIPS/manifest.json --min-score 8 -o reel.mp4
-
-# Find one specific moment, then cut only the strong matches
-autocut run interview.mp4 --query "when the guest reveals why he quit"
-autocut cut --from-json ./CLIPS/plan.json --video interview.mp4 --output-dir ./CLIPS --min-score 7
-
-# Analysis only, inspect the plan first (no plan written on a dry run)
-autocut run mystery.mp4 --content-hint hybrid --dry-run
+uv tool install git+https://github.com/ArtiomIV/autocut-skill
 ```
+
+(If `uv` itself is missing: `curl -LsSf https://astral.sh/uv/install.sh | sh` on
+mac/Linux, or `powershell -c "irm https://astral.sh/uv/install.ps1 | iex"` on
+Windows. ffmpeg is bundled — no separate install.)
+
+## Step 1 — probe, then pick HOST or CLOUD
+
+```bash
+autocut probe VIDEO    # -> JSON: duration_sec, fps, width, height, codecs
+```
+
+Use the duration to suggest a default, then **ask the user** (unless they already
+said which):
+
+| Situation | Suggested default |
+|---|---|
+| Video ≤ ~15 min | **HOST** (free; you read the frames) |
+| Video > ~15 min | **CLOUD** (the frames would flood your context) |
+| No OpenRouter key configured | **HOST** (cloud needs a key) |
+| You cannot open / view images | **CLOUD** |
+
+The user can always override. Then follow the matching recipe below.
+
+---
+
+## HOST recipe (you analyse the frames — free)
+
+You drive the deterministic tools. A contact **sheet** is a grid image: each cell
+is one frame with its integer index burned in; `index.json` maps every index to
+its exact second. You read the grid, pick moments, cut them.
+
+### Short / medium video (≤ ~15 min) — single dense pass
+
+```bash
+autocut sheet VIDEO --fps 2 --out CLIPS/sheet      # dense grid + index.json
+```
+
+1. **Open** every `CLIPS/sheet/sheet_*.jpg` and read `CLIPS/sheet/index.json`.
+2. **Identify** the highlight moments (see *Judgement* below). For each, read the
+   cell indices at its start and end and look them up in `index.json` to get exact
+   seconds. An impact (punch, fall, goal) often happens a cell or two BEFORE the
+   frame where you first see its effect — start a touch earlier.
+3. **Cut** each chosen `[start, end]`:
+   ```bash
+   autocut cut VIDEO --start <START> --end <END> --accurate -o CLIPS/s<score>_clip_NN.mp4
+   ```
+4. **(Optional) reel:** `autocut merge CLIPS/s*_clip_*.mp4 -o CLIPS/reel.mp4`.
+
+### Long video (> ~15 min) — chunk + coarse→fine + cut as you go
+
+A long video at 2 fps is too many frames for one look. Process it **chunk by
+chunk and cut incrementally**, so your context only holds one chunk at a time:
+
+For each ~5-minute window `[T, T+300]`:
+1. **Coarse** (sparse, cheap): `autocut sheet VIDEO --interval 3 --from T --to T+300 --out CLIPS/coarse_T` → open it, spot the 0–few candidate regions in this chunk.
+2. **Fine** (dense) on each candidate region `[a, b]`: `autocut sheet VIDEO --fps 2 --from a --to b --out CLIPS/fine_a` → open it, pick exact `[start, end]`.
+3. **Cut immediately**: `autocut cut VIDEO --start <START> --end <END> --accurate -o CLIPS/s<score>_clip_NN.mp4`. You can now forget this chunk's frames.
+4. Move to the next window.
+
+Finally: `autocut merge CLIPS/s*_clip_*.mp4 -o CLIPS/reel.mp4`.
+
+---
+
+## CLOUD recipe (autonomous — paid)
+
+### Key (security)
+
+The cloud path needs an OpenRouter API key, stored in the OS keyring (never in a
+file, never in plaintext, never echoed). If `autocut keys list` doesn't show
+`openrouter`, ask the **user** to store their own key:
+
+```bash
+autocut keys set openrouter      # prompts for the key, saves it to the keyring
+```
+
+Do not ask the user to paste the key into the chat; the command prompts for it
+securely. Then:
+
+### Run → cut
+
+```bash
+autocut run VIDEO --vlm openrouter [--content-hint MODE] [--query "<moment>"]
+# writes CLIPS/plan.json (ranked clips, roll baked in; real + estimated cost recorded)
+autocut cut --from-json CLIPS/plan.json --video VIDEO --output-dir CLIPS [--min-score N]
+autocut merge --from-manifest CLIPS/manifest.json --min-score 8 -o CLIPS/reel.mp4   # optional
+```
+
+For long (>60s) cloud runs AutoCut does a **two-pass** coarse→fine automatically
+for tight boundaries (~2× the model calls; add `--single-pass` to disable). Review
+`plan.json` before cutting if you want to drop or nudge a clip.
+
+---
+
+## Judgement — what to keep (both paths)
+
+Pick the MODE/intent from the request crossed with the kind of video:
+
+| User intent | Use |
+|---|---|
+| "best/viral moments", "make highlights" | **highlights** mode |
+| "find/cut WHEN <specific thing happens>" | **query**: a clear description of that one moment |
+| "interesting bits" of a talk/interview/podcast | **talk** mode |
+| unclear / mixed | **hybrid** (the safe default) |
+
+(On cloud these map to `--content-hint highlights|talk|hybrid` / `--query`; on host
+they just guide YOUR selection.)
+
+Rules of thumb:
+- **highlights is strict**: keep only genuinely strong moments. Returning **zero
+  clips** is a valid, honest outcome — never force a best-of-nothing.
+- **query ≠ highlights**: one described moment is a query; elaborate the user's
+  words into a specific description and find exactly that.
+- Score on **intensity**, not just clean outcomes: a near-KO / staggering blow /
+  heated exchange counts even without a knockdown. Exclude pre-action and ceremony
+  (entrances, walk-ins, anthems, podiums) and dead time (between-round rest,
+  timeouts) — staging is not action.
+- Cut tight: include the wind-up and the follow-through of the moment, nothing more.
