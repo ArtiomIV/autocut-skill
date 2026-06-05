@@ -61,16 +61,23 @@ You drive the deterministic tools. A contact **sheet** is a grid image: each cel
 is one frame with its integer index burned in; `index.json` maps every index to
 its exact second. You read the grid, pick moments, cut them.
 
-**Legibility (adapt to resolution):** the cells must be readable. For low-resolution
-sources (from `probe`, width ≤ ~640 / height ≤ ~480) the default 6×8 grid packs the
-cells too small — pass **bigger cells and fewer per sheet**, e.g. `--cell-px 320
---cols 4 --rows 5`. For HD sources the 256px / 6×8 default is fine. The fine pass
-should always be legible (`--cell-px 320` is a safe default).
+**Legibility — DOWNSCALING IS WHAT MAKES YOU MISREAD.** You can only judge what you
+can clearly SEE. A cell smaller than the source frame throws away the only detail you
+have, and a small, motion-blurred cell makes a knockdown + a referee's count look
+exactly like a clinch — this is a real, documented failure. So err toward BIGGER cells
+and MORE sheets everywhere; never shrink cells just to save a sheet:
+- **Coarse** (locating regions): keep cells generous so you don't miss a region —
+  `--cell-px 480 --cols 4 --rows 4`. Bump higher if anything looks ambiguous.
+- **Fine** pass and **every verify**: use **`--cell-px 640` with a SMALL grid
+  (`--cols 3 --rows 4`)**. On an SD source (≤640 wide, e.g. 360p) that is the NATIVE
+  frame — zero quality lost; on HD it is still plenty of detail. This produces MANY
+  more sheets — that is fine and expected, **legibility beats sheet count.** Never
+  downscale the decisive moment to save a sheet.
 
 ### Short / medium video (≤ ~15 min) — single dense pass
 
 ```bash
-autocut sheet VIDEO --fps 2 --out CLIPS/sheet      # dense grid + index.json
+autocut sheet VIDEO --fps 2 --cell-px 640 --cols 3 --rows 4 --out CLIPS/sheet   # dense, legible grid + index.json
 ```
 
 1. **Open** every `CLIPS/sheet/sheet_*.jpg` and read `CLIPS/sheet/index.json`.
@@ -93,8 +100,8 @@ A long video at 2 fps is too many frames for one look. Process it **chunk by
 chunk and cut incrementally**, so your context only holds one chunk at a time:
 
 For each ~5-minute window `[T, T+300]`:
-1. **Coarse** (sparse, cheap): `autocut sheet VIDEO --interval 3 --from T --to T+300 --out CLIPS/coarse_T` → open it, spot the 0–few candidate regions in this chunk.
-2. **Fine** (dense) on each candidate region `[a, b]`: `autocut sheet VIDEO --fps 2 --from a --to b --out CLIPS/fine_a` → open it, pick exact `[start, end]`.
+1. **Coarse** (locate): `autocut sheet VIDEO --interval 2 --from T --to T+300 --cell-px 480 --cols 4 --rows 4 --out CLIPS/coarse_T` → open it and spot **every** candidate region in this chunk — there may be several, do not stop at the first. (Sample every **2s**, not sparser: a fast knockdown can hide between frames spaced wider.)
+2. **Fine** (dense, NATIVE res) on each candidate `[a, b]` — **pad it by ±5–8s** so the whole event (cause AND count/aftermath) fits well inside, never at the edge: `autocut sheet VIDEO --fps 2 --from a-8 --to b+8 --cell-px 640 --cols 3 --rows 4 --out CLIPS/fine_a` → open it, confirm what it actually is (a real peak vs routine action), then pick exact `[start, end]`.
 3. **Cut immediately**: `autocut cut VIDEO --start <START> --end <END> --accurate -o CLIPS/s<score>_clip_NN.mp4`.
 4. **⭐ VERIFY THE CUT (MANDATORY — do not skip):** sheet the clip and confirm the
    decisive event is inside it (see *Verify every cut* below); RE-CUT if missing.
@@ -148,14 +155,56 @@ Pick the MODE/intent from the request crossed with the kind of video:
 (On cloud these map to `--content-hint highlights|talk|hybrid` / `--query`; on host
 they just guide YOUR selection.)
 
+### Selection discipline — your ONLY job is to pick the best moments
+
+Read this before judging. These rules keep selection honest and are where agents
+most often go wrong:
+
+1. **Match the request exactly — no more, no less.**
+   - Asked for **knockouts / KOs** → keep ONLY knockouts (actual knockdowns/KOs), not
+     every exchange, not near-KOs.
+   - Asked for **highlights / best / salient moments** → keep KOs **and** the other
+     peaks (near-KOs, staggering blows, heated sustained exchanges, slow-mo replays).
+     **Do NOT keep only the knockouts.** A salient-moments request wants those strong
+     non-KO moments too — dropping a genuine big moment "to stay strict" is wrong here.
+   - Asked for a **specific moment (query)** → find exactly that one thing.
+2. **If what was asked for is not in the video, keep nothing for it.** Never force a
+   "best of nothing" cut just to have an output — skip it and move on. Empty is valid.
+3. **A window can hold SEVERAL moments, not one.** Don't stop at the first peak in a
+   chunk — capture every moment that qualifies, each as its own clip.
+4. **Do NOT reason about the state of the match — it is not your task and it makes you
+   wrong.** Never conclude "the fight is over", "this is a TKO", "the match ended", or
+   "this is the final round". Whether an event ends the bout is irrelevant to whether
+   it makes a good clip. Just select good moments.
+5. **A break is a non-moment — skip it, don't interpret it.** A full-screen graphic, a
+   sponsor card, an empty ring with stools, fighters walking to corners = not a moment.
+   Pass over it and keep scanning; never treat it as the end of anything, and never
+   extend a clip into it.
+6. **Slow-motion REPLAYS are top-value — score them at the MAXIMUM.** Broadcasts replay
+   the best action (a KO, a big hit) in slow motion, often during the breaks. Keep every
+   replay: it is prime viral footage and often your cleanest view of a fast event.
+7. **Score on CLEAN, DECISIVE ACTION — not on activity or proximity.** A highlight is
+   the action LANDING: a clean combination connecting, a shot that visibly hurts, a
+   goal scored, a punchline that lands. Fighters merely close and busy with punches
+   that MISS / are BLOCKED / are LIGHT is NOT a highlight (~4) — "looks intense" is not
+   the test, clean CONTACT is. Verify the contact on the fine pass before scoring.
+8. **Label by what you see, and KEEP only score ≥ 6 (drop everything below).** Only a
+   clear knockout / knockdown WITH a count is a "KO" (9–10); a strong moment with clean
+   landed action is a good highlight (7–8); activity without clean contact is ~4 and
+   DROPS. Don't inflate, and don't keep sub-6 clips to pad the set.
+
 ### On HOST: load the SAME rules the cloud uses (MANDATORY first step of judging)
 
 **Before you look at a single sheet to pick clips, you MUST run and FOLLOW:**
 
 ```bash
-autocut guidance highlights     # or: talk | hybrid
+autocut guidance highlights                  # or: talk | hybrid
+autocut guidance highlights --sport boxing   # + thin recognition layer for a sport
 ```
 
+For a combat/known sport, add `--sport <name>` (e.g. `boxing`) — it appends a small
+"what a count / knockdown / strong moment LOOKS like in this sport" layer on top of
+the generic rules. Unknown sport → generic highlights (the generic always works).
 This is **not optional**. It prints the exact editorial rules the cloud model gets
 in its prompt — there is ONE source, so host and cloud judge clips identically.
 Skipping it is the documented cause of past misreads. Run it, read it, apply it.
@@ -175,20 +224,45 @@ The rules that matter most (and the ones agents most often get wrong):
 - **query ≠ highlights**: one described moment; elaborate it and find exactly that.
 - Cut tight: wind-up + follow-through of the moment, nothing more.
 
+### How to read a peak off the sheets (what to extract, and how)
+
+The decisive event is usually TOO FAST to land in a cell — you see its CONSEQUENCE
+(a reaction, an intervention, a celebration, a result on screen), not the act itself:
+
+- Read the consequence first, then **ANCHOR BACKWARDS**: the event that caused it is
+  2–5s earlier (the low frame rate hides the instant of impact). Set START there, END
+  after the consequence that proves it.
+- **If at the current cell size you cannot tell WHAT you are looking at** — a decisive
+  moment or just routine action — that ambiguity is itself the signal to **re-sheet
+  that window at `--cell-px 640`** before deciding. Never score or cut on a cell you
+  cannot clearly read: re-sheet, don't guess.
+- **Never judge an event that sits at the EDGE of your fine window.** If the candidate
+  (a fighter going down, a referee stepping in, a celebration) appears in the FIRST or
+  LAST cells of a fine sheet, then its cause or its aftermath (e.g. the count) is
+  OUTSIDE the window — you are seeing the event only HALF. WIDEN the window by several
+  seconds on that side and re-sheet before deciding. Always pad fine windows generously
+  (±5–8s around the candidate). A half-seen event is the #1 cause of a real knockdown
+  being wrongly dismissed as "just an exchange".
+
 ### Verify every cut (MANDATORY self-check)
 
-A boundary read off a sheet can be wrong — most often the clip ends BEFORE the
-decisive moment (you anchored on an earlier flurry, not the actual knockdown +
-count). **After every `cut`, you MUST check the clip you produced, not just trust
-the timestamps:**
+A cut can be wrong two ways: it ends BEFORE the decisive moment, OR you mis-saw the
+moment entirely on small, blurry cells (routine action read as a peak). **After every
+`cut`, re-sheet the clip you produced — at NATIVE resolution, so the check can actually
+catch a misread instead of rubber-stamping it:**
 
 ```bash
-autocut sheet CLIPS/s<score>_clip_NN.mp4 --fps 2 --cell-px 320 --out CLIPS/verify_NN
+autocut sheet CLIPS/s<score>_clip_NN.mp4 --fps 2 --cell-px 640 --cols 3 --rows 4 --out CLIPS/verify_NN
 ```
 
-Open `CLIPS/verify_NN/sheet_*.jpg` and confirm the **whole decisive event is inside
-the clip**: the strike AND its result AND the aftermath that proves it (e.g. the
-fighter going down AND the referee's count; the goal AND the net bulging). If the
-clip starts late, ends before the count, or cuts the impact — **RE-CUT with corrected
-boundaries and verify again.** Do not merge or report a clip until it passes this
-check. This loop is what catches the #1 error (cutting the aftermath off the event).
+⚠️ **The verify is worthless at the same small cell size you SELECTED with — you would
+just re-confirm your own mistake.** Use big cells (`--cell-px 640`).
+
+Open the sheets and confirm the **whole decisive event is genuinely inside the clip AND
+is what you thought it was**: the action AND its result AND the aftermath that proves it
+(e.g. the fighter going down AND the referee's count; the goal AND the net bulging). If
+you still cannot clearly confirm it at native resolution, it is NOT a verified
+highlight — drop it or get a higher-fidelity check, do not ship a guess. If the clip
+starts late, ends before the payoff, or cuts the impact — RE-CUT and verify again. Do
+not merge or report a clip until it passes. This loop catches both the #1 error
+(cutting the event off) and the misread error (inventing one that isn't there).

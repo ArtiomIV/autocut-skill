@@ -56,6 +56,29 @@ def test_guidance_aliases_map_to_highlights() -> None:
     assert guidance_for("boxing") == guidance_for("highlights")
 
 
+def test_guidance_sport_appends_recognition_layer() -> None:
+    # An explicit --sport appends a thin recognition layer on top of highlights.
+    generic = guidance_for("highlights")
+    boxing = guidance_for("highlights", sport="boxing")
+    assert boxing.startswith(generic)
+    assert len(boxing) > len(generic)
+    assert "Sport cues" in boxing
+    # The cue layer carries the count-vs-clinch recognition (the key host mistake).
+    assert "CLINCH" in boxing
+    assert "COUNT" in boxing
+
+
+def test_guidance_unknown_sport_falls_back_to_generic() -> None:
+    # An unknown sport (or none) changes nothing — generic highlights stands alone.
+    assert guidance_for("highlights", sport="underwater-chess") == guidance_for("highlights")
+    assert guidance_for("highlights", sport=None) == guidance_for("highlights")
+
+
+def test_guidance_sport_only_layers_on_highlights_not_talk() -> None:
+    # The sport cue is meaningful only on the action/highlights body, not on talk.
+    assert guidance_for("talk", sport="boxing") == guidance_for("talk")
+
+
 def test_schema_includes_extra_forbid_for_clip() -> None:
     schema = json.loads(clip_plan_schema())
     clip_schema = schema["$defs"]["Clip"]

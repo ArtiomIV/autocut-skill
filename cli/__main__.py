@@ -579,6 +579,14 @@ def guidance(
         str,
         typer.Argument(help="Editing mode: highlights | talk | hybrid."),
     ] = "highlights",
+    sport: Annotated[
+        str | None,
+        typer.Option(
+            "--sport",
+            help="Optional sport for extra recognition cues (e.g. boxing). "
+            "Unknown/none -> generic highlights.",
+        ),
+    ] = None,
 ) -> None:
     """Print the clip-selection rules for a HOST run. Deterministic, no VLM.
 
@@ -587,10 +595,15 @@ def guidance(
     moment; score on intensity; KO always kept; exclude ceremony/dead time; keep
     slow-mo replays). On the host path, read this BEFORE judging the contact sheets
     so host and cloud pick clips identically.
+
+    Pass ``--sport`` (e.g. ``--sport boxing``) to append a thin sport-specific
+    recognition layer on top of the highlights rules (what a count / knockdown /
+    strong moment looks like in that sport). An unknown sport falls back to the
+    generic highlights guidance.
     """
     from autocut.vlm.prompts import guidance_for
 
-    console.print(guidance_for(mode))
+    console.print(guidance_for(mode, sport=sport))
 
 
 @app.command()

@@ -282,7 +282,56 @@ Universal rules (every mode):
 """
 
 
-def guidance_for(mode: str) -> str:
+# Optional per-sport RECOGNITION layer, appended on top of the generic highlights
+# body when the caller names a sport. This is the "what does a peak/consequence
+# LOOK like in this sport" cue sheet — NOT a replacement for the universal rules.
+# Keep each block thin (recognition cues only); the editorial judgement lives in
+# the shared core above so it never forks per sport. Unknown / no sport -> generic
+# highlights (no append). Boxing first; add others on demand.
+_SPORT_CUES: Final[dict[str, str]] = {
+    "boxing": """\
+
+Sport cues — boxing / kickboxing / combat sports (recognition layer):
+- KNOCKDOWN / COUNT looks like this in a wide shot: the referee suddenly moves to
+  CENTRE frame and makes a repeated arm/hand chopping gesture (the count); one
+  fighter is on the canvas or sent to a neutral corner, the other waits APART. A
+  referee gesturing centre-frame with the fighters SEPARATED is a COUNT — PROOF a
+  knockdown just happened. ALWAYS keep it (9-10) and anchor 2-5s earlier on the
+  strike that caused it. A STANDING count (fighter up against the ropes/corner
+  while the ref counts) is a near-KO — keep it too, never read it as a clinch.
+- Do NOT confuse a CLINCH with a knockdown: in a clinch both fighters are UPRIGHT
+  and TOGETHER with the ref beside them; in a knockdown they are APART, one is
+  low/down, and the ref is COUNTING centre-frame. If you cannot tell at the current
+  cell size, re-sheet at native resolution before deciding.
+- WHAT MAKES A BOXING HIGHLIGHT = CLEAN LANDED SHOTS. The test is whether punches
+  visibly CONNECT — a sharp combination landing to the head or body, a clean power
+  shot, a sustained flurry of LANDED blows, a punch that snaps the head back or folds
+  the body. You must SEE the shots land (head jerks, body buckles, opponent rocked).
+  Verify this on the fine pass at native resolution BEFORE scoring — do not score on
+  how "busy" or "close" the fighters look.
+- NOT a highlight (score ~4, DROP it): fighters merely close and active but with
+  punches MISSING, BLOCKED, glancing or LIGHT; pressing or leaning on the ropes
+  WITHOUT clean landed shots; feeling-out, circling; holding/clinching; the
+  between-round rest. "Intense-looking" or "close" is NOT the test — clean CONTACT
+  is. If you cannot clearly see shots LAND, it is not a 7; it is ~4, and it is below
+  the keep threshold, so DROP it.
+""",
+}
+
+
+def sport_cue_for(sport: str | None) -> str:
+    """Return the recognition-cue block for ``sport`` (empty if none/unknown).
+
+    A thin per-sport layer appended on top of the generic highlights body. Unknown
+    or missing sport falls back to nothing — the generic guidance always stands on
+    its own.
+    """
+    if not sport:
+        return ""
+    return _SPORT_CUES.get(sport.strip().lower(), "")
+
+
+def guidance_for(mode: str, sport: str | None = None) -> str:
     """Return the human-readable clip-selection rules for a HOST run of ``mode``.
 
     SINGLE SOURCE of the editorial judgement, shared with the cloud system prompt:
@@ -290,6 +339,12 @@ def guidance_for(mode: str) -> str:
     it would receive inside the openrouter prompt, so host and cloud pick clips
     identically. ``mode`` accepts the editing modes / content hints; unknown values
     fall back to the hybrid guidance.
+
+    ``sport`` is an OPTIONAL recognition layer: when set to a known sport (e.g.
+    ``boxing``) and ``mode`` resolves to highlights, the sport's cue block is
+    appended on top. An unknown or missing sport changes nothing (generic
+    highlights). ``mode`` and ``sport`` are independent axes — ``mode="boxing"``
+    alone is still just the generic highlights body, by design.
     """
     m = (mode or "hybrid").strip().lower()
     if m in {"highlights", "sport", "boxing", "gameplay"}:
@@ -298,7 +353,8 @@ def guidance_for(mode: str) -> str:
         body = _TALK_GUIDANCE
     else:
         body = _HYBRID_GUIDANCE
-    return _HOST_JUDGEMENT_PREAMBLE + body
+    cue = sport_cue_for(sport) if body is _HIGHLIGHTS_GUIDANCE else ""
+    return _HOST_JUDGEMENT_PREAMBLE + body + cue
 
 
 _SYSTEM_TEMPLATES: Final[dict[PromptTemplateId, str]] = {
