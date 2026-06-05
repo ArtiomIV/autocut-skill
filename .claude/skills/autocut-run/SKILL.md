@@ -82,7 +82,10 @@ autocut sheet VIDEO --fps 2 --out CLIPS/sheet      # dense grid + index.json
    ```bash
    autocut cut VIDEO --start <START> --end <END> --accurate -o CLIPS/s<score>_clip_NN.mp4
    ```
-4. **(Optional) reel:** `autocut merge CLIPS/s*_clip_*.mp4 -o CLIPS/reel.mp4`.
+4. **⭐ VERIFY THE CUT (MANDATORY — do not skip):** sheet the clip you just made and
+   confirm the decisive event is actually inside it (see *Verify every cut* below).
+   If it's missing or truncated, RE-CUT before moving on.
+5. **(Optional) reel:** `autocut merge CLIPS/s*_clip_*.mp4 -o CLIPS/reel.mp4`.
 
 ### Long video (> ~15 min) — chunk + coarse→fine + cut as you go
 
@@ -92,8 +95,10 @@ chunk and cut incrementally**, so your context only holds one chunk at a time:
 For each ~5-minute window `[T, T+300]`:
 1. **Coarse** (sparse, cheap): `autocut sheet VIDEO --interval 3 --from T --to T+300 --out CLIPS/coarse_T` → open it, spot the 0–few candidate regions in this chunk.
 2. **Fine** (dense) on each candidate region `[a, b]`: `autocut sheet VIDEO --fps 2 --from a --to b --out CLIPS/fine_a` → open it, pick exact `[start, end]`.
-3. **Cut immediately**: `autocut cut VIDEO --start <START> --end <END> --accurate -o CLIPS/s<score>_clip_NN.mp4`. You can now forget this chunk's frames.
-4. Move to the next window.
+3. **Cut immediately**: `autocut cut VIDEO --start <START> --end <END> --accurate -o CLIPS/s<score>_clip_NN.mp4`.
+4. **⭐ VERIFY THE CUT (MANDATORY — do not skip):** sheet the clip and confirm the
+   decisive event is inside it (see *Verify every cut* below); RE-CUT if missing.
+   Only then may you forget this chunk's frames and move to the next window.
 
 Finally: `autocut merge CLIPS/s*_clip_*.mp4 -o CLIPS/reel.mp4`.
 
@@ -143,17 +148,18 @@ Pick the MODE/intent from the request crossed with the kind of video:
 (On cloud these map to `--content-hint highlights|talk|hybrid` / `--query`; on host
 they just guide YOUR selection.)
 
-### On HOST: load the SAME rules the cloud uses
+### On HOST: load the SAME rules the cloud uses (MANDATORY first step of judging)
 
-Before picking clips from the sheets, run and FOLLOW:
+**Before you look at a single sheet to pick clips, you MUST run and FOLLOW:**
 
 ```bash
 autocut guidance highlights     # or: talk | hybrid
 ```
 
-This prints the exact editorial rules the cloud model gets in its prompt — there is
-ONE source, so host and cloud judge clips identically. Apply them. The rules that
-matter most (and the ones agents most often get wrong):
+This is **not optional**. It prints the exact editorial rules the cloud model gets
+in its prompt — there is ONE source, so host and cloud judge clips identically.
+Skipping it is the documented cause of past misreads. Run it, read it, apply it.
+The rules that matter most (and the ones agents most often get wrong):
 
 - **ANCHOR ON THE EVENT, NOT ITS AFTERMATH.** A referee's count, a fighter on the
   canvas, a celebration is PROOF an event happened just before — find that event
@@ -168,3 +174,21 @@ matter most (and the ones agents most often get wrong):
 - **highlights is strict**: zero clips is a valid outcome — never force best-of-nothing.
 - **query ≠ highlights**: one described moment; elaborate it and find exactly that.
 - Cut tight: wind-up + follow-through of the moment, nothing more.
+
+### Verify every cut (MANDATORY self-check)
+
+A boundary read off a sheet can be wrong — most often the clip ends BEFORE the
+decisive moment (you anchored on an earlier flurry, not the actual knockdown +
+count). **After every `cut`, you MUST check the clip you produced, not just trust
+the timestamps:**
+
+```bash
+autocut sheet CLIPS/s<score>_clip_NN.mp4 --fps 2 --cell-px 320 --out CLIPS/verify_NN
+```
+
+Open `CLIPS/verify_NN/sheet_*.jpg` and confirm the **whole decisive event is inside
+the clip**: the strike AND its result AND the aftermath that proves it (e.g. the
+fighter going down AND the referee's count; the goal AND the net bulging). If the
+clip starts late, ends before the count, or cuts the impact — **RE-CUT with corrected
+boundaries and verify again.** Do not merge or report a clip until it passes this
+check. This loop is what catches the #1 error (cutting the aftermath off the event).
