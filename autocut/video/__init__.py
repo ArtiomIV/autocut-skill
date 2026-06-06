@@ -13,6 +13,7 @@ from autocut.video.frame_sampler import (
 )
 from autocut.video.keyframes import KeyframeExtractionError, extract_keyframes
 from autocut.video.probe import FFprobeError, probe_video
+from autocut.video.readiness import ReadinessTimeout, ReadyResult, wait_until_ready
 from autocut.video.scene_detect import SceneDetectError, detect_scenes
 
 __all__ = [
@@ -23,6 +24,8 @@ __all__ = [
     "FFprobeError",
     "FrameSpec",
     "KeyframeExtractionError",
+    "ReadinessTimeout",
+    "ReadyResult",
     "SamplingStrategy",
     "SceneDetectError",
     "build_sampler",
@@ -36,4 +39,5 @@ __all__ = [
     "sample_hybrid",
     "sample_scene_based",
     "sample_uniform",
+    "wait_until_ready",
 ]

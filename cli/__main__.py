@@ -581,6 +581,57 @@ def probe(
     )
 
 
+@app.command(name="wait-ready")
+def wait_ready(
+    video: Annotated[Path, typer.Argument(help="Input video that may still be copying.")],
+    stable_for: Annotated[
+        float,
+        typer.Option(
+            "--stable-for",
+            help="Seconds the file size+mtime must stay unchanged before it counts as ready.",
+        ),
+    ] = 2.0,
+    timeout: Annotated[
+        float,
+        typer.Option(
+            "--timeout",
+            help="Give up after this many seconds (also covers a file that never arrives).",
+        ),
+    ] = 900.0,
+    poll: Annotated[
+        float,
+        typer.Option("--poll", help="Seconds between checks."),
+    ] = 1.0,
+) -> None:
+    """Block until VIDEO has finished being written. Deterministic, no VLM.
+
+    Call this FIRST, before ``probe``/``run``, whenever the file may still be
+    arriving (e.g. a phone transfer into a watched folder). The file *exists* the
+    instant a copy starts but keeps growing for seconds; touching it early can
+    probe or cut a truncated video. This polls the file's ``(size, mtime)`` and
+    only returns once the pair has been identical for ``--stable-for`` seconds and
+    the file is openable for reading (which also clears a Windows copy lock). It
+    also waits for a not-yet-present file to appear, up to ``--timeout``.
+
+    Exit 0 = ready; exit 1 = timed out (still copying, locked, or never arrived).
+    """
+    from autocut.video.readiness import ReadinessTimeout, wait_until_ready
+
+    if stable_for < 0 or timeout <= 0 or poll <= 0:
+        raise typer.BadParameter("--stable-for must be >= 0; --timeout and --poll must be > 0")
+
+    try:
+        result = wait_until_ready(video, stable_for=stable_for, timeout=timeout, poll=poll)
+    except ReadinessTimeout as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    console.print(
+        f"[green]OK[/] ready: {video.resolve()} "
+        f"({result.size_bytes} bytes, waited {result.waited_sec:.1f}s)"
+    )
+
+
 @app.command()
 def signals(
     video: Annotated[Path, typer.Argument(help="Input video to analyse for advisory signals.")],

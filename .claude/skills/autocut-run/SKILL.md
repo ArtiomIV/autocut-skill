@@ -35,6 +35,26 @@ uv tool install git+https://github.com/ArtiomIV/autocut-skill
 mac/Linux, or `powershell -c "irm https://astral.sh/uv/install.ps1 | iex"` on
 Windows. ffmpeg is bundled — no separate install.)
 
+## Step 0.5 — if the file may still be arriving, wait for it first
+
+A file **exists the instant a copy starts** but keeps growing for seconds (a phone
+transfer into a watched folder, an upload, an AirDrop/network copy). If you probe or
+cut it too early you can read a truncated video — or silently cut a clip that's missing
+its end. So **whenever the video was just dropped in / you're watching a folder / the
+user is transferring it, run this BEFORE `probe` (and before `run`), on BOTH paths:**
+
+```bash
+autocut wait-ready VIDEO          # blocks until the file finished copying, then exits 0
+# tune if needed: --stable-for 2 (secs unchanged = ready)  --timeout 900  --poll 1
+```
+
+It polls the file's size+mtime and returns only once they've held steady for
+`--stable-for` seconds and the file is openable (this also clears a Windows copy
+lock); it also waits for a not-yet-present file to appear. **Exit 0 = ready, proceed;
+exit 1 = it timed out** (still copying / locked / never arrived) — tell the user, do
+not run on it. If you already have a settled local file (nothing is copying), you can
+skip this step.
+
 ## Step 1 — probe, then pick HOST or CLOUD
 
 ```bash

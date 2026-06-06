@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `autocut wait-ready VIDEO` — a deterministic readiness gate the orchestrating
+  agent calls before `probe`/`run` when a file may still be arriving (e.g. a phone
+  transfer into a watched folder). A file *exists* the instant a copy starts but
+  keeps growing; touching it early can probe or cut a truncated video. The command
+  polls the file's `(size, mtime)` and the read lock, returning only once they have
+  held steady for `--stable-for` seconds (also waits for a not-yet-present file to
+  appear, up to `--timeout`). Exit 0 = ready; exit 1 = timed out. Wired as
+  "Step 0.5" of the `autocut-run` recipe (both host and cloud paths).
 - `autocut bootstrap` is now implemented and works across agents, not just Claude.
   It detects installed agents and installs AutoCut in each one's native shape,
   idempotently (`--list`, `--dry-run`, `--force`):
