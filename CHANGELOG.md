@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `autocut bootstrap` is now implemented: it detects installed AI agents (Claude
+  Code / Cowork) and installs the four skill manifests into each agent's skills
+  directory, idempotently (`--list`, `--dry-run`, `--force`). The manifests are a
+  single source of truth at `.claude/skills/` and are bundled into the wheel
+  (`autocut/_skills/`), so a `uv tool install` ships them and bootstrap can lay
+  them down — closing the gap where `npx skills` copies markdown but not the CLI
+  engine the skills drive.
+- One-line installers `install.sh` (macOS/Linux) and `install.ps1` (Windows):
+  install `uv` if missing, `uv tool install` the CLI (ffmpeg bundled), run
+  `autocut bootstrap`, then `autocut doctor`.
 - Video-input analysis path (Phase G). Instead of sampling keyframes, the
   source is compressed to an analysis-grade copy and the model watches the
   video directly — it perceives motion and catches the decisive moment a flat

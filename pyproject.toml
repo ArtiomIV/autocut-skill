@@ -88,6 +88,12 @@ autocut = "cli.__main__:app"
 [tool.hatch.build.targets.wheel]
 packages = ["autocut", "cli"]
 
+# Ship the agent skill manifests inside the wheel so `autocut bootstrap` can
+# install them after a `uv tool install`. Single source of truth stays at
+# `.claude/skills/`; this mirrors it to `autocut/_skills/` in the built artifact.
+[tool.hatch.build.targets.wheel.force-include]
+".claude/skills" = "autocut/_skills"
+
 # ---------------------------------------------------------------------------
 # Tool configuration
 # ---------------------------------------------------------------------------

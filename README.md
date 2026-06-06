@@ -29,14 +29,39 @@ Currently building **v0.1.0**. See [`CHANGELOG.md`](CHANGELOG.md) for what is in
 | v0.3.0 | Local providers (Ollama, LM Studio) | planned |
 | v0.4.0 | Hardening, optional GUI, optional MCP wrapper | planned |
 
-## Quick start (once v0.1.0 ships)
+## Quick start
+
+**One-line install** (installs `uv` if missing, the `autocut` CLI with bundled
+ffmpeg, and the agent skills):
 
 ```bash
-pipx install 'autocut-skill[ffmpeg-bundled]'
-autocut bootstrap           # detects installed AI agents + installs skill manifests
-autocut config wizard       # picks provider, model, output modes
-autocut run my_video.mp4    # produces highlights in ./CLIPS/
+# macOS / Linux
+curl -LsSf https://raw.githubusercontent.com/ArtiomIV/autocut-skill/main/install.sh | sh
 ```
+
+```powershell
+# Windows
+powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/ArtiomIV/autocut-skill/main/install.ps1 | iex"
+```
+
+**Or install the CLI directly** with [uv](https://docs.astral.sh/uv/) (ffmpeg is
+bundled — nothing else to install):
+
+```bash
+uv tool install git+https://github.com/ArtiomIV/autocut-skill
+autocut bootstrap           # detect installed AI agents + install the skill manifests
+autocut doctor              # verify ffmpeg / config / providers
+```
+
+Then just ask your agent for the highlights, or drive it yourself:
+
+```bash
+autocut run my_video.mp4    # cloud pipeline (needs an OpenRouter key); host mode is free
+```
+
+`autocut bootstrap` writes the four skills (`autocut-run`, `autocut-cut`,
+`autocut-merge`, `autocut-detect`) into every detected agent's skills directory
+(e.g. `~/.claude/skills/`). Re-run it any time to refresh; it is idempotent.
 
 ## Security model
 

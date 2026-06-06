@@ -17,6 +17,13 @@ from rich.console import Console
 from rich.table import Table
 
 from autocut import __version__
+from autocut.bootstrap import (
+    BootstrapError,
+    detect_agents,
+    discover_skills,
+    install_skills,
+    known_agents,
+)
 from autocut.config import AutoCutConfig, AutoCutSettings, config_path
 from autocut.models import AnalysisHints, ContentHint
 from autocut.pipeline import (
@@ -867,10 +874,66 @@ def merge(
 
 
 @app.command()
-def bootstrap() -> None:
-    """Detect installed AI agents and install skill manifests. Available from M5."""
-    err_console.print("`autocut bootstrap` is not implemented yet. Available from M5.")
-    raise typer.Exit(code=2)
+def bootstrap(
+    list_only: Annotated[
+        bool,
+        typer.Option(
+            "--list", help="Only report detected agents and bundled skills; write nothing."
+        ),
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Reinstall every skill even if already up to date."),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Show what would change without writing anything."),
+    ] = False,
+) -> None:
+    """Detect installed AI agents and install AutoCut's skill manifests into each."""
+    try:
+        skills = discover_skills()
+    except BootstrapError as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    agents = detect_agents()
+
+    if list_only:
+        console.print(f"Bundled skills ({len(skills)}): " + ", ".join(s.name for s in skills))
+        if not agents:
+            console.print("[yellow]No supported AI agents detected.[/]")
+            for a in known_agents():
+                console.print(f"  · {a.label}: looked for {a.marker} (not found)")
+            return
+        console.print("Detected agents:")
+        for a in agents:
+            console.print(f"  [green]✓[/] {a.label} → {a.skills_dir}")
+        return
+
+    if not agents:
+        err_console.print(
+            "No supported AI agents detected (looked for "
+            + ", ".join(str(a.marker) for a in known_agents())
+            + "). Install Claude Code first, then re-run `autocut bootstrap`."
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        results = install_skills(agents, skills, force=force, dry_run=dry_run)
+    except BootstrapError as exc:
+        err_console.print(str(exc))
+        raise typer.Exit(code=1) from exc
+
+    changed = sum(1 for r in results if r.action not in {"unchanged"})
+    for r in results:
+        mark = "[green]✓[/]" if r.action != "unchanged" else "·"
+        console.print(f"  {mark} {r.agent_id}: {r.skill} [{r.action}]")
+    verb = "would change" if dry_run else "changed"
+    console.print(
+        f"[green]OK[/] {len(results)} skill/agent pair(s), {changed} {verb}. "
+        "Restart your agent to pick up new skills."
+    )
 
 
 # ---------------------------------------------------------------------------
