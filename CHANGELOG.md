@@ -8,13 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `autocut bootstrap` is now implemented: it detects installed AI agents (Claude
-  Code / Cowork) and installs the four skill manifests into each agent's skills
-  directory, idempotently (`--list`, `--dry-run`, `--force`). The manifests are a
-  single source of truth at `.claude/skills/` and are bundled into the wheel
-  (`autocut/_skills/`), so a `uv tool install` ships them and bootstrap can lay
-  them down — closing the gap where `npx skills` copies markdown but not the CLI
-  engine the skills drive.
+- `autocut bootstrap` is now implemented and works across agents, not just Claude.
+  It detects installed agents and installs AutoCut in each one's native shape,
+  idempotently (`--list`, `--dry-run`, `--force`):
+  - **skills-dir agents** (Claude Code / Cowork) get the four SKILL.md folders
+    copied into `~/.claude/skills/`.
+  - **instructions-file agents** (Codex via `~/.codex/AGENTS.md`, Gemini CLI via
+    `~/.gemini/GEMINI.md`) get a small, marker-delimited AutoCut block upserted
+    into their always-loaded instructions file (existing content preserved;
+    re-runs replace the block in place, never duplicate it).
+  - `--project PATH` (or `-p .`) additionally installs into a repo's
+    `.claude/skills` + `AGENTS.md`, reaching editor agents (Cursor, Windsurf,
+    aider, Zed, …) that read project-local files.
+  The manifests are a single source of truth at `.claude/skills/` and are bundled
+  into the wheel (`autocut/_skills/`), so a `uv tool install` ships them and
+  bootstrap can lay them down — closing the gap where `npx skills` copies markdown
+  but not the CLI engine the skills drive.
 - One-line installers `install.sh` (macOS/Linux) and `install.ps1` (Windows):
   install `uv` if missing, `uv tool install` the CLI (ffmpeg bundled), run
   `autocut bootstrap`, then `autocut doctor`.

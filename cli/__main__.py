@@ -21,8 +21,9 @@ from autocut.bootstrap import (
     BootstrapError,
     detect_agents,
     discover_skills,
-    install_skills,
+    install,
     known_agents,
+    project_agents,
 )
 from autocut.config import AutoCutConfig, AutoCutSettings, config_path
 from autocut.models import AnalysisHints, ContentHint
@@ -881,16 +882,33 @@ def bootstrap(
             "--list", help="Only report detected agents and bundled skills; write nothing."
         ),
     ] = False,
+    project: Annotated[
+        Path | None,
+        typer.Option(
+            "--project",
+            "-p",
+            help=(
+                "Also install into a PROJECT dir (writes ./.claude/skills + ./AGENTS.md "
+                "there), reaching editor agents like Cursor/Windsurf/aider/Zed. "
+                "Pass a path, or use '.' for the current directory."
+            ),
+        ),
+    ] = None,
     force: Annotated[
         bool,
-        typer.Option("--force", help="Reinstall every skill even if already up to date."),
+        typer.Option("--force", help="Reinstall everything even if already up to date."),
     ] = False,
     dry_run: Annotated[
         bool,
         typer.Option("--dry-run", help="Show what would change without writing anything."),
     ] = False,
 ) -> None:
-    """Detect installed AI agents and install AutoCut's skill manifests into each."""
+    """Detect installed AI agents and install AutoCut's instructions into each.
+
+    skills-dir agents (Claude Code/Cowork) get the SKILL.md folders; instructions-file
+    agents (Codex, Gemini CLI) get a small AutoCut block in their AGENTS.md/GEMINI.md.
+    Use --project to also reach editor agents via a project's files.
+    """
     try:
         skills = discover_skills()
     except BootstrapError as exc:
@@ -898,6 +916,8 @@ def bootstrap(
         raise typer.Exit(code=1) from exc
 
     agents = detect_agents()
+    if project is not None:
+        agents = agents + project_agents(project.resolve())
 
     if list_only:
         console.print(f"Bundled skills ({len(skills)}): " + ", ".join(s.name for s in skills))
@@ -905,34 +925,35 @@ def bootstrap(
             console.print("[yellow]No supported AI agents detected.[/]")
             for a in known_agents():
                 console.print(f"  · {a.label}: looked for {a.marker} (not found)")
+            console.print("  Tip: pass --project . to install into the current repo for any agent.")
             return
-        console.print("Detected agents:")
+        console.print("Targets:")
         for a in agents:
-            console.print(f"  [green]✓[/] {a.label} → {a.skills_dir}")
+            console.print(f"  [green]✓[/] {a.label} → {a.target}")
         return
 
     if not agents:
         err_console.print(
             "No supported AI agents detected (looked for "
             + ", ".join(str(a.marker) for a in known_agents())
-            + "). Install Claude Code first, then re-run `autocut bootstrap`."
+            + "). Install one first, or pass --project . to install into this repo."
         )
         raise typer.Exit(code=1)
 
     try:
-        results = install_skills(agents, skills, force=force, dry_run=dry_run)
+        results = install(agents, skills, force=force, dry_run=dry_run)
     except BootstrapError as exc:
         err_console.print(str(exc))
         raise typer.Exit(code=1) from exc
 
-    changed = sum(1 for r in results if r.action not in {"unchanged"})
+    changed = sum(1 for r in results if r.action != "unchanged")
     for r in results:
         mark = "[green]✓[/]" if r.action != "unchanged" else "·"
-        console.print(f"  {mark} {r.agent_id}: {r.skill} [{r.action}]")
+        console.print(f"  {mark} {r.agent_id}: {r.item} [{r.action}]")
     verb = "would change" if dry_run else "changed"
     console.print(
-        f"[green]OK[/] {len(results)} skill/agent pair(s), {changed} {verb}. "
-        "Restart your agent to pick up new skills."
+        f"[green]OK[/] {len(results)} target(s), {changed} {verb}. "
+        "Restart your agent to pick up the changes."
     )
 
 
