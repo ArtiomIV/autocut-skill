@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-beta.1] - 2026-06-06
+
+First public beta. The CLI, the cross-agent skills, and both analysis paths
+(agent-driven host + autonomous OpenRouter cloud) are usable; APIs may still shift
+before the stable `v0.1.0`.
+
 ### Added
 
 - `autocut wait-ready VIDEO` — a deterministic readiness gate the orchestrating
