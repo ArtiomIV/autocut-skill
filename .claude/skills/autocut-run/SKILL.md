@@ -94,18 +94,43 @@ autocut sheet VIDEO --fps 2 --cell-px 640 --cols 3 --rows 4 --out CLIPS/sheet   
    If it's missing or truncated, RE-CUT before moving on.
 5. **(Optional) reel:** `autocut merge CLIPS/s*_clip_*.mp4 -o CLIPS/reel.mp4`.
 
-### Long video (> ~15 min) — chunk + coarse→fine + cut as you go
+### Long video (> ~15 min) — LOCATE cheaply, then fine → cut
 
-A long video at 2 fps is too many frames for one look. Process it **chunk by
-chunk and cut incrementally**, so your context only holds one chunk at a time:
+A long video at 2 fps is too many frames to read blindly. FIRST locate the few
+regions worth a look, THEN fine-sheet only those — so your context holds a handful
+of windows, not the whole timeline.
 
-For each ~5-minute window `[T, T+300]`:
-1. **Coarse** (locate): `autocut sheet VIDEO --interval 2 --from T --to T+300 --cell-px 480 --cols 4 --rows 4 --out CLIPS/coarse_T` → open it and spot **every** candidate region in this chunk — there may be several, do not stop at the first. (Sample every **2s**, not sparser: a fast knockdown can hide between frames spaced wider.)
-2. **Fine** (dense, NATIVE res) on each candidate `[a, b]` — **pad it by ±5–8s** so the whole event (cause AND count/aftermath) fits well inside, never at the edge: `autocut sheet VIDEO --fps 2 --from a-8 --to b+8 --cell-px 640 --cols 3 --rows 4 --out CLIPS/fine_a` → open it, confirm what it actually is (a real peak vs routine action), then pick exact `[start, end]`.
-3. **Cut immediately**: `autocut cut VIDEO --start <START> --end <END> --accurate -o CLIPS/s<score>_clip_NN.mp4`.
-4. **⭐ VERIFY THE CUT (MANDATORY — do not skip):** sheet the clip and confirm the
-   decisive event is inside it (see *Verify every cut* below); RE-CUT if missing.
-   Only then may you forget this chunk's frames and move to the next window.
+**Step 0 — locate (pick ONE path):**
+
+- **Loud action sport (crowd/commentary) with NO specific query → `signals` (cheapest):**
+  ```bash
+  autocut signals VIDEO        # JSON: audio_peaks (impact/crowd, ranked by strength) + scene_cuts
+  ```
+  The JSON is tiny — read it instead of opening dozens of coarse sheets. Your candidate
+  windows are: the **strong audio peaks** (each marks a loud live moment — a landed
+  shot, a roar) **and the scene-cut clusters** (replays / graphic transitions). **Always
+  also sheet the ~30–60s AFTER each strong peak** — a slow-mo replay lives there and is
+  often audio-SILENT, so the scene-cut is what flags it. This REPLACES the blanket coarse
+  pass. **Advisory, never a gate:** it says where to look FIRST, it does not forbid
+  looking elsewhere.
+
+- **A specific `--query` (e.g. "the moment he raises the belt", "the ring-walk"), OR
+  quiet content with no crowd → DO NOT use `signals`.** A silent/visual moment has no
+  audio peak and the energy would steer you AWAY from it. Locate visually, per ~5-min
+  window `[T, T+300]`:
+  ```bash
+  autocut sheet VIDEO --interval 2 --from T --to T+300 --cell-px 480 --cols 4 --rows 4 --out CLIPS/coarse_T
+  ```
+  → open it and spot **every** candidate region (there may be several; every 2s so a
+  fast knockdown can't hide between frames).
+
+**For each candidate window (from `signals` OR the coarse pass):**
+1. **Fine** (dense, NATIVE res) on `[a, b]` — **pad it ±5–8s** so the whole event (cause AND count/aftermath) fits well inside, never at the edge: `autocut sheet VIDEO --fps 2 --from a-8 --to b+8 --cell-px 640 --cols 3 --rows 4 --out CLIPS/fine_a` → open it, confirm what it actually is (a real peak vs routine action), pick exact `[start, end]`.
+2. **Cut immediately**: `autocut cut VIDEO --start <START> --end <END> --accurate -o CLIPS/s<score>_clip_NN.mp4`.
+3. **⭐ VERIFY THE CUT (MANDATORY — do not skip):** sheet the clip and confirm the
+   decisive event is inside it (see *Verify every cut* below); RE-CUT if missing. If you
+   located via `signals`, also **cross-check**: a real knockdown should sit on an audio
+   peak — a "knockdown" with no nearby peak is suspect. Only then move on.
 
 Finally: `autocut merge CLIPS/s*_clip_*.mp4 -o CLIPS/reel.mp4`.
 

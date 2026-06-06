@@ -574,6 +574,43 @@ def probe(
 
 
 @app.command()
+def signals(
+    video: Annotated[Path, typer.Argument(help="Input video to analyse for advisory signals.")],
+    no_scenes: Annotated[
+        bool,
+        typer.Option("--no-scenes", help="Skip scene-cut detection (audio peaks only; faster)."),
+    ] = False,
+    sensitivity: Annotated[
+        float,
+        typer.Option(
+            "--sensitivity",
+            "-k",
+            help="Audio-peak sensitivity (lower = more peaks). Default 4.0.",
+        ),
+    ] = 4.0,
+) -> None:
+    """Print ADVISORY localisation signals as JSON. Deterministic, no VLM.
+
+    Audio-energy peaks (loud live action: ``impact``/``crowd``) + scene cuts
+    (replays, graphic transitions). The host agent uses these to fine-sheet ONLY
+    the flagged windows (plus the ~30-60s after each peak, where a replay lives)
+    instead of blanket coarse-sheeting a long video. They are ADVISORY, NEVER a
+    gate: for a ``--query`` or quiet content, ignore them and scan visually.
+    """
+    from autocut.video.signals import SignalsError, compute_signals
+
+    if not video.exists() or not video.is_file():
+        err_console.print(f"input video not found: {video}")
+        raise typer.Exit(code=1)
+    try:
+        report = compute_signals(video, k=sensitivity, with_scenes=not no_scenes)
+    except SignalsError as exc:
+        err_console.print(f"signals failed: {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print_json(json.dumps(report))
+
+
+@app.command()
 def guidance(
     mode: Annotated[
         str,
