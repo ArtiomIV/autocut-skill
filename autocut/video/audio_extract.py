@@ -69,7 +69,8 @@ def extract_audio_for_vlm(
         completed = subprocess.run(  # noqa: S603 - args is a fixed list, no shell
             args,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",  # ffmpeg speaks UTF-8; Windows ANSI codepages have holes
             timeout=timeout_sec,
             check=False,
         )

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "autocut-skill"
-version = "0.1.0b1"
+version = "0.1.0b2"
 description = "Open-source cross-agent skill for automatic video highlight extraction with a VLM."
 readme = "README.md"
 requires-python = ">=3.11"

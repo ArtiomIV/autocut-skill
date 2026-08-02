@@ -1296,7 +1296,8 @@ def _probe_binary(name: str) -> str:
         result = subprocess.run(  # noqa: S603 - args is a fixed list, no shell
             [path, "-version"],
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",  # ffmpeg speaks UTF-8; Windows ANSI codepages have holes
             timeout=5,
             check=False,
         )

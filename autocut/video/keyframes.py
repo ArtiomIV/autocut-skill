@@ -114,7 +114,8 @@ def _extract_single(
         completed = subprocess.run(  # noqa: S603 - args is a fixed list, no shell
             args,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",  # ffmpeg speaks UTF-8; Windows ANSI codepages have holes
             timeout=_DEFAULT_FFMPEG_TIMEOUT_SEC,
             check=False,
         )

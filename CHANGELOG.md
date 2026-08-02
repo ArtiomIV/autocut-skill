@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0-beta.2] - 2026-07-29
+
+### Fixed
+
+- **Windows: hostile filenames no longer crash the ffmpeg helpers.** Every
+  subprocess wrapper (`probe`, `cut`, `concat`, `compress`, audio extract,
+  contact sheet, keyframes, CLI version check) decoded ffmpeg/ffprobe output
+  with `text=True`, i.e. the locale ANSI codepage. ffmpeg speaks UTF-8 and
+  echoes the input filename in its output (ffprobe embeds it in the JSON
+  payload), so filenames with bytes outside the codepage — e.g. Japanese,
+  whose UTF-8 encoding contains `0x81`/`0x90`, holes in cp1252 — raised
+  `UnicodeDecodeError` instead of processing the file. All helpers now decode
+  UTF-8 explicitly with `errors="replace"`. Found by a downstream dress
+  rehearsal (cutman-ai) delivering 10 hostile-named files through a watcher.
+
 ## [0.1.0-beta.1] - 2026-06-06
 
 First public beta. The CLI, the cross-agent skills, and both analysis paths
